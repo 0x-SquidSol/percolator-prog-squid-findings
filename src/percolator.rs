@@ -1490,13 +1490,21 @@ pub mod zc {
 
     /// Old slab length (before Account struct reordering migration)
     /// Old slabs support up to 4095 accounts, new slabs support 4096.
-    const OLD_ENGINE_LEN: usize = ENGINE_LEN - 8;
+    ///
+    /// PERC-118 migration: RiskEngine grew by 16 bytes (trade_twap_e6 + twap_last_slot).
+    /// Pre-PERC-118 slabs are ENGINE_LEN - 16 bytes smaller than the current ENGINE_LEN.
+    /// Pre-PERC-118 + pre-Account-reorder slabs are ENGINE_LEN - 24 bytes smaller.
+    /// Accept the oldest possible layout so all existing devnet slabs remain readable.
+    /// The new TWAP fields are at the END of RiskEngine and default to zero (= no TWAP,
+    /// pure oracle mark) when read from memory beyond the old slab boundary.
+    const OLDEST_ENGINE_LEN: usize = ENGINE_LEN - 24;
 
     #[inline]
     #[allow(clippy::manual_is_multiple_of)]
     pub fn engine_ref(data: &[u8]) -> Result<&RiskEngine, ProgramError> {
-        // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
-        if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
+        // Accept all legacy slab sizes down to ENGINE_LEN - 24 for backward compatibility.
+        // Migration layers: -8 (pre-Account-reorder), -16 (pre-PERC-118), -24 (both combined).
+        if data.len() < ENGINE_OFF + OLDEST_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_ptr().add(ENGINE_OFF) };
@@ -1510,8 +1518,9 @@ pub mod zc {
     #[inline]
     #[allow(clippy::manual_is_multiple_of)]
     pub fn engine_mut(data: &mut [u8]) -> Result<&mut RiskEngine, ProgramError> {
-        // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
-        if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
+        // Accept all legacy slab sizes down to ENGINE_LEN - 24 for backward compatibility.
+        // Migration layers: -8 (pre-Account-reorder), -16 (pre-PERC-118), -24 (both combined).
+        if data.len() < ENGINE_OFF + OLDEST_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
@@ -5573,7 +5582,7 @@ pub mod processor {
             DEFAULT_HYPERP_PRICE_CAP_E2BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR,
             DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MIN_STEP,
             DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-            MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN, VERSION,
+            ENGINE_LEN, ENGINE_OFF, MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN, VERSION,
         },
         error::{map_risk_error, PercolatorError},
         ix::{self, Instruction},
@@ -5630,13 +5639,19 @@ pub mod processor {
         slab: &AccountInfo,
         data: &[u8],
     ) -> Result<(), ProgramError> {
-        // Slab shape validation via verify helper (Kani-provable)
-        // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
-        // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
-        const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
+        // Slab shape validation via verify helper (Kani-provable).
+        // Three legacy sizes are accepted for backward compatibility:
+        //   SLAB_LEN        — current (PERC-118 + Account reorder)
+        //   SLAB_LEN - 16   — pre-PERC-118 (before trade_twap_e6 + twap_last_slot, +16 bytes)
+        //   SLAB_LEN - 24   — pre-PERC-118 + pre-Account-reorder (oldest devnet slabs, -8 bytes)
+        // New TWAP fields default to zero when read from old slabs → pure oracle mark (safe).
+        const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
+        const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN
+                || data.len() == PRE_118_SLAB_LEN
+                || data.len() == OLDEST_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -7042,6 +7057,7 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
+                let slab_len = data.len();
                 let engine = zc::engine_mut(&mut data)?;
 
                 // PERC-299: Update emergency OI mode based on circuit breaker status
@@ -7096,7 +7112,12 @@ pub mod processor {
                 // engine TWAP is 0 for new markets, so set_mark_price_blended
                 // falls back to oracle anyway). For configured markets, the
                 // blend weight controls oracle vs TWAP proportions.
-                {
+                //
+                // Safety: set_mark_price_blended writes trade_twap_e6 + twap_last_slot
+                // at the tail of RiskEngine. On pre-PERC-118 slabs (data.len() <
+                // ENGINE_OFF + ENGINE_LEN), those fields are beyond the allocated data.
+                // Skip the TWAP write for undersized slabs — they get pure oracle mark.
+                if slab_len >= ENGINE_OFF + ENGINE_LEN {
                     let w = state::get_mark_oracle_weight_bps(&config) as u64;
                     engine.set_mark_price_blended(config.authority_price_e6, w);
                 }
