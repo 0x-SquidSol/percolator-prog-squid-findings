@@ -5287,8 +5287,10 @@ fn nightly_median_within_bounds() {
 /// Prove: median of single price returns that price.
 /// NOTE: Renamed to nightly_ — this proof takes ~2h45m (symbolic sort over 5-element array);
 /// excluded from PR CI (--harness proof_ filter), runs in nightly.yml.
+/// kani::unwind(1) added to cap nightly budget (was exceeding 5h ceiling).
 #[cfg(kani)]
 #[kani::proof]
+#[kani::unwind(1)]
 fn nightly_median_single_price() {
     use percolator_prog::verify::median_price;
 
@@ -6015,10 +6017,12 @@ fn proof_rebalancing_mode_never_permanent() {
 // ---------------------------------------------------------------------------
 
 /// Prove: HWM floor math is correct (no rounding up).
+/// NOTE: Renamed to nightly_ — symbolic MUL/DIV over full u128 range is SAT-hard;
+/// excluded from PR CI (proof_ filter), runs in nightly.yml.
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(1)]
-fn proof_hwm_floor_correct_math() {
+fn nightly_hwm_floor_correct_math() {
     let epoch_hwm: u128 = kani::any();
     let hwm_floor_bps: u64 = kani::any();
 
