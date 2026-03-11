@@ -117,6 +117,16 @@ pub const TAG_ATTEST_CROSS_MARGIN: u8 = 55;
 pub const TAG_TOPUP_KEEPER_FUND: u8 = 57;
 /// PERC-629: Slash creation deposit.
 pub const TAG_SLASH_CREATION_DEPOSIT: u8 = 58;
+/// PERC-628: Initialize the global shared vault.
+pub const TAG_INIT_SHARED_VAULT: u8 = 59;
+/// PERC-628: Allocate virtual liquidity to a market.
+pub const TAG_ALLOCATE_MARKET: u8 = 60;
+/// PERC-628: Queue a withdrawal request for the current epoch.
+pub const TAG_QUEUE_WITHDRAWAL_SV: u8 = 61;
+/// PERC-628: Claim a queued withdrawal after epoch elapses.
+pub const TAG_CLAIM_EPOCH_WITHDRAWAL: u8 = 62;
+/// PERC-628: Advance the shared vault epoch (permissionless crank).
+pub const TAG_ADVANCE_EPOCH: u8 = 63;
 
 #[cfg(test)]
 mod tests {
@@ -182,6 +192,14 @@ mod tests {
             TAG_AUDIT_CRANK,
             TAG_SET_OFFSET_PAIR,
             TAG_ATTEST_CROSS_MARGIN,
+            TAG_ADVANCE_ORACLE_PHASE,
+            TAG_TOPUP_KEEPER_FUND,
+            TAG_SLASH_CREATION_DEPOSIT,
+            TAG_INIT_SHARED_VAULT,
+            TAG_ALLOCATE_MARKET,
+            TAG_QUEUE_WITHDRAWAL_SV,
+            TAG_CLAIM_EPOCH_WITHDRAWAL,
+            TAG_ADVANCE_EPOCH,
         ];
 
         for i in 0..tags.len() {
@@ -251,6 +269,14 @@ mod tests {
             TAG_AUDIT_CRANK,
             TAG_SET_OFFSET_PAIR,
             TAG_ATTEST_CROSS_MARGIN,
+            TAG_ADVANCE_ORACLE_PHASE,
+            TAG_TOPUP_KEEPER_FUND,
+            TAG_SLASH_CREATION_DEPOSIT,
+            TAG_INIT_SHARED_VAULT,
+            TAG_ALLOCATE_MARKET,
+            TAG_QUEUE_WITHDRAWAL_SV,
+            TAG_CLAIM_EPOCH_WITHDRAWAL,
+            TAG_ADVANCE_EPOCH,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
