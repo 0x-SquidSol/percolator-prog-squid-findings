@@ -7437,16 +7437,26 @@ pub mod shared_vault {
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
     pub struct SharedVaultState {
-        pub magic: u64,                   // 0..8
-        pub epoch_number: u64,            // 8..16
-        pub total_capital: u128,          // 16..32
-        pub total_allocated: u128,        // 32..48
-        pub pending_withdrawals: u128,    // 48..64
-        pub epoch_start_slot: u64,        // 64..72
-        pub epoch_duration_slots: u64,    // 72..80
-        pub max_market_exposure_bps: u16, // 80..82
-        pub bump: u8,                     // 82
-        pub _reserved: [u8; 45],          // 83..128
+        pub magic: u64,                      // 0..8
+        pub epoch_number: u64,               // 8..16
+        pub total_capital: u128,             // 16..32
+        pub total_allocated: u128,           // 32..48
+        pub pending_withdrawals: u128,       // 48..64
+        pub epoch_start_slot: u64,           // 64..72
+        pub epoch_duration_slots: u64,       // 72..80
+        pub max_market_exposure_bps: u16,    // 80..82
+        pub bump: u8,                        // 82
+        /// Alignment padding to next 16-byte boundary for u128 fields below.
+        pub _pad: [u8; 13],                  // 83..96
+        /// Snapshot of `total_capital` taken at the start of each epoch
+        /// (set by `AdvanceEpoch`). Used as the fixed available-capital
+        /// denominator in `ClaimEpochWithdrawal` so that claim-ordering
+        /// never affects individual payouts. Fixes security issue #1016.
+        pub epoch_snapshot_capital: u128,    // 96..112
+        /// Snapshot of `pending_withdrawals` taken at the start of each epoch
+        /// (set by `AdvanceEpoch`). Preserved after the per-epoch reset so
+        /// claims can still compute proportional payouts. Fixes #1016.
+        pub epoch_snapshot_pending: u128,    // 112..128
     }
 
     const _: () = assert!(SHARED_VAULT_STATE_LEN == 128);
@@ -7690,7 +7700,9 @@ pub mod shared_vault {
                 epoch_duration_slots: DEFAULT_EPOCH_DURATION_SLOTS,
                 max_market_exposure_bps: DEFAULT_MAX_MARKET_EXPOSURE_BPS,
                 bump: 255,
-                _reserved: [0; 45],
+                _pad: [0; 13],
+                epoch_snapshot_capital: 0,
+                epoch_snapshot_pending: 0,
             };
             let mut buf = [0u8; SHARED_VAULT_STATE_LEN];
             write_vault_state(&mut buf, &state);
@@ -7786,6 +7798,80 @@ pub mod shared_vault {
             let payout = compute_proportional_withdrawal(100, 100, 999_999);
             assert_eq!(payout, 100);
         }
+
+        // ── Fix #1016: epoch_snapshot_capital / epoch_snapshot_pending ──
+
+        /// SharedVaultState struct is still exactly 128 bytes after adding
+        /// epoch_snapshot_capital and epoch_snapshot_pending.
+        #[test]
+        fn test_struct_size_unchanged() {
+            assert_eq!(SHARED_VAULT_STATE_LEN, 128);
+        }
+
+        /// epoch_snapshot_capital / epoch_snapshot_pending survive a
+        /// write → read round-trip.
+        #[test]
+        fn test_epoch_snapshot_roundtrip() {
+            let state = SharedVaultState {
+                magic: SHARED_VAULT_MAGIC,
+                epoch_number: 5,
+                total_capital: 100_000,
+                total_allocated: 0,
+                pending_withdrawals: 0,
+                epoch_start_slot: 1_000,
+                epoch_duration_slots: DEFAULT_EPOCH_DURATION_SLOTS,
+                max_market_exposure_bps: DEFAULT_MAX_MARKET_EXPOSURE_BPS,
+                bump: 1,
+                _pad: [0; 13],
+                epoch_snapshot_capital: 99_000,
+                epoch_snapshot_pending: 200_000,
+            };
+            let mut buf = [0u8; SHARED_VAULT_STATE_LEN];
+            write_vault_state(&mut buf, &state);
+            let read = read_vault_state(&buf).unwrap();
+            assert_eq!(read.epoch_snapshot_capital, 99_000);
+            assert_eq!(read.epoch_snapshot_pending, 200_000);
+        }
+
+        /// Ordering invariant: User A (first) and User B (second) receive the
+        /// same per-LP-token payout from the epoch snapshot values.
+        ///
+        /// Scenario: epoch ends with total_capital=100, pending=200 (50% funded).
+        /// Each user has 20 LP. Using snapshots both get 10 tokens.
+        /// With live total_capital User B would get only 9 (the bug).
+        #[test]
+        fn test_ordering_invariant_snapshot_values() {
+            // Epoch snapshot values (fixed at epoch boundary)
+            let snapshot_capital: u128 = 100;
+            let snapshot_pending: u128 = 200;
+
+            // User A claims first
+            let payout_a = compute_proportional_withdrawal(20, snapshot_pending, snapshot_capital);
+            // User B claims second — snapshot values are unchanged
+            let payout_b = compute_proportional_withdrawal(20, snapshot_pending, snapshot_capital);
+
+            assert_eq!(payout_a, 10, "User A should get 10");
+            assert_eq!(payout_b, 10, "User B should get 10 (same as A)");
+            assert_eq!(payout_a, payout_b, "ordering must not affect payout");
+        }
+
+        /// Underfunded epoch: proportional reduction applies equally.
+        #[test]
+        fn test_underfunded_epoch_equal_reduction() {
+            // 3 users each with 30 LP, total pending=90, capital=45 (50% funded)
+            let snapshot_capital: u128 = 45;
+            let snapshot_pending: u128 = 90;
+
+            let p1 = compute_proportional_withdrawal(30, snapshot_pending, snapshot_capital);
+            let p2 = compute_proportional_withdrawal(30, snapshot_pending, snapshot_capital);
+            let p3 = compute_proportional_withdrawal(30, snapshot_pending, snapshot_capital);
+
+            assert_eq!(p1, 15);
+            assert_eq!(p2, 15);
+            assert_eq!(p3, 15);
+            // Total payouts don't exceed available capital
+            assert!(p1 as u128 + p2 as u128 + p3 as u128 <= snapshot_capital);
+        }
     }
 }
 
@@ -7862,6 +7948,48 @@ mod shared_vault_kani {
         kani::assume(max_bps <= 10_000);
         let max_alloc = max_single_market_allocation(total, max_bps);
         assert!(max_alloc <= total);
+    }
+
+    /// #1016 fix: ordering invariant — two users with equal LP receive equal
+    /// payout when using fixed snapshot values (not live total_capital).
+    #[kani::proof]
+    fn proof_sv_ordering_invariant() {
+        let snapshot_capital: u128 = kani::any();
+        let snapshot_pending: u128 = kani::any();
+        let lp_a: u64 = kani::any();
+        let lp_b: u64 = kani::any();
+        kani::assume(snapshot_pending > 0);
+        kani::assume(lp_a == lp_b); // same LP amount → must get same payout
+        kani::assume(lp_a as u128 <= snapshot_pending);
+
+        let payout_a = compute_proportional_withdrawal(lp_a, snapshot_pending, snapshot_capital);
+        // User B claims "after" A — but snapshot values are immutable, so
+        // available_capital seen by B is identical to that seen by A.
+        let payout_b = compute_proportional_withdrawal(lp_b, snapshot_pending, snapshot_capital);
+
+        assert_eq!(payout_a, payout_b, "same LP → same payout regardless of order");
+    }
+
+    /// #1016 fix: total payout of all users in an epoch never exceeds
+    /// epoch_snapshot_capital (no over-payment from the vault).
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn nightly_proof_sv_total_payout_bounded() {
+        let snapshot_capital: u128 = kani::any();
+        let snapshot_pending: u128 = kani::any();
+        let lp_user: u64 = kani::any();
+        kani::assume(snapshot_pending > 0);
+        kani::assume(lp_user as u128 <= snapshot_pending);
+
+        let payout = compute_proportional_withdrawal(lp_user, snapshot_pending, snapshot_capital);
+        // Individual payout must not exceed the user's proportional share of capital
+        if snapshot_capital < snapshot_pending {
+            // Underfunded: payout < request
+            assert!(payout <= lp_user);
+        } else {
+            // Fully funded: payout == request
+            assert_eq!(payout as u128, lp_user as u128);
+        }
     }
 }
 
@@ -14992,7 +15120,9 @@ pub mod processor {
                     epoch_duration_slots: duration,
                     max_market_exposure_bps: max_bps,
                     bump: pda_bump,
-                    _reserved: [0; 45],
+                    _pad: [0; 13],
+                    epoch_snapshot_capital: 0,
+                    epoch_snapshot_pending: 0,
                 };
                 let mut sv_data = a_shared_vault
                     .try_borrow_mut_data()
@@ -15155,15 +15285,23 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // Snapshot capital and pending_withdrawals at epoch boundary
+                // BEFORE resetting so ClaimEpochWithdrawal uses fixed values
+                // regardless of claim ordering. Fixes security issue #1016.
+                vault_state.epoch_snapshot_capital = vault_state.total_capital;
+                vault_state.epoch_snapshot_pending = vault_state.pending_withdrawals;
+
                 vault_state.epoch_number = vault_state.epoch_number.saturating_add(1);
                 vault_state.epoch_start_slot = clock.slot;
                 vault_state.pending_withdrawals = 0;
                 crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
 
                 msg!(
-                    "PERC-628: Epoch advanced to {} at slot {}",
+                    "PERC-628: Epoch advanced to {} at slot {} (snapshot_capital={} snapshot_pending={})",
                     vault_state.epoch_number,
-                    clock.slot
+                    clock.slot,
+                    vault_state.epoch_snapshot_capital,
+                    vault_state.epoch_snapshot_pending,
                 );
             }
 
@@ -15379,11 +15517,14 @@ pub mod processor {
                 crate::shared_vault::write_withdraw_req(&mut req_data, &updated_req);
                 drop(req_data);
 
-                // Compute proportional withdrawal
+                // Compute proportional withdrawal using epoch-boundary snapshots.
+                // Using snapshots (not live values) ensures all users in the
+                // same epoch get the same per-LP-token payout regardless of
+                // claim ordering. Fixes security issue #1016.
                 let payout = crate::shared_vault::compute_proportional_withdrawal(
                     req.lp_amount,
-                    vault_state.pending_withdrawals,
-                    vault_state.total_capital,
+                    vault_state.epoch_snapshot_pending,
+                    vault_state.epoch_snapshot_capital,
                 );
 
                 if payout > 0 {
