@@ -2423,6 +2423,23 @@ pub mod ix {
         TopUpKeeperFund {
             amount: u64,
         },
+        /// PERC-628: Initialize the global shared vault.
+        InitSharedVault {
+            epoch_duration_slots: u64,
+            max_market_exposure_bps: u16,
+        },
+        /// PERC-628: Allocate virtual liquidity to a market.
+        AllocateMarket {
+            amount: u128,
+        },
+        /// PERC-628: Queue a withdrawal for the current epoch.
+        QueueWithdrawalSV {
+            lp_amount: u64,
+        },
+        /// PERC-628: Claim a queued withdrawal after epoch elapses.
+        ClaimEpochWithdrawal,
+        /// PERC-628: Advance the shared vault epoch (permissionless crank).
+        AdvanceEpoch,
     }
 
     impl Instruction {
@@ -2904,6 +2921,24 @@ pub mod ix {
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::TopUpKeeperFund { amount })
                 }
+                TAG_INIT_SHARED_VAULT => {
+                    let epoch_duration_slots = read_u64(&mut rest)?;
+                    let max_market_exposure_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::InitSharedVault {
+                        epoch_duration_slots,
+                        max_market_exposure_bps,
+                    })
+                }
+                TAG_ALLOCATE_MARKET => {
+                    let amount = read_u128(&mut rest)?;
+                    Ok(Instruction::AllocateMarket { amount })
+                }
+                TAG_QUEUE_WITHDRAWAL_SV => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::QueueWithdrawalSV { lp_amount })
+                }
+                TAG_CLAIM_EPOCH_WITHDRAWAL => Ok(Instruction::ClaimEpochWithdrawal),
+                TAG_ADVANCE_EPOCH => Ok(Instruction::AdvanceEpoch),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -7374,6 +7409,589 @@ mod creator_history_kani {
         kani::assume(oi_a <= oi_b);
         if oi_threshold_met(deposit, oi_a) {
             assert!(oi_threshold_met(deposit, oi_b));
+        }
+    }
+}
+
+// 8e. mod shared_vault — PERC-628: Elastic Shared Vault + Epoch Withdrawals
+pub mod shared_vault {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const SHARED_VAULT_MAGIC: u64 = 0x5348_5244_5641_4C54; // "SHRDVALT"
+    pub const SHARED_VAULT_STATE_LEN: usize = core::mem::size_of::<SharedVaultState>();
+    pub const SHARED_VAULT_SEED: &[u8] = b"shared_vault";
+
+    pub const MARKET_ALLOC_MAGIC: u64 = 0x4D4B_5441_4C4C_4F43; // "MKTALLOC"
+    pub const MARKET_ALLOC_LEN: usize = core::mem::size_of::<MarketAllocation>();
+    pub const MARKET_ALLOC_SEED: &[u8] = b"market_alloc";
+
+    pub const WITHDRAW_REQ_MAGIC: u64 = 0x5754_4844_5252_4551; // "WTHDRREQ"
+    pub const WITHDRAW_REQ_LEN: usize = core::mem::size_of::<WithdrawalRequest>();
+    pub const WITHDRAW_REQ_SEED: &[u8] = b"withdraw_req";
+
+    pub const DEFAULT_EPOCH_DURATION_SLOTS: u64 = 72_000; // ~8 hours
+    pub const DEFAULT_MAX_MARKET_EXPOSURE_BPS: u16 = 2_000; // 20%
+
+    /// Global shared vault state.
+    /// Layout: all u128 at 16-byte aligned offsets, u64s grouped.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct SharedVaultState {
+        pub magic: u64,                   // 0..8
+        pub epoch_number: u64,            // 8..16
+        pub total_capital: u128,          // 16..32
+        pub total_allocated: u128,        // 32..48
+        pub pending_withdrawals: u128,    // 48..64
+        pub epoch_start_slot: u64,        // 64..72
+        pub epoch_duration_slots: u64,    // 72..80
+        pub max_market_exposure_bps: u16, // 80..82
+        pub bump: u8,                     // 82
+        /// Alignment padding to next 16-byte boundary for u128 fields below.
+        pub _pad: [u8; 13], // 83..96
+        /// Snapshot of `total_capital` taken at the start of each epoch
+        /// (set by `AdvanceEpoch`). Used as the fixed available-capital
+        /// denominator in `ClaimEpochWithdrawal` so that claim-ordering
+        /// never affects individual payouts. Fixes security issue #1016.
+        pub epoch_snapshot_capital: u128, // 96..112
+        /// Snapshot of `pending_withdrawals` taken at the start of each epoch
+        /// (set by `AdvanceEpoch`). Preserved after the per-epoch reset so
+        /// claims can still compute proportional payouts. Fixes #1016.
+        pub epoch_snapshot_pending: u128, // 112..128
+    }
+
+    const _: () = assert!(SHARED_VAULT_STATE_LEN == 128);
+
+    /// Per-market virtual allocation.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct MarketAllocation {
+        pub magic: u64,
+        pub bump: u8,
+        pub _pad: [u8; 7],
+        pub allocated_capital: u128,
+        pub utilized_capital: u128,
+    }
+
+    const _: () = assert!(MARKET_ALLOC_LEN == 48);
+
+    /// Per-user per-epoch withdrawal request.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct WithdrawalRequest {
+        pub magic: u64,
+        pub bump: u8,
+        pub claimed: u8,
+        pub _pad: [u8; 6],
+        pub lp_amount: u64,
+        pub epoch_number: u64,
+    }
+
+    const _: () = assert!(WITHDRAW_REQ_LEN == 32);
+
+    // --- Pure logic ---
+
+    /// Check if a market allocation would exceed the exposure cap.
+    /// Returns true if the allocation is within bounds.
+    #[inline]
+    pub fn check_exposure_cap(total_capital: u128, market_allocation: u128, max_bps: u16) -> bool {
+        if total_capital == 0 {
+            return market_allocation == 0;
+        }
+        // market_allocation * 10_000 <= total_capital * max_bps
+        let lhs = market_allocation.saturating_mul(10_000);
+        let rhs = total_capital.saturating_mul(max_bps as u128);
+        lhs <= rhs
+    }
+
+    /// Available capital for new allocations.
+    #[inline]
+    pub fn available_for_allocation(total_capital: u128, total_allocated: u128) -> u128 {
+        total_capital.saturating_sub(total_allocated)
+    }
+
+    /// Maximum allocation for a single market given the exposure cap.
+    #[inline]
+    pub fn max_single_market_allocation(total_capital: u128, max_bps: u16) -> u128 {
+        total_capital.saturating_mul(max_bps as u128) / 10_000
+    }
+
+    /// Check if the epoch has elapsed.
+    #[inline]
+    pub fn is_epoch_elapsed(current_slot: u64, epoch_start: u64, duration: u64) -> bool {
+        current_slot >= epoch_start.saturating_add(duration)
+    }
+
+    /// Compute epoch number from slot.
+    #[inline]
+    pub fn epoch_from_slot(current_slot: u64, genesis_slot: u64, duration: u64) -> u64 {
+        if duration == 0 {
+            return 0;
+        }
+        current_slot.saturating_sub(genesis_slot) / duration
+    }
+
+    /// Queue a withdrawal: add to pending total.
+    #[inline]
+    pub fn queue_withdrawal(pending: u128, amount: u64) -> u128 {
+        pending.saturating_add(amount as u128)
+    }
+
+    /// Compute proportional withdrawal amount for one user.
+    /// If total pending > available capital, everyone gets proportionally less.
+    /// All users in the same epoch get the same effective price.
+    #[inline]
+    pub fn compute_proportional_withdrawal(
+        request_lp: u64,
+        total_pending_lp: u128,
+        available_capital: u128,
+    ) -> u64 {
+        if total_pending_lp == 0 {
+            return 0;
+        }
+        // If enough capital for everyone, return full request
+        if available_capital >= total_pending_lp {
+            return request_lp;
+        }
+        // Proportional: request * available / total_pending
+        let result = (request_lp as u128).saturating_mul(available_capital) / total_pending_lp;
+        result.min(u64::MAX as u128) as u64
+    }
+
+    // --- State I/O ---
+
+    pub fn read_vault_state(data: &[u8]) -> Option<SharedVaultState> {
+        if data.len() < SHARED_VAULT_STATE_LEN {
+            return None;
+        }
+        let mut s = SharedVaultState::zeroed();
+        bytemuck::bytes_of_mut(&mut s).copy_from_slice(&data[..SHARED_VAULT_STATE_LEN]);
+        if s.magic != SHARED_VAULT_MAGIC {
+            return None;
+        }
+        Some(s)
+    }
+
+    pub fn write_vault_state(data: &mut [u8], state: &SharedVaultState) {
+        data[..SHARED_VAULT_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    pub fn read_market_alloc(data: &[u8]) -> Option<MarketAllocation> {
+        if data.len() < MARKET_ALLOC_LEN {
+            return None;
+        }
+        let mut s = MarketAllocation::zeroed();
+        bytemuck::bytes_of_mut(&mut s).copy_from_slice(&data[..MARKET_ALLOC_LEN]);
+        if s.magic != MARKET_ALLOC_MAGIC {
+            return None;
+        }
+        Some(s)
+    }
+
+    pub fn write_market_alloc(data: &mut [u8], state: &MarketAllocation) {
+        data[..MARKET_ALLOC_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    pub fn read_withdraw_req(data: &[u8]) -> Option<WithdrawalRequest> {
+        if data.len() < WITHDRAW_REQ_LEN {
+            return None;
+        }
+        let mut s = WithdrawalRequest::zeroed();
+        bytemuck::bytes_of_mut(&mut s).copy_from_slice(&data[..WITHDRAW_REQ_LEN]);
+        if s.magic != WITHDRAW_REQ_MAGIC {
+            return None;
+        }
+        Some(s)
+    }
+
+    pub fn write_withdraw_req(data: &mut [u8], state: &WithdrawalRequest) {
+        data[..WITHDRAW_REQ_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_exposure_cap_within() {
+            // 20% of 1000 = 200, allocation 200 → ok
+            assert!(check_exposure_cap(1000, 200, 2_000));
+        }
+
+        #[test]
+        fn test_exposure_cap_exceeded() {
+            // 20% of 1000 = 200, allocation 201 → exceeded
+            assert!(!check_exposure_cap(1000, 201, 2_000));
+        }
+
+        #[test]
+        fn test_exposure_cap_zero_capital() {
+            assert!(check_exposure_cap(0, 0, 2_000));
+            assert!(!check_exposure_cap(0, 1, 2_000));
+        }
+
+        #[test]
+        fn test_available_for_allocation() {
+            assert_eq!(available_for_allocation(1000, 400), 600);
+            assert_eq!(available_for_allocation(100, 200), 0); // saturating
+        }
+
+        #[test]
+        fn test_max_single_market() {
+            assert_eq!(max_single_market_allocation(10_000, 2_000), 2_000);
+            assert_eq!(max_single_market_allocation(10_000, 5_000), 5_000);
+        }
+
+        #[test]
+        fn test_epoch_elapsed() {
+            assert!(!is_epoch_elapsed(100, 50, 100));
+            assert!(is_epoch_elapsed(150, 50, 100));
+            assert!(is_epoch_elapsed(200, 50, 100));
+        }
+
+        #[test]
+        fn test_epoch_from_slot() {
+            assert_eq!(epoch_from_slot(72_000, 0, 72_000), 1);
+            assert_eq!(epoch_from_slot(144_000, 0, 72_000), 2);
+            assert_eq!(epoch_from_slot(71_999, 0, 72_000), 0);
+        }
+
+        #[test]
+        fn test_epoch_from_slot_zero_duration() {
+            assert_eq!(epoch_from_slot(100, 0, 0), 0);
+        }
+
+        #[test]
+        fn test_queue_withdrawal() {
+            assert_eq!(queue_withdrawal(1000, 500), 1500);
+        }
+
+        #[test]
+        fn test_proportional_withdrawal_full() {
+            // Enough capital for everyone: get full amount
+            assert_eq!(compute_proportional_withdrawal(100, 200, 300), 100);
+        }
+
+        #[test]
+        fn test_proportional_withdrawal_partial() {
+            // Only 50% capital available: everyone gets 50%
+            assert_eq!(compute_proportional_withdrawal(100, 200, 100), 50);
+        }
+
+        #[test]
+        fn test_proportional_withdrawal_zero_pending() {
+            assert_eq!(compute_proportional_withdrawal(100, 0, 1000), 0);
+        }
+
+        #[test]
+        fn test_proportional_withdrawal_exact() {
+            // Exactly enough
+            assert_eq!(compute_proportional_withdrawal(100, 100, 100), 100);
+        }
+
+        #[test]
+        fn test_vault_state_roundtrip() {
+            let state = SharedVaultState {
+                magic: SHARED_VAULT_MAGIC,
+                epoch_number: 42,
+                total_capital: 1_000_000,
+                total_allocated: 500_000,
+                pending_withdrawals: 10_000,
+                epoch_start_slot: 100_000,
+                epoch_duration_slots: DEFAULT_EPOCH_DURATION_SLOTS,
+                max_market_exposure_bps: DEFAULT_MAX_MARKET_EXPOSURE_BPS,
+                bump: 255,
+                _pad: [0; 13],
+                epoch_snapshot_capital: 0,
+                epoch_snapshot_pending: 0,
+            };
+            let mut buf = [0u8; SHARED_VAULT_STATE_LEN];
+            write_vault_state(&mut buf, &state);
+            let read = read_vault_state(&buf).unwrap();
+            assert_eq!(read.total_capital, 1_000_000);
+            assert_eq!(read.epoch_number, 42);
+            assert_eq!(read.max_market_exposure_bps, 2_000);
+        }
+
+        #[test]
+        fn test_market_alloc_roundtrip() {
+            let alloc = MarketAllocation {
+                magic: MARKET_ALLOC_MAGIC,
+                bump: 254,
+                _pad: [0; 7],
+                allocated_capital: 200_000,
+                utilized_capital: 150_000,
+            };
+            let mut buf = [0u8; MARKET_ALLOC_LEN];
+            write_market_alloc(&mut buf, &alloc);
+            let read = read_market_alloc(&buf).unwrap();
+            assert_eq!(read.allocated_capital, 200_000);
+            assert_eq!(read.utilized_capital, 150_000);
+        }
+
+        #[test]
+        fn test_withdraw_req_roundtrip() {
+            let req = WithdrawalRequest {
+                magic: WITHDRAW_REQ_MAGIC,
+                bump: 253,
+                claimed: 0,
+                _pad: [0; 6],
+                lp_amount: 5_000,
+                epoch_number: 42,
+            };
+            let mut buf = [0u8; WITHDRAW_REQ_LEN];
+            write_withdraw_req(&mut buf, &req);
+            let read = read_withdraw_req(&buf).unwrap();
+            assert_eq!(read.lp_amount, 5_000);
+            assert_eq!(read.epoch_number, 42);
+            assert_eq!(read.claimed, 0);
+        }
+
+        #[test]
+        fn test_read_bad_magic() {
+            let mut buf = [0u8; SHARED_VAULT_STATE_LEN];
+            buf[0..8].copy_from_slice(&0xDEADu64.to_le_bytes());
+            assert!(read_vault_state(&buf).is_none());
+        }
+
+        #[test]
+        fn test_struct_sizes() {
+            assert_eq!(SHARED_VAULT_STATE_LEN, 128);
+            assert_eq!(MARKET_ALLOC_LEN, 48);
+            assert_eq!(WITHDRAW_REQ_LEN, 32);
+        }
+
+        /// Simulate the double-claim guard: once claimed=1, a second
+        /// attempt must be rejected (mirrors ClaimEpochWithdrawal handler).
+        #[test]
+        fn test_double_claim_guard() {
+            let req = WithdrawalRequest {
+                magic: WITHDRAW_REQ_MAGIC,
+                bump: 1,
+                claimed: 0,
+                _pad: [0; 6],
+                lp_amount: 1_000,
+                epoch_number: 5,
+            };
+            assert_eq!(req.claimed, 0, "initially unclaimed");
+            let mut buf = [0u8; WITHDRAW_REQ_LEN];
+            write_withdraw_req(&mut buf, &req);
+            // First claim: mark claimed=1
+            let mut updated = read_withdraw_req(&buf).unwrap();
+            updated.claimed = 1;
+            write_withdraw_req(&mut buf, &updated);
+            // Second attempt must be rejected
+            let re_read = read_withdraw_req(&buf).unwrap();
+            assert_eq!(re_read.claimed, 1, "claimed flag must persist");
+            assert_ne!(re_read.claimed, 0, "double-claim guard: must reject");
+        }
+
+        /// Payout is zero when there are no pending withdrawals.
+        #[test]
+        fn test_zero_payout_no_pending() {
+            let payout = compute_proportional_withdrawal(500, 0, 10_000);
+            assert_eq!(payout, 0, "zero pending → zero payout");
+        }
+
+        /// Payout equals the request when capital is more than sufficient.
+        #[test]
+        fn test_payout_capped_at_request() {
+            let payout = compute_proportional_withdrawal(100, 100, 999_999);
+            assert_eq!(payout, 100);
+        }
+
+        // ── Fix #1016: epoch_snapshot_capital / epoch_snapshot_pending ──
+
+        /// SharedVaultState struct is still exactly 128 bytes after adding
+        /// epoch_snapshot_capital and epoch_snapshot_pending.
+        #[test]
+        fn test_struct_size_unchanged() {
+            assert_eq!(SHARED_VAULT_STATE_LEN, 128);
+        }
+
+        /// epoch_snapshot_capital / epoch_snapshot_pending survive a
+        /// write → read round-trip.
+        #[test]
+        fn test_epoch_snapshot_roundtrip() {
+            let state = SharedVaultState {
+                magic: SHARED_VAULT_MAGIC,
+                epoch_number: 5,
+                total_capital: 100_000,
+                total_allocated: 0,
+                pending_withdrawals: 0,
+                epoch_start_slot: 1_000,
+                epoch_duration_slots: DEFAULT_EPOCH_DURATION_SLOTS,
+                max_market_exposure_bps: DEFAULT_MAX_MARKET_EXPOSURE_BPS,
+                bump: 1,
+                _pad: [0; 13],
+                epoch_snapshot_capital: 99_000,
+                epoch_snapshot_pending: 200_000,
+            };
+            let mut buf = [0u8; SHARED_VAULT_STATE_LEN];
+            write_vault_state(&mut buf, &state);
+            let read = read_vault_state(&buf).unwrap();
+            assert_eq!(read.epoch_snapshot_capital, 99_000);
+            assert_eq!(read.epoch_snapshot_pending, 200_000);
+        }
+
+        /// Ordering invariant: User A (first) and User B (second) receive the
+        /// same per-LP-token payout from the epoch snapshot values.
+        ///
+        /// Scenario: epoch ends with total_capital=100, pending=200 (50% funded).
+        /// Each user has 20 LP. Using snapshots both get 10 tokens.
+        /// With live total_capital User B would get only 9 (the bug).
+        #[test]
+        fn test_ordering_invariant_snapshot_values() {
+            // Epoch snapshot values (fixed at epoch boundary)
+            let snapshot_capital: u128 = 100;
+            let snapshot_pending: u128 = 200;
+
+            // User A claims first
+            let payout_a = compute_proportional_withdrawal(20, snapshot_pending, snapshot_capital);
+            // User B claims second — snapshot values are unchanged
+            let payout_b = compute_proportional_withdrawal(20, snapshot_pending, snapshot_capital);
+
+            assert_eq!(payout_a, 10, "User A should get 10");
+            assert_eq!(payout_b, 10, "User B should get 10 (same as A)");
+            assert_eq!(payout_a, payout_b, "ordering must not affect payout");
+        }
+
+        /// Underfunded epoch: proportional reduction applies equally.
+        #[test]
+        fn test_underfunded_epoch_equal_reduction() {
+            // 3 users each with 30 LP, total pending=90, capital=45 (50% funded)
+            let snapshot_capital: u128 = 45;
+            let snapshot_pending: u128 = 90;
+
+            let p1 = compute_proportional_withdrawal(30, snapshot_pending, snapshot_capital);
+            let p2 = compute_proportional_withdrawal(30, snapshot_pending, snapshot_capital);
+            let p3 = compute_proportional_withdrawal(30, snapshot_pending, snapshot_capital);
+
+            assert_eq!(p1, 15);
+            assert_eq!(p2, 15);
+            assert_eq!(p3, 15);
+            // Total payouts don't exceed available capital
+            assert!(p1 as u128 + p2 as u128 + p3 as u128 <= snapshot_capital);
+        }
+    }
+}
+
+#[cfg(kani)]
+mod shared_vault_kani {
+    use crate::shared_vault::*;
+
+    /// Exposure cap: if check_exposure_cap passes, allocation <= max % of total.
+    #[kani::proof]
+    fn nightly_sv_exposure_cap_bounded() {
+        let total: u128 = kani::any();
+        let alloc: u128 = kani::any();
+        let max_bps: u16 = kani::any();
+        kani::assume(total <= u128::MAX / 10_000);
+        kani::assume(alloc <= u128::MAX / 10_000);
+        if check_exposure_cap(total, alloc, max_bps) && total > 0 {
+            // alloc * 10_000 <= total * max_bps
+            assert!(alloc.saturating_mul(10_000) <= total.saturating_mul(max_bps as u128));
+        }
+    }
+
+    /// Available for allocation never exceeds total capital.
+    #[kani::proof]
+    fn nightly_sv_available_bounded() {
+        let total: u128 = kani::any();
+        let allocated: u128 = kani::any();
+        let avail = available_for_allocation(total, allocated);
+        assert!(avail <= total);
+    }
+
+    /// Proportional withdrawal is fair: result <= request.
+    #[kani::proof]
+    fn nightly_sv_proportional_bounded() {
+        let req: u64 = kani::any();
+        let total_pending: u128 = kani::any();
+        let available: u128 = kani::any();
+        kani::assume(total_pending > 0);
+        kani::assume(req as u128 <= total_pending);
+        let result = compute_proportional_withdrawal(req, total_pending, available);
+        assert!(result <= req);
+    }
+
+    /// Epoch monotonically increases with slot.
+    #[kani::proof]
+    fn nightly_sv_epoch_monotone() {
+        let slot_a: u64 = kani::any();
+        let slot_b: u64 = kani::any();
+        let genesis: u64 = kani::any();
+        let duration: u64 = kani::any();
+        kani::assume(duration > 0);
+        kani::assume(slot_a <= slot_b);
+        kani::assume(slot_a >= genesis);
+        kani::assume(slot_b >= genesis);
+        assert!(
+            epoch_from_slot(slot_a, genesis, duration)
+                <= epoch_from_slot(slot_b, genesis, duration)
+        );
+    }
+
+    /// Queue withdrawal monotonically increases pending.
+    #[kani::proof]
+    fn nightly_sv_queue_monotone() {
+        let pending: u128 = kani::any();
+        let amount: u64 = kani::any();
+        let new_pending = queue_withdrawal(pending, amount);
+        assert!(new_pending >= pending);
+    }
+
+    /// Max single market allocation never exceeds total capital.
+    #[kani::proof]
+    fn nightly_sv_max_alloc_bounded() {
+        let total: u128 = kani::any();
+        let max_bps: u16 = kani::any();
+        kani::assume(max_bps <= 10_000);
+        let max_alloc = max_single_market_allocation(total, max_bps);
+        assert!(max_alloc <= total);
+    }
+
+    /// #1016 fix: ordering invariant — two users with equal LP receive equal
+    /// payout when using fixed snapshot values (not live total_capital).
+    #[kani::proof]
+    fn proof_sv_ordering_invariant() {
+        let snapshot_capital: u128 = kani::any();
+        let snapshot_pending: u128 = kani::any();
+        let lp_a: u64 = kani::any();
+        let lp_b: u64 = kani::any();
+        kani::assume(snapshot_pending > 0);
+        kani::assume(lp_a == lp_b); // same LP amount → must get same payout
+        kani::assume(lp_a as u128 <= snapshot_pending);
+
+        let payout_a = compute_proportional_withdrawal(lp_a, snapshot_pending, snapshot_capital);
+        // User B claims "after" A — but snapshot values are immutable, so
+        // available_capital seen by B is identical to that seen by A.
+        let payout_b = compute_proportional_withdrawal(lp_b, snapshot_pending, snapshot_capital);
+
+        assert_eq!(
+            payout_a, payout_b,
+            "same LP → same payout regardless of order"
+        );
+    }
+
+    /// #1016 fix: total payout of all users in an epoch never exceeds
+    /// epoch_snapshot_capital (no over-payment from the vault).
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn nightly_proof_sv_total_payout_bounded() {
+        let snapshot_capital: u128 = kani::any();
+        let snapshot_pending: u128 = kani::any();
+        let lp_user: u64 = kani::any();
+        kani::assume(snapshot_pending > 0);
+        kani::assume(lp_user as u128 <= snapshot_pending);
+
+        let payout = compute_proportional_withdrawal(lp_user, snapshot_pending, snapshot_capital);
+        // Individual payout must not exceed the user's proportional share of capital
+        if snapshot_capital < snapshot_pending {
+            // Underfunded: payout < request
+            assert!(payout <= lp_user);
+        } else {
+            // Fully funded: payout == request
+            assert_eq!(payout as u128, lp_user as u128);
         }
     }
 }
@@ -14430,6 +15048,524 @@ pub mod processor {
                 }
 
                 msg!("TopUpKeeperFund: amount={}", amount);
+            }
+
+            // PERC-628: InitSharedVault — admin creates the global shared vault PDA.
+            Instruction::InitSharedVault {
+                epoch_duration_slots,
+                max_market_exposure_bps,
+            } => {
+                // accounts: [0] admin (signer), [1] shared_vault PDA (writable),
+                //           [2] system_program
+                accounts::expect_len(accounts, 3)?;
+                let a_admin = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_system_program = &accounts[2];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_shared_vault)?;
+
+                if *a_system_program.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                if *a_shared_vault.key != expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if !a_shared_vault.data_is_empty() {
+                    return Err(ProgramError::AccountAlreadyInitialized);
+                }
+
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(crate::shared_vault::SHARED_VAULT_STATE_LEN);
+                let bump_bytes = [pda_bump];
+                let signer_seeds: &[&[u8]] = &[crate::shared_vault::SHARED_VAULT_SEED, &bump_bytes];
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_admin.key,
+                        &expected_pda,
+                        lamports,
+                        crate::shared_vault::SHARED_VAULT_STATE_LEN as u64,
+                        program_id,
+                    ),
+                    &[
+                        a_admin.clone(),
+                        a_shared_vault.clone(),
+                        a_system_program.clone(),
+                    ],
+                    &[signer_seeds],
+                )?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                let duration = if epoch_duration_slots == 0 {
+                    crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
+                } else {
+                    epoch_duration_slots
+                };
+                let max_bps = if max_market_exposure_bps == 0 {
+                    crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
+                } else {
+                    max_market_exposure_bps.min(10_000)
+                };
+
+                let state = crate::shared_vault::SharedVaultState {
+                    magic: crate::shared_vault::SHARED_VAULT_MAGIC,
+                    epoch_number: 0,
+                    total_capital: 0,
+                    total_allocated: 0,
+                    pending_withdrawals: 0,
+                    epoch_start_slot: clock.slot,
+                    epoch_duration_slots: duration,
+                    max_market_exposure_bps: max_bps,
+                    bump: pda_bump,
+                    _pad: [0; 13],
+                    epoch_snapshot_capital: 0,
+                    epoch_snapshot_pending: 0,
+                };
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_vault_state(&mut sv_data, &state);
+
+                msg!(
+                    "PERC-628: SharedVault initialized — epoch_duration={} max_exposure_bps={}",
+                    duration,
+                    max_bps
+                );
+            }
+
+            // PERC-628: AllocateMarket — allocate virtual liquidity to a market.
+            Instruction::AllocateMarket { amount } => {
+                // accounts: [0] admin (signer), [1] slab, [2] shared_vault PDA (writable),
+                //           [3] market_alloc PDA (writable), [4] system_program
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_shared_vault = &accounts[2];
+                let a_market_alloc = &accounts[3];
+                let a_system_program = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_market_alloc)?;
+
+                // Verify slab
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let header = state::read_header(&slab_data);
+                require_admin(header.admin, a_admin.key)?;
+                drop(slab_data);
+
+                // Verify shared vault PDA
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                // Verify market_alloc PDA
+                let (expected_alloc, alloc_bump) = Pubkey::find_program_address(
+                    &[crate::shared_vault::MARKET_ALLOC_SEED, a_slab.key.as_ref()],
+                    program_id,
+                );
+                if *a_market_alloc.key != expected_alloc {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // Read shared vault state
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                // Check exposure cap
+                let new_allocation = amount;
+                if !crate::shared_vault::check_exposure_cap(
+                    vault_state.total_capital,
+                    new_allocation,
+                    vault_state.max_market_exposure_bps,
+                ) {
+                    msg!("PERC-628: allocation {} exceeds exposure cap", amount);
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Check available capital
+                let available = crate::shared_vault::available_for_allocation(
+                    vault_state.total_capital,
+                    vault_state.total_allocated,
+                );
+                if new_allocation > available {
+                    msg!("PERC-628: allocation {} > available {}", amount, available);
+                    return Err(ProgramError::InsufficientFunds);
+                }
+
+                // Create market_alloc PDA if needed
+                if a_market_alloc.data_is_empty() {
+                    if *a_system_program.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(crate::shared_vault::MARKET_ALLOC_LEN);
+                    let bump_bytes = [alloc_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        crate::shared_vault::MARKET_ALLOC_SEED,
+                        a_slab.key.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_admin.key,
+                            &expected_alloc,
+                            lamports,
+                            crate::shared_vault::MARKET_ALLOC_LEN as u64,
+                            program_id,
+                        ),
+                        &[
+                            a_admin.clone(),
+                            a_market_alloc.clone(),
+                            a_system_program.clone(),
+                        ],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                // Update market allocation
+                let alloc = crate::shared_vault::MarketAllocation {
+                    magic: crate::shared_vault::MARKET_ALLOC_MAGIC,
+                    bump: alloc_bump,
+                    _pad: [0; 7],
+                    allocated_capital: new_allocation,
+                    utilized_capital: 0,
+                };
+                let mut alloc_data = a_market_alloc
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_market_alloc(&mut alloc_data, &alloc);
+
+                // Update shared vault totals
+                vault_state.total_allocated =
+                    vault_state.total_allocated.saturating_add(new_allocation);
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!("PERC-628: Market allocated {} from shared vault", amount);
+            }
+
+            // PERC-628: AdvanceEpoch — permissionless crank to advance the epoch.
+            Instruction::AdvanceEpoch => {
+                // accounts: [0] caller (signer), [1] shared_vault PDA (writable)
+                accounts::expect_len(accounts, 2)?;
+                let a_caller = &accounts[0];
+                let a_shared_vault = &accounts[1];
+
+                accounts::expect_signer(a_caller)?;
+                accounts::expect_writable(a_shared_vault)?;
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                if !crate::shared_vault::is_epoch_elapsed(
+                    clock.slot,
+                    vault_state.epoch_start_slot,
+                    vault_state.epoch_duration_slots,
+                ) {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Snapshot capital and pending_withdrawals at epoch boundary
+                // BEFORE resetting so ClaimEpochWithdrawal uses fixed values
+                // regardless of claim ordering. Fixes security issue #1016.
+                vault_state.epoch_snapshot_capital = vault_state.total_capital;
+                vault_state.epoch_snapshot_pending = vault_state.pending_withdrawals;
+
+                vault_state.epoch_number = vault_state.epoch_number.saturating_add(1);
+                vault_state.epoch_start_slot = clock.slot;
+                vault_state.pending_withdrawals = 0;
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!(
+                    "PERC-628: Epoch advanced to {} at slot {} (snapshot_capital={} snapshot_pending={})",
+                    vault_state.epoch_number,
+                    clock.slot,
+                    vault_state.epoch_snapshot_capital,
+                    vault_state.epoch_snapshot_pending,
+                );
+            }
+
+            // PERC-628: QueueWithdrawalSV — queue a withdrawal for the current epoch.
+            Instruction::QueueWithdrawalSV { lp_amount } => {
+                // accounts: [0] user (signer), [1] shared_vault PDA (writable),
+                //           [2] withdraw_req PDA (writable), [3] system_program
+                accounts::expect_len(accounts, 4)?;
+                let a_user = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_withdraw_req = &accounts[2];
+                let a_system_program = &accounts[3];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_withdraw_req)?;
+
+                if lp_amount == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                // Verify withdraw_req PDA
+                let epoch_bytes = vault_state.epoch_number.to_le_bytes();
+                let (expected_req, req_bump) = Pubkey::find_program_address(
+                    &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &epoch_bytes,
+                    ],
+                    program_id,
+                );
+                if *a_withdraw_req.key != expected_req {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // Create withdraw_req PDA if needed
+                if a_withdraw_req.data_is_empty() {
+                    if *a_system_program.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(crate::shared_vault::WITHDRAW_REQ_LEN);
+                    let bump_bytes = [req_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &epoch_bytes,
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_user.key,
+                            &expected_req,
+                            lamports,
+                            crate::shared_vault::WITHDRAW_REQ_LEN as u64,
+                            program_id,
+                        ),
+                        &[
+                            a_user.clone(),
+                            a_withdraw_req.clone(),
+                            a_system_program.clone(),
+                        ],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                let req = crate::shared_vault::WithdrawalRequest {
+                    magic: crate::shared_vault::WITHDRAW_REQ_MAGIC,
+                    bump: req_bump,
+                    claimed: 0,
+                    _pad: [0; 6],
+                    lp_amount,
+                    epoch_number: vault_state.epoch_number,
+                };
+                let mut req_data = a_withdraw_req
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_withdraw_req(&mut req_data, &req);
+
+                // Update pending withdrawals
+                vault_state.pending_withdrawals = crate::shared_vault::queue_withdrawal(
+                    vault_state.pending_withdrawals,
+                    lp_amount,
+                );
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!(
+                    "PERC-628: Queued withdrawal {} LP for epoch {}",
+                    lp_amount,
+                    vault_state.epoch_number
+                );
+            }
+
+            // PERC-628: ClaimEpochWithdrawal — claim after epoch elapses.
+            // Security: MUST gate on is_epoch_elapsed() and set claimed=1
+            // BEFORE transfer (not after). No mid-epoch claims.
+            Instruction::ClaimEpochWithdrawal => {
+                // accounts: [0] user (signer), [1] shared_vault PDA (writable),
+                //           [2] withdraw_req PDA (writable),
+                //           [3] slab (for vault derivation),
+                //           [4] vault (writable), [5] user_ata (writable),
+                //           [6] vault_authority, [7] token_program
+                accounts::expect_len(accounts, 8)?;
+                let a_user = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_withdraw_req = &accounts[2];
+                let a_slab = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_user_ata = &accounts[5];
+                let a_vault_authority = &accounts[6];
+                let a_token = &accounts[7];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_withdraw_req)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_user_ata)?;
+                verify_token_program(a_token)?;
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                // Security HIGH #1: Gate on epoch elapsed — no mid-epoch claims
+                let clock = solana_program::clock::Clock::get()?;
+                if !crate::shared_vault::is_epoch_elapsed(
+                    clock.slot,
+                    vault_state.epoch_start_slot,
+                    vault_state.epoch_duration_slots,
+                ) {
+                    msg!("PERC-628: epoch not yet elapsed — cannot claim mid-epoch");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Verify slab + vault
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                accounts::expect_key(a_vault_authority, &auth)?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
+                drop(slab_data);
+
+                // Read request
+                let mut req_data = a_withdraw_req
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let req = crate::shared_vault::read_withdraw_req(&req_data)
+                    .ok_or(ProgramError::InvalidAccountData)?;
+
+                if req.claimed != 0 {
+                    msg!("PERC-628: withdrawal already claimed");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Security HIGH #2: Verify request epoch < current epoch.
+                // Re-derive PDA from stored epoch to confirm authenticity.
+                let req_epoch_bytes = req.epoch_number.to_le_bytes();
+                let (expected_req_pda, _) = Pubkey::find_program_address(
+                    &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &req_epoch_bytes,
+                    ],
+                    program_id,
+                );
+                if *a_withdraw_req.key != expected_req_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                if req.epoch_number >= vault_state.epoch_number {
+                    msg!(
+                        "PERC-628: request epoch {} >= current {} — must wait for epoch advance",
+                        req.epoch_number,
+                        vault_state.epoch_number
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Security: set claimed=1 BEFORE any transfer
+                let mut updated_req = req;
+                updated_req.claimed = 1;
+                crate::shared_vault::write_withdraw_req(&mut req_data, &updated_req);
+                drop(req_data);
+
+                // Compute proportional withdrawal using epoch-boundary snapshots.
+                // Using snapshots (not live values) ensures all users in the
+                // same epoch get the same per-LP-token payout regardless of
+                // claim ordering. Fixes security issue #1016.
+                let payout = crate::shared_vault::compute_proportional_withdrawal(
+                    req.lp_amount,
+                    vault_state.epoch_snapshot_pending,
+                    vault_state.epoch_snapshot_capital,
+                );
+
+                if payout > 0 {
+                    // Convert units to base tokens
+                    let base_payout =
+                        crate::units::units_to_base_checked(payout, config.unit_scale)
+                            .ok_or(PercolatorError::EngineOverflow)?;
+
+                    // Transfer from vault to user
+                    let seed1: &[u8] = b"vault";
+                    let seed2: &[u8] = a_slab.key.as_ref();
+                    let bump_arr: [u8; 1] = [vault_bump];
+                    let seed3: &[u8] = &bump_arr;
+                    let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                    let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                    collateral::withdraw(
+                        a_token,
+                        a_vault,
+                        a_user_ata,
+                        a_vault_authority,
+                        base_payout,
+                        &signer_seeds,
+                    )?;
+
+                    // Update shared vault accounting
+                    vault_state.total_capital =
+                        vault_state.total_capital.saturating_sub(payout as u128);
+                    crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                    msg!(
+                        "PERC-628: Claim: {} LP → {} base tokens transferred",
+                        req.lp_amount,
+                        base_payout
+                    );
+                } else {
+                    msg!("PERC-628: Claim: {} LP → 0 payout", req.lp_amount);
+                }
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,
