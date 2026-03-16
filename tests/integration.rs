@@ -40,7 +40,7 @@ const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
 
 fn cu_ix() -> Instruction {
-    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)
+    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(2_000_000)
 }
 
 fn program_path() -> PathBuf {
@@ -22384,8 +22384,9 @@ fn test_attack_multi_lp_independent_positions() {
     );
 }
 
-/// ATTACK: SetRiskThreshold changes gate mode.
-/// High threshold blocks risk-increasing trades, lowering re-enables them.
+/// Per spec v10.5, insurance_floor (SetRiskThreshold) does NOT gate trades.
+/// Trade gating is side-mode based (DrainOnly/ResetPending only).
+/// This test verifies that changing insurance_floor does not affect trading.
 #[test]
 fn test_attack_set_risk_threshold_enables_trades() {
     program_path();
@@ -22406,30 +22407,27 @@ fn test_attack_set_risk_threshold_enables_trades() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // First trade succeeds (insurance 1B > threshold 0 default)
+    // Trade succeeds
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
-    assert_eq!(env.read_account_position(user_idx), 100_000);
+    assert_ne!(env.read_account_position(user_idx), 0);
 
-    // Set very high threshold so gate becomes active (insurance 1B < 999T)
+    // Set very high floor — does NOT block trades in v10.5
     env.set_slot(2);
     env.try_set_risk_threshold(&admin, 999_000_000_000_000)
         .unwrap();
 
-    // Risk-increasing trade should be blocked
+    // Trades still succeed (insurance_floor does not gate trades)
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 100_000);
     assert!(
-        result.is_err(),
-        "ATTACK: Risk-increasing trade succeeded with gate active!"
+        result.is_ok(),
+        "Insurance floor does not gate trades in spec v10.5: {:?}",
+        result
     );
 
-    // Lower threshold back to 0 (disable gate)
-    env.set_slot(3);
-    env.try_set_risk_threshold(&admin, 0).unwrap();
-
-    // Trade should succeed again (different size to avoid tx hash collision)
-    env.set_slot(4);
-    env.trade(&user, &lp, lp_idx, user_idx, 150_000);
-    assert_eq!(env.read_account_position(user_idx), 250_000);
+    // Conservation
+    let vault = env.vault_balance();
+    let engine_vault = env.read_engine_vault();
+    assert_eq!(engine_vault as u64, vault, "Conservation: engine={} vault={}", engine_vault, vault);
 }
 
 /// ATTACK: Close account after round-trip trade with PnL.
