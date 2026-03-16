@@ -13269,15 +13269,13 @@ fn test_attack_maintenance_fee_u128_max() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    // Advance time and crank - massive fee should not panic or corrupt
+    // Advance time and crank - per spec §1.5, fee_per_slot * dt uses checked
+    // arithmetic. u128::MAX * dt > u128 → EngineOverflow. Crank must fail.
     env.set_slot(200);
-    env.crank();
-
-    // Vault should still have tokens (not corrupted)
-    let vault = env.vault_balance();
+    let result = env.try_crank();
     assert!(
-        vault > 0,
-        "Vault should still have balance after max fee crank"
+        result.is_err(),
+        "Crank with u128::MAX fee should fail (checked arithmetic overflow per §1.5)"
     );
 }
 
