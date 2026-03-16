@@ -1196,7 +1196,20 @@ impl TestEnv {
         } else {
             basis_lo as u128
         };
-        let effective = abs_basis.checked_mul(a_side).unwrap_or(u128::MAX) / a_basis;
+        // Compute effective position in instruction-level units (e6-denominated).
+        // effective_q = abs_basis * a_side / a_basis (Q64)
+        // effective = effective_q * 1_000_000 / POS_SCALE
+        // Reorder to avoid u128 overflow: (abs_basis / a_basis * a_side) when a_side==a_basis is just abs_basis
+        const POS_SCALE: u128 = 1u128 << 64;
+        const SCALE_FACTOR: u128 = POS_SCALE / 1_000_000;
+        let effective = if a_side == a_basis {
+            abs_basis / SCALE_FACTOR
+        } else {
+            // Use 256-bit: (abs_basis * a_side / a_basis) / SCALE_FACTOR
+            let abs_basis_256 = (abs_basis as u128) as u128;
+            // Approximate: divide first by SCALE_FACTOR, then scale by a_side/a_basis
+            (abs_basis / SCALE_FACTOR).checked_mul(a_side / a_basis.max(1)).unwrap_or(u128::MAX)
+        };
         if is_negative { -(effective as i128) } else { effective as i128 }
     }
 
@@ -4960,18 +4973,44 @@ impl TradeCpiTestEnv {
     }
 
     fn read_account_position(&self, idx: u16) -> i128 {
-        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF = 440, accounts array at offset 9136 within RiskEngine
-        // Account size = 240 bytes, position at offset 80 within Account
-        const ACCOUNTS_OFFSET: usize = 440 + 9408;
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        const ENGINE: usize = 440;
+        const ACCOUNTS_OFFSET: usize = ENGINE + 9408;
         const ACCOUNT_SIZE: usize = 360;
-        const POSITION_OFFSET_IN_ACCOUNT: usize = 136;
-        let account_off =
-            ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
-        if slab_data.len() < account_off + 16 {
-            return 0;
-        }
-        i128::from_le_bytes(slab_data[account_off..account_off + 16].try_into().unwrap())
+        const PBQ: usize = 136;
+        const A_BASIS: usize = 168;
+        const EPOCH_SNAP: usize = 216;
+        const ADL_MULT_LONG: usize = ENGINE + 296;
+        const ADL_MULT_SHORT: usize = ENGINE + 312;
+        const ADL_EPOCH_LONG: usize = ENGINE + 392;
+        const ADL_EPOCH_SHORT: usize = ENGINE + 400;
+        const POS_SCALE: u128 = 1u128 << 64;
+
+        let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
+        if d.len() < acc_off + ACCOUNT_SIZE { return 0; }
+
+        let basis_lo = i128::from_le_bytes(d[acc_off+PBQ..acc_off+PBQ+16].try_into().unwrap());
+        let basis_hi = i128::from_le_bytes(d[acc_off+PBQ+16..acc_off+PBQ+32].try_into().unwrap());
+        if basis_lo == 0 && basis_hi == 0 { return 0; }
+
+        let a_basis = u128::from_le_bytes(d[acc_off+A_BASIS..acc_off+A_BASIS+16].try_into().unwrap());
+        let epoch_snap = u64::from_le_bytes(d[acc_off+EPOCH_SNAP..acc_off+EPOCH_SNAP+8].try_into().unwrap());
+        if a_basis == 0 { return 0; }
+
+        let is_negative = basis_hi < 0 || (basis_hi == 0 && basis_lo < 0);
+        let (a_side, epoch_side) = if !is_negative {
+            (u128::from_le_bytes(d[ADL_MULT_LONG..ADL_MULT_LONG+16].try_into().unwrap()),
+             u64::from_le_bytes(d[ADL_EPOCH_LONG..ADL_EPOCH_LONG+8].try_into().unwrap()))
+        } else {
+            (u128::from_le_bytes(d[ADL_MULT_SHORT..ADL_MULT_SHORT+16].try_into().unwrap()),
+             u64::from_le_bytes(d[ADL_EPOCH_SHORT..ADL_EPOCH_SHORT+8].try_into().unwrap()))
+        };
+        if epoch_snap != epoch_side { return 0; }
+
+        let abs_basis = if is_negative { (basis_lo as u128).wrapping_neg() } else { basis_lo as u128 };
+        let effective_q = abs_basis.checked_mul(a_side).unwrap_or(u128::MAX) / a_basis;
+        let effective = effective_q / POS_SCALE;
+        if is_negative { -(effective as i128) } else { effective as i128 }
     }
 
     fn try_withdraw(&mut self, owner: &Keypair, user_idx: u16, amount: u64) -> Result<(), String> {

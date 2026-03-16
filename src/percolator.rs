@@ -2550,12 +2550,26 @@ pub mod processor {
             oracle_price,
             size,
         )?;
+        // Convert exec.size to Q64 (POS_SCALE) for the engine.
+        // The instruction size is in price_e6-denominated units, so
+        // size_q = exec.size * POS_SCALE / 1_000_000 to match notional semantics.
+        let abs_size = exec.size.unsigned_abs();
+        let abs_q = percolator::wide_math::mul_div_floor_u256(
+            percolator::wide_math::U256::from_u128(abs_size),
+            percolator::wide_math::U256::from_u128(percolator::POS_SCALE),
+            percolator::wide_math::U256::from_u128(1_000_000),
+        );
+        let size_q = if exec.size >= 0 {
+            I256::from_raw_u256_pub(abs_q)
+        } else {
+            percolator::try_negate_u256_to_i256(abs_q).ok_or(RiskError::Overflow)?
+        };
         engine.execute_trade(
             user_idx,
             lp_idx,
             oracle_price,
             now_slot,
-            I256::from_i128(exec.size),
+            size_q,
             exec.price,
         )
     }
