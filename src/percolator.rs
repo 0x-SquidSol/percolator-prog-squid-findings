@@ -3112,23 +3112,27 @@ pub mod processor {
                     let clock = Clock::from_account_info(a_clock)?;
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Force-close positions in a paginated manner using crank_cursor
-                    // Process up to 64 accounts per crank call (bounded compute)
-                    // Use liquidate_at_oracle which handles all settlement, ADL, and OI updates.
+                    // Force-close positions in a paginated manner using crank_cursor.
+                    // 1. accrue_market_to updates mark to settlement price
+                    // 2. touch_account_full settles mark-to-market PnL for each account
+                    // 3. attach_effective_position zeros the position
                     const BATCH_SIZE: u16 = 64;
                     let start = engine.crank_cursor;
                     let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
 
+                    // Update market mark to settlement price
+                    let _ = engine.accrue_market_to(clock.slot, settlement_price);
+
                     for idx in start..end {
                         if engine.is_used(idx as usize) {
+                            // Touch account to settle all pending PnL at settlement price
+                            let _ = engine.touch_account_full(idx as usize, settlement_price, clock.slot);
                             let eff = engine.effective_pos_q(idx as usize);
                             if !eff.is_zero() {
-                                // Use engine's liquidation to properly close at settlement price
-                                let _ = engine.liquidate_at_oracle(
-                                    idx,
-                                    clock.slot,
-                                    settlement_price,
-                                );
+                                // Zero the position
+                                engine.attach_effective_position(idx as usize, percolator::wide_math::I256::ZERO);
+                                // Update warmup for any positive PnL
+                                engine.update_warmup_slope(idx as usize);
                             }
                         }
                     }
