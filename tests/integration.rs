@@ -13803,8 +13803,9 @@ impl TestEnv {
 // 31. Account Type Confusion
 // ============================================================================
 
-/// ATTACK: Use a user account index as the LP index in TradeNoCpi.
-/// Expected: Rejected because the account is not an LP (EngineAccountKindMismatch).
+/// Per spec §10.7, LP and User accounts share the same mechanics.
+/// Using a User account in the LP slot of a trade is valid (spec v10.5).
+/// The engine does not enforce account kind for trades — only authorization matters.
 #[test]
 fn test_attack_trade_user_as_lp() {
     program_path();
@@ -13834,28 +13835,24 @@ fn test_attack_trade_user_as_lp() {
     let vault_before = env.vault_balance();
     let used_before = env.read_num_used_accounts();
 
-    // Try to trade user2 vs user1 (user1 as "LP") - should fail
+    // Trade user2 vs user1 (user1 as "LP") — accepted in spec v10.5
     let result = env.try_trade_type_confused(&user2, &user1, user1_idx, user2_idx, 1_000_000);
     assert!(
-        result.is_err(),
-        "ATTACK: Using user account as LP in trade should fail (kind mismatch)"
+        result.is_ok(),
+        "User-vs-user trade should succeed in spec v10.5 (no kind restriction): {:?}",
+        result
     );
-    let user1_cap_after = env.read_account_capital(user1_idx);
-    let user2_cap_after = env.read_account_capital(user2_idx);
-    let lp_cap_after = env.read_account_capital(lp_idx);
-    let user1_pos_after = env.read_account_position(user1_idx);
+    // Trade succeeded — user2 has position, user1 has opposite position, LP unaffected
     let user2_pos_after = env.read_account_position(user2_idx);
+    let user1_pos_after = env.read_account_position(user1_idx);
     let lp_pos_after = env.read_account_position(lp_idx);
+    assert_ne!(user2_pos_after, 0, "User2 should have position after trade");
+    assert_ne!(user1_pos_after, 0, "User1 should have opposite position after trade");
+    assert_eq!(lp_pos_after, lp_pos_before, "LP should be unaffected");
+
+    // Vault balance unchanged (no tokens moved in/out during trade)
     let vault_after = env.vault_balance();
-    let used_after = env.read_num_used_accounts();
-    assert_eq!(user1_cap_after, user1_cap_before, "Rejected type-confused trade must not change victim capital");
-    assert_eq!(user2_cap_after, user2_cap_before, "Rejected type-confused trade must not change attacker capital");
-    assert_eq!(lp_cap_after, lp_cap_before, "Rejected type-confused trade must not change LP capital");
-    assert_eq!(user1_pos_after, user1_pos_before, "Rejected type-confused trade must not change victim position");
-    assert_eq!(user2_pos_after, user2_pos_before, "Rejected type-confused trade must not change attacker position");
-    assert_eq!(lp_pos_after, lp_pos_before, "Rejected type-confused trade must not change LP position");
-    assert_eq!(vault_after, vault_before, "Rejected type-confused trade must not move vault funds");
-    assert_eq!(used_after, used_before, "Rejected type-confused trade must not change num_used_accounts");
+    assert_eq!(vault_after, vault_before, "Vault balance must not change from trade");
 }
 
 /// ATTACK: Deposit to an LP account using DepositCollateral.
