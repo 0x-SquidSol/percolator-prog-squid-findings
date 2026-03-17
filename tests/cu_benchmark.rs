@@ -29,10 +29,10 @@ use std::path::PathBuf;
 
 // SLAB_LEN for SBF - differs between test and production
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 17336; // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 24320; // MAX_ACCOUNTS=64 - ADL/wide fields
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1058152; // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 1484408; // MAX_ACCOUNTS=4096 - ADL/wide fields
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -88,6 +88,10 @@ fn make_mint_data() -> Vec<u8> {
 /// Create PriceUpdateV2 mock data (Pyth Pull format)
 /// Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) +
 ///         price(8) + conf(8) + expo(4) + publish_time(8) + ...
+fn cu_ix() -> Instruction {
+    ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)
+}
+
 fn make_pyth_data(
     feed_id: &[u8; 32],
     price: i64,
@@ -346,7 +350,7 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&admin.pubkey()),
             &[admin],
             self.svm.latest_blockhash(),
@@ -404,7 +408,7 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&owner.pubkey()),
             &[owner],
             self.svm.latest_blockhash(),
@@ -432,7 +436,7 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&owner.pubkey()),
             &[owner],
             self.svm.latest_blockhash(),
@@ -458,7 +462,7 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&owner.pubkey()),
             &[owner],
             self.svm.latest_blockhash(),
@@ -480,7 +484,7 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&user.pubkey()),
             &[user, lp],
             self.svm.latest_blockhash(),
@@ -602,7 +606,7 @@ impl TestEnv {
             data,
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&funder.pubkey()),
             &[funder],
             self.svm.latest_blockhash(),
@@ -634,7 +638,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
             data: encode_init_user(0),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[cu_ix(), ix],
             Some(&user.pubkey()),
             &[&user],
             env.svm.latest_blockhash(),
@@ -730,7 +734,7 @@ fn benchmark_worst_case_scenarios() {
                 data: encode_init_user(0),
             };
             let tx = Transaction::new_signed_with_payer(
-                &[ix],
+                &[cu_ix(), ix],
                 Some(&user.pubkey()),
                 &[&user],
                 env.svm.latest_blockhash(),
@@ -797,7 +801,7 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[cu_ix(), ix],
                     Some(&user.pubkey()),
                     &[&user],
                     env.svm.latest_blockhash(),
@@ -1020,7 +1024,7 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[cu_ix(), ix],
                     Some(&user.pubkey()),
                     &[&user],
                     env.svm.latest_blockhash(),
@@ -1134,7 +1138,7 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[cu_ix(), ix],
                     Some(&user.pubkey()),
                     &[&user],
                     env.svm.latest_blockhash(),
@@ -1239,7 +1243,7 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[cu_ix(), ix],
                     Some(&user.pubkey()),
                     &[&user],
                     env.svm.latest_blockhash(),
@@ -1392,7 +1396,7 @@ fn benchmark_worst_case_scenarios() {
                 data: encode_init_user(0),
             };
             let tx = Transaction::new_signed_with_payer(
-                &[ix],
+                &[cu_ix(), ix],
                 Some(&user.pubkey()),
                 &[&user],
                 env.svm.latest_blockhash(),
