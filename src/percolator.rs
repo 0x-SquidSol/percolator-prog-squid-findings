@@ -4971,30 +4971,25 @@ pub mod oracle {
             let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
             (price, liquidity)
         } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
-            // Meteora DLMM: read active bin liquidity for depth check.
-            // DLMM pool layout includes active_id (i32) at offset 104 and
-            // bin_step (u16) at offset 108. The actual bin liquidity requires
-            // scanning bin accounts, but we can use the pool's reserve amounts
-            // as a proxy for total liquidity.
+            // Meteora DLMM: liquidity depth check.
             //
-            // Meteora DLMM pool layout (verified against meteora-ag/dlmm-sdk):
-            //   [70..78]  reserve_x (u64) — base token reserve
-            //   [78..86]  reserve_y (u64) — quote token reserve
-            const METEORA_OFF_RESERVE_Y: usize = 78;
-            let liq = {
-                let pool_data = price_ai.try_borrow_data()?;
-                if pool_data.len() >= METEORA_OFF_RESERVE_Y + 8 {
-                    u64::from_le_bytes(
-                        pool_data[METEORA_OFF_RESERVE_Y..METEORA_OFF_RESERVE_Y + 8]
-                            .try_into()
-                            .unwrap(),
-                    )
-                } else {
-                    0 // Can't read reserves — treat as no liquidity
-                }
-            };
+            // SECURITY: The Meteora DLMM LbPair account layout has reserve_x/reserve_y
+            // IDL fields at offsets 152/184, but these are Pubkeys (vault token account
+            // addresses), NOT u64 token amounts. Reading raw bytes at those offsets as
+            // u64 would produce garbage data and corrupt the liquidity check.
+            //
+            // To properly read vault balances we would need to pass the vault token
+            // accounts as additional accounts and read the SPL token account `amount`
+            // field. That requires CPI or additional account passing which UpdateHyperpMark
+            // does not currently support.
+            //
+            // Safe fallback: use u64::MAX sentinel so the MIN_DEX_QUOTE_LIQUIDITY check
+            // always passes for Meteora pools. The price validity check in
+            // read_meteora_dlmm_price_e6 (bin_step > 0, active_id in range, finite price)
+            // provides the primary safety gate. Real reserve depth checking for Meteora
+            // is tracked as a follow-up improvement.
             let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
-            (price, liq)
+            (price, u64::MAX)
         } else {
             return Err(PercolatorError::OracleInvalid.into());
         };
@@ -12723,27 +12718,37 @@ pub mod processor {
                 // Use prev_mark as oracle fallback if last_effective_price_e6 is not yet seeded.
                 let prev_mark = config.authority_price_e6;
 
-                // SECURITY: Max deviation check — reject DEX spot price if it deviates
-                // too far from the current EMA mark. Acts as a "TWAP band" without
-                // new on-chain state. A flash-loan attack pushes spot far from EMA → rejected.
-                // 500 bps = 5% max deviation from current mark.
+                // SECURITY: Max deviation clamp — clamp DEX spot price to a band around
+                // the current EMA mark. Acts as a "TWAP band" without new on-chain state.
+                // A flash-loan attack pushes spot far from EMA → clamped, not rejected.
+                //
+                // IMPORTANT: We clamp rather than hard-reject to avoid permanently wedging
+                // the oracle when the true price legitimately moves >5% between updates
+                // (e.g., rapid market moves, infrequent cranking). A hard-reject would
+                // require admin intervention to unblock the oracle.
+                //
+                // With clamping: the oracle still advances toward the new true price each
+                // crank, just rate-limited. Flash loans still cannot manipulate the EMA
+                // because the extreme spike is clamped before entering the EMA blend.
+                // 500 bps = 5% max step from current mark.
                 const MAX_HYPERP_DEVIATION_BPS: u64 = 500;
-                if prev_mark > 0 {
-                    let deviation = if dex_price > prev_mark {
-                        ((dex_price - prev_mark) as u128).saturating_mul(10_000)
-                            / (prev_mark as u128)
-                    } else {
-                        ((prev_mark - dex_price) as u128).saturating_mul(10_000)
-                            / (prev_mark as u128)
-                    };
-                    if deviation > MAX_HYPERP_DEVIATION_BPS as u128 {
+                let dex_price = if prev_mark > 0 {
+                    let max_delta = (prev_mark as u128)
+                        .saturating_mul(MAX_HYPERP_DEVIATION_BPS as u128)
+                        / 10_000;
+                    let max_delta = max_delta.min(prev_mark as u128) as u64;
+                    let lo = prev_mark.saturating_sub(max_delta);
+                    let hi = prev_mark.saturating_add(max_delta);
+                    if dex_price < lo || dex_price > hi {
                         msg!(
-                            "UpdateHyperpMark: DEX price {} deviates {}bps from mark {} (max {}bps)",
-                            dex_price, deviation, prev_mark, MAX_HYPERP_DEVIATION_BPS,
+                            "UpdateHyperpMark: DEX price {} outside band [{}, {}] (mark {}), clamping",
+                            dex_price, lo, hi, prev_mark,
                         );
-                        return Err(PercolatorError::OracleInvalid.into());
                     }
-                }
+                    dex_price.clamp(lo, hi)
+                } else {
+                    dex_price
+                };
 
                 let oracle_for_blend = if config.last_effective_price_e6 > 0 {
                     config.last_effective_price_e6
