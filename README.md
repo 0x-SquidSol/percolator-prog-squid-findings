@@ -1,12 +1,12 @@
 # Percolator (Solana Program)
 
-> **⚠️ DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
+> **DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
 >
 > This code has **NOT been audited**. Do NOT use in production or with real funds. This is experimental software provided for learning and testing purposes only. Use at your own risk.
 
 Percolator is a minimal Solana program that wraps the `percolator` crate's `RiskEngine` inside a single on-chain **slab** account and exposes a small, composable instruction set for deploying and operating perpetual markets.
 
-This README is intentionally **high-level**: it explains the trust model, account layout, operational flows, and the parts that are easy to get wrong (CPI binding, nonce discipline, oracle usage, and gating). It does **not** restate code structure or obvious Rust/Solana boilerplate.
+This README is intentionally **high-level**: it explains the trust model, account layout, operational flows, and the parts that are easy to get wrong (CPI binding, nonce discipline, oracle usage, and side-mode gating). It does **not** restate code structure or obvious Rust/Solana boilerplate.
 
 ---
 
@@ -17,7 +17,7 @@ This README is intentionally **high-level**: it explains the trust model, accoun
 - [Account model](#account-model)
 - [Instruction overview](#instruction-overview)
 - [Matcher CPI model](#matcher-cpi-model)
-- [Risk-reduction gating and auto-threshold](#risk-reduction-gating-and-auto-threshold)
+- [Side-mode gating and insurance floor](#side-mode-gating-and-insurance-floor)
 - [Operational runbook](#operational-runbook)
 - [Deployment flow](#deployment-flow)
 - [Security properties and verification](#security-properties-and-verification)
@@ -30,7 +30,7 @@ This README is intentionally **high-level**: it explains the trust model, accoun
 ## Concepts
 
 ### One market = one slab account
-A market is represented by a single **program-owned** account (“slab”) containing:
+A market is represented by a single **program-owned** account ("slab") containing:
 
 - **Header**: magic/version/admin + reserved fields (nonce + threshold update slot)
 - **MarketConfig**: mint/vault/oracle keys + policy knobs
@@ -42,9 +42,15 @@ Benefits:
 - easy snapshotting / archival
 - minimizes CPI/state scattering
 
+### Native 128-bit arithmetic
+Positions and PnL use native `i128`/`u128` (POS_SCALE = 1,000,000, ADL_ONE = 1,000,000). There are no I256/U256 wrapper types for positions or PnL. Positions use the ADL A/K coefficient mechanism defined in the spec.
+
 ### Two trade paths
 - **TradeNoCpi**: no external matcher; used for baseline integration, local testing, and deterministic program-test scenarios.
-- **TradeCpi**: production path; calls an external matcher program (LP-chosen), validates the returned prefix, then executes the engine trade using the matcher’s `exec_price` / `exec_size`.
+- **TradeCpi**: production path; calls an external matcher program (LP-chosen), validates the returned prefix, then executes the engine trade using the matcher's `exec_price` / `exec_size`.
+
+### MatchingEngine trait
+The `MatchingEngine` trait is defined in the Percolator program (not in the engine crate). The engine is a pure recorder of state transitions and does not define the matching interface. Two implementations exist: `NoOpMatcher` (TradeNoCpi) and `CpiMatcher` (TradeCpi).
 
 ---
 
@@ -64,11 +70,11 @@ Percolator enforces three layers with distinct responsibilities:
 - performs token transfers (vault deposit/withdraw)
 - reads oracle prices
 - runs optional matcher CPI for `TradeCpi`
-- enforces wrapper-level policy (risk-reduction gating / auto-threshold)
-- ensures coupling invariants (identity binding, nonce discipline, “use exec_size not requested size”)
+- enforces wrapper-level policy (side-mode gating, insurance floor)
+- ensures coupling invariants (identity binding, nonce discipline, "use exec_size not requested size")
 
 ### 3) Matcher program (LP-scoped trust)
-- provides execution result (`exec_price`, `exec_size`) and “accept/reject/partial” flags
+- provides execution result (`exec_price`, `exec_size`) and "accept/reject/partial" flags
 - trusted **only by the LP that registered it**, not by the protocol as a whole
 - Percolator treats matcher as adversarial except for LP-chosen semantics and validates strict ABI constraints.
 
@@ -103,7 +109,7 @@ LP PDA:
   - empty data
   - unfunded (0 lamports)
 
-This makes it a “pure identity signer” and prevents it from becoming an attack surface.
+This makes it a "pure identity signer" and prevents it from becoming an attack surface.
 
 ### Matcher context (TradeCpi)
 - account owned by matcher program
@@ -123,9 +129,10 @@ This section describes intent and operational ordering, not argument-by-argument
   - initializes nonce + threshold update slot to zero
 - **UpdateAdmin**
   - rotates admin key
-  - setting admin to all-zeros “burns” governance permanently (admin ops disabled forever)
+  - setting admin to all-zeros "burns" governance permanently (admin ops disabled forever)
 - **SetRiskThreshold**
-  - manual override of `risk_reduction_threshold` (optional if auto-threshold is used)
+  - sets `insurance_floor` (the minimum reserved insurance fund balance)
+  - does **not** gate trades directly; side-mode gating is handled internally by the engine (see below)
 
 ### Participant lifecycle
 - **InitUser**
@@ -138,12 +145,14 @@ This section describes intent and operational ordering, not argument-by-argument
   - performs oracle-read + engine checks; withdraws from vault via PDA signer; debits engine
 - **CloseAccount**
   - settles and withdraws remaining funds (subject to engine rules)
+  - on resolved markets, bypasses `touch_account_full` to avoid ADL overflow; uses `engine.free_slot()` directly
 
 ### Risk / maintenance
 - **KeeperCrank**
   - permissionless global maintenance entrypoint
+  - two-phase design: keeper computes candidate shortlist off-chain using `preview_account_at_barrier`, then passes the candidate list in instruction data; on-chain processing operates only on shortlisted candidates
   - accrues funding, charges maintenance fees, liquidates stale/unsafe accounts
-  - optionally updates risk threshold via auto-threshold policy
+  - optionally updates insurance floor via smoothed auto-threshold policy
 - **LiquidateAtOracle**
   - explicit liquidation for a specific target at current oracle
 - **TopUpInsurance**
@@ -154,6 +163,12 @@ This section describes intent and operational ordering, not argument-by-argument
   - trade without external matcher (used for testing / deterministic scenarios)
 - **TradeCpi**
   - trade via LP-chosen matcher CPI with strict binding + validation
+
+### Post-resolution admin
+- **AdminForceCloseAccount**
+  - force-close abandoned accounts after market resolution
+  - bypasses `touch_account_full` on resolved markets; uses `engine.free_slot()` directly
+  - verifies destination ATA owner matches stored account owner
 
 ---
 
@@ -172,7 +187,7 @@ Percolator treats a matcher like a price/size oracle **with rules** chosen by th
   - context length must be sufficient for the return prefix
 - **Nonce binding**: response must echo the current request id derived from slab nonce
 - **ABI validation**: strict validation of return prefix fields
-- **Execution size discipline**: engine trade uses matcher’s `exec_size` (never the user’s requested size)
+- **Execution size discipline**: engine trade uses matcher's `exec_size` (never the user's requested size)
 
 ### What the matcher controls (LP-scoped)
 - execution `price` and `size` (including partial fills)
@@ -187,39 +202,17 @@ The matcher return is treated as adversarial input. It must:
 - echo request identifiers and fields (LP account id, oracle price, req_id)
 - have reserved/padding fields set to zero
 - enforce size constraints (`|exec_size| <= |req_size|`, sign match when req_size != 0)
-- handle `i128::MIN` safely via `unsigned_abs`/`unsigned_abs()` semantics (no `.abs()` panics)
+- handle `i128::MIN` safely via `unsigned_abs` semantics (no `.abs()` panics)
 
 ---
 
-## Risk-reduction gating and auto-threshold
+## Side-mode gating and insurance floor
 
-### Why gating exists
-When the system is under-insured, the wrapper can enforce “risk-reduction-only” trades to reduce griefing/DoS and protect the insurance fund from adversarial volatility.
+### Side-mode gating (engine-internal, spec §9.6)
+Trade gating when the market is under-insured is handled **internally by the engine** through side-mode states (`DrainOnly`, `ResetPending`). The engine transitions between modes autonomously based on risk conditions. This logic lives entirely inside the `RiskEngine` and is not duplicated at the wrapper level.
 
-### Activation condition
-Gating is active when:
-- `threshold > 0` **and**
-- `insurance_balance <= threshold`
-
-When active:
-- **risk-increasing** trades are rejected
-- risk-reducing trades are allowed
-
-### Risk metric (wrapper-level)
-Percolator computes a deterministic system risk metric from LP exposure:
-- one O(n) scan to compute aggregate LP risk state
-- O(1) delta check to decide whether a proposed LP delta increases risk
-- conservative behavior when the max-position LP shrinks (overestimates risk rather than underestimates)
-
-### Auto-threshold update (KeeperCrank)
-Threshold can be updated by KeeperCrank (rate-limited + smoothed):
-- update at most once per `THRESH_UPDATE_INTERVAL_SLOTS`
-- compute target from risk units * oracle price
-- apply EWMA smoothing
-- apply step clamp to prevent sudden threshold jumps
-- clamp to `[THRESH_MIN, THRESH_MAX]`
-
-This policy is intentionally outside the engine so the engine remains a clean state machine.
+### Insurance floor (`SetRiskThreshold`)
+`SetRiskThreshold` sets `insurance_floor`: the minimum insurance fund balance the market operator wishes to reserve. This is a bookkeeping/reservation mechanism — it does **not** directly gate trades. The auto-threshold policy in `KeeperCrank` updates `insurance_floor` periodically using a smoothed target derived from LP risk exposure, rate-limited to at most once per `THRESH_UPDATE_INTERVAL_SLOTS`.
 
 ---
 
@@ -228,12 +221,16 @@ This policy is intentionally outside the engine so the engine remains a clean st
 ### Who runs what?
 - **Users / LPs**: init + deposits + trades
 - **Keepers (permissionless)**: call `KeeperCrank` regularly
-- **Admin**: may set threshold / rotate admin (unless burned)
+- **Admin**: may set insurance floor / rotate admin (unless burned)
 
 ### KeeperCrank cadence
 Run `KeeperCrank` often enough to satisfy engine freshness rules:
 - engine may enforce staleness bounds (e.g., `max_crank_staleness_slots`)
 - in stressed markets, higher cadence reduces liquidation latency and funding drift
+
+The two-phase keeper design keeps on-chain CU predictable. The keeper bot:
+1. Off-chain: calls `preview_account_at_barrier` for each account to build a candidate shortlist
+2. On-chain: submits `KeeperCrank` with the shortlist embedded in instruction data
 
 A typical ops approach:
 - a keeper bot that calls `KeeperCrank` every N slots (or every M seconds) and retries on failure
@@ -241,7 +238,7 @@ A typical ops approach:
 
 ### Monitoring checklist
 At minimum, monitor:
-- insurance fund balance (and whether gating is active)
+- insurance fund balance vs insurance floor
 - total open interest / LP exposure concentration
 - crank success rate + last successful crank slot
 - oracle freshness (age vs max staleness) and confidence filter failures
@@ -250,7 +247,7 @@ At minimum, monitor:
 
 ### Governance / admin handling
 - rotating admin changes who can:
-  - set manual risk threshold
+  - set insurance floor
   - rotate admin again
 - burning admin (setting to all zeros) is irreversible and disables admin ops forever
 
@@ -300,7 +297,7 @@ Run `KeeperCrank` continuously.
 
 ## Security properties and verification
 
-Percolator’s security model is “engine correctness + wrapper enforcement”.
+Percolator's security model is "engine correctness + wrapper enforcement".
 
 ### Wrapper-level properties (Kani-proven)
 Kani harnesses are designed to prove program-level coupling invariants, including:
@@ -318,7 +315,14 @@ Kani harnesses are designed to prove program-level coupling invariants, includin
 > Note: Kani does not model full CPI execution or internal engine accounting; it targets wrapper security properties and binding logic.
 
 ### Engine properties
-Engine-specific invariants (conservation, warmup, liquidation properties, etc.) live in the `percolator` crate’s verification suite. The program relies on engine correctness but does not restate it.
+Engine-specific invariants (conservation, warmup, liquidation properties, etc.) live in the `percolator` crate's verification suite. The program relies on engine correctness but does not restate it.
+
+### Test suite
+- **Integration tests**: 454 (LiteSVM with production BPF binaries)
+- **Unit tests**: 28
+- **Alignment tests**: 8
+- **Kani proofs**: 111
+- **CU benchmark**: 1 (worst case 461K CU, 32.9% of the 1.4M limit, with two-phase crank)
 
 ---
 
@@ -336,8 +340,8 @@ These are governance powers, not bugs:
    - rotate admin to attacker-controlled key or burn admin to zero.
    - impact: governance capture or permanent governance lockout.
 2. `SetRiskThreshold`
-   - force restrictive gating behavior.
-   - impact: users may be unable to open/increase risk.
+   - set `insurance_floor` (minimum reserved insurance balance).
+   - impact: reserves more of the insurance fund, but does not gate trades.
 3. `UpdateConfig`
    - change funding/threshold policy knobs (within validation bounds).
    - impact: economics can become unfavorable to users.
@@ -411,7 +415,6 @@ Do not enable `unsafe_close` in production builds.
 - bad matcher shape (non-executable program, executable ctx, wrong ctx owner, short ctx)
 - LP PDA mismatch / wrong PDA shape
 - ABI prefix invalid (flags, echoed fields, reserved bytes, size constraints)
-- gating active + risk-increasing trade
 
 These are expected and should be treated as **hard safety rejections**, not transient errors.
 
@@ -426,15 +429,21 @@ Recovery:
 
 ### Admin burned
 Once admin is burned (all zeros), admin ops are permanently disabled.
-Recovery is “by design impossible” (this is a one-way governance lock).
+Recovery is "by design impossible" (this is a one-way governance lock).
 
 ---
 
 ## Build & test
 
 ```bash
-# unit tests / program-test style
+# Build BPF binary (required before running CU benchmark)
+cargo build-sbf
+
+# All tests (integration, unit, alignment)
 cargo test
+
+# CU benchmark (requires BPF binary)
+cargo test --release --test cu_benchmark -- --nocapture
 
 # Kani harnesses (requires kani toolchain)
 cargo kani --tests
