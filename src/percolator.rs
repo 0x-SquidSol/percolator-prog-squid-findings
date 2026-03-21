@@ -4824,10 +4824,10 @@ pub mod oracle {
     // the SPL Token Account `amount` field at byte offset 64 within the vault account.
     // We verify the vault owner is spl_token::ID or spl_token_2022::ID.
 
-    const METEORA_DLMM_PRICE_MIN_LEN: usize = 81;  // need through active_id end (77+4)
-    const METEORA_DLMM_MIN_LEN: usize = 217;       // need through reserve_y end (185+32)
+    const METEORA_DLMM_PRICE_MIN_LEN: usize = 81; // need through active_id end (77+4)
+    const METEORA_DLMM_MIN_LEN: usize = 217; // need through reserve_y end (185+32)
     const METEORA_DLMM_OFF_BIN_STEP_SEED: usize = 74; // u16 LE = bin_step
-    const METEORA_DLMM_OFF_ACTIVE_ID: usize = 77;  // i32 LE
+    const METEORA_DLMM_OFF_ACTIVE_ID: usize = 77; // i32 LE
     const METEORA_DLMM_OFF_RESERVE_Y: usize = 185; // Pubkey of vault_y token account
 
     /// Read spot price from a Meteora DLMM pool account.
@@ -5027,8 +5027,8 @@ pub mod oracle {
             }
 
             // SECURITY: verify vault_y is owned by spl_token or spl_token_2022
-            let is_valid_token_program = *vault_y_ai.owner == spl_token::ID
-                || *vault_y_ai.owner == spl_token_2022::ID;
+            let is_valid_token_program =
+                *vault_y_ai.owner == spl_token::ID || *vault_y_ai.owner == spl_token_2022::ID;
             if !is_valid_token_program {
                 return Err(PercolatorError::OracleInvalid.into());
             }

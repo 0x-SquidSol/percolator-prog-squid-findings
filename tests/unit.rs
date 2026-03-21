@@ -3326,7 +3326,7 @@ fn make_pumpswap_pool(
     quote_vault_key: &Pubkey,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 256]; // generous size
-    // base_mint at offset 35 — must match market collateral_mint
+                                   // base_mint at offset 35 — must match market collateral_mint
     data[35..67].copy_from_slice(base_mint_key.as_ref());
     // base_vault at offset 131
     data[131..163].copy_from_slice(base_vault_key.as_ref());
@@ -3340,7 +3340,7 @@ fn make_pumpswap_pool(
 /// active_id=0 → price_e6 = 1_000_000 (price == 1.0 for any bin_step).
 fn make_meteora_lbpair(bin_step: u16, active_id: i32, vault_y_key: &Pubkey) -> Vec<u8> {
     let mut data = vec![0u8; 220]; // must be ≥ METEORA_DLMM_MIN_LEN (217)
-    // bin_step_seed at offset 74
+                                   // bin_step_seed at offset 74
     data[74..76].copy_from_slice(&bin_step.to_le_bytes());
     // active_id at offset 77
     data[77..81].copy_from_slice(&active_id.to_le_bytes());
