@@ -1,7 +1,7 @@
 # Percolator — Compute Unit Benchmarks
 **Program**: `dcccrypto/percolator-prog` (Solana BPF, `no_std`, `forbid(unsafe_code)`)  
 **Tool**: LiteSVM (production BPF binary, `cargo build-sbf`)  
-**Date**: 2026-02-26  
+**Last updated**: 2026-03-23  
 
 ---
 
@@ -9,13 +9,14 @@
 
 | Metric | Value |
 |--------|-------|
-| Open trade CU | **5,338** |
-| Modify/flip trade CU | **~6,304–6,328** |
-| Close trade CU | **4,584** |
-| CU budget used (open) | **~2.7%** of 200,000 |
+| Open trade CU | **6,330** |
+| Modify/flip trade CU | **~7,297–7,317** |
+| Close trade CU | **5,270** |
+| CU budget used (open) | **~3.2%** of 200,000 |
 | Scaling | **O(1)** — flat from 1 to 4,000 active accounts |
 | Size independence | ✅ — same CU from size=1 to size=100,000 |
-| Projected CU (with TradeCpiV2 + bump) | **~3,800** |
+| pinocchio-token CU delta | **+0 to +1 CU** (noise; no runtime savings yet) |
+| Expected savings after SIMD-0266 activation | **~131 CU per token Transfer** |
 
 ---
 
@@ -26,29 +27,94 @@
 | Sprint 3 baseline | ~6,800+ | — | Pre-optimization |
 | PERC-154: Stack alloc + `invoke_signed_unchecked` | 5,384 | **−1,416** | Heap → stack, RefCell skip |
 | PERC-199: `Clock::get()` syscall | **5,338** | **−46** | Removes clock sysvar deserialization |
-| TradeCpiV2 (caller-provided bump) | **~3,800** | **~−1,538** | Eliminates `find_program_address` + save |
-| **Total projected** | **~3,800** | **~−3,000** | All opts combined |
+| Post-NFT + struct growth (Feb→Mar 2026) | **6,330** | **+992** | Position NFT support, TransferPositionOwnership, struct growth |
+| **PERC-637: pinocchio-token 0.5.0** | **6,330** | **±0** | No runtime change yet (see SIMD-0266 section) |
+| SIMD-0266 activation (projected) | **~6,199** | **−131** | Per-Transfer CU reduction in token program |
 
 ---
 
-## Full Benchmark Table (Current — Post-PERC-199)
+## PERC-637 pinocchio-token Migration — Before/After
 
-*Build: `main @ pr-8`, `cargo build-sbf`, production BPF*
+*Benchmarked: 2026-03-23. Tool: LiteSVM, production SBF binary.*  
+*Pre-pinocchio commit: `8c8c032` (main @ PR-133, spl-token 6.0)*  
+*Post-pinocchio commit: `dbbb04e` (feat/pinocchio-cpi-parity-test, pinocchio-token 0.5.0)*
+
+### Trade Instruction CU (TradeCpiV2)
+
+| Operation | Pre-pinocchio | Post-pinocchio | Δ CU | % |
+|-----------|--------------|----------------|------|---|
+| Open long (+100) | 6,329 | 6,330 | **+1** | +0.02% |
+| Open short (−100) | 6,325 | 6,326 | **+1** | +0.02% |
+| Increase long (+50) | 7,316 | 7,317 | **+1** | +0.01% |
+| Flip long→short | 7,309 | 7,310 | **+1** | +0.01% |
+| Close position | 5,269 | 5,270 | **+1** | +0.02% |
+| Rapid trades avg | 5,903 | 5,904 | **+1** | +0.02% |
+| Rapid trades min | 5,263 | 5,264 | **+1** | +0.02% |
+| Rapid trades max | 6,567 | 6,568 | **+1** | +0.02% |
+
+**Result: No meaningful CU change.** The ±1 CU delta is within LiteSVM measurement noise.
+
+### Why No Change?
+
+The Trade instruction itself does **not** call `Transfer`, `MintTo`, or `Burn` directly. Token movement happens at Deposit/Withdraw time (separate instructions). Trade only updates positions in-memory in the Slab account. Therefore pinocchio-token's builder-path optimization doesn't affect Trade CU.
+
+The **~131 CU savings per Transfer** is a **runtime** optimization in the token program execution itself (SIMD-0266), not a compile-time change. It activates when validators upgrade to support SIMD-0266.
+
+### Token CPI Path: pinocchio-token vs spl-token
+
+| Instruction | spl-token 6.0 CU estimate | pinocchio-token 0.5.0 CU | Δ (current) | Δ (SIMD-0266) |
+|-------------|--------------------------|--------------------------|-------------|---------------|
+| Transfer | ~2,800 (builder overhead) | ~2,800 (builder overhead) | **0** | **−131** |
+| MintTo | ~2,900 | ~2,900 | **0** | **−131** |
+| Burn | ~2,900 | ~2,900 | **0** | **−131** |
+| InitializeMint | ~3,200 | ~3,200 | **0** | TBD |
+
+*Note: pinocchio-token generates byte-identical instructions to spl-token 6.0 (proven by 17 parity tests in `tests/pinocchio_cpi_parity.rs`). The ~131 CU claim refers to SIMD-0266 optimizations in the token program validator runtime, not the CPI builder.*
+
+---
+
+## SIMD-0266 — p-token: Efficient Token Program
+
+**Status**: SIMD merged 2026-03-13. Validator activation pending supermajority upgrade.
+
+SIMD-0266 adds a `p-token` execution pathway in the validator that reduces CU for SPL Token instructions:
+
+| Token Instruction | Current CU | SIMD-0266 CU | Savings |
+|-------------------|------------|--------------|---------|
+| Transfer | ~2,800 | ~2,669 | **~131** |
+| MintTo | ~2,900 | ~2,769 | **~131** |
+| Burn | ~2,900 | ~2,769 | **~131** |
+
+**When will this show up in benchmarks?**  
+- Not on current devnet (SIMD-0266 not activated yet)
+- Will appear automatically once validators activate — no code change required
+- pinocchio-token 0.5.0 is the correct dependency to get these savings when activated
+
+**Impact on Percolator**:
+- Deposit/Withdraw instructions call Transfer → will save ~131 CU each when SIMD-0266 activates
+- Position NFT mint calls MintTo → will save ~131 CU
+- Current percolator-stake calls Transfer → will save ~131 CU per staking tx
+
+---
+
+## Full Benchmark Table (Current — Post-PERC-637, 2026-03-23)
+
+*Build: `feat/pinocchio-cpi-parity-test`, `cargo build-sbf`, production BPF*
 
 | Operation | CU |
 |-----------|----|
-| Open long (+100) | **5,338** |
-| Open short (-100) | **5,337** |
-| Increase long (+50) | **6,328** |
-| Flip long→short | **6,315** |
-| Flip short→long | **6,304** |
-| Close position | **4,584** |
-| Partial close (−75) | **6,321** |
-| Rapid trades avg (20 trades) | **5,067** |
-| Rapid trades min | 4,576 |
-| Rapid trades max | 5,579 |
-| Tiny trade (size=1) | **5,338** |
-| Large trade (size=100K) | **5,579** |
+| Open long (+100) | **6,330** |
+| Open short (−100) | **6,326** |
+| Increase long (+50) | **7,317** |
+| Flip long→short | **7,310** |
+| Flip short→long | **7,297** |
+| Close position | **5,270** |
+| Partial close (−75) | **7,317** |
+| Rapid trades avg (20 trades) | **5,904** |
+| Rapid trades min | 5,264 |
+| Rapid trades max | 6,568 |
+| Tiny trade (size=1) | **6,330** |
+| Large trade (size=100K) | **6,334** |
 
 ---
 
@@ -58,13 +124,13 @@ CU is **constant regardless of how many accounts are in the slab**. Confirmed up
 
 | Active Accounts | CU (Open Trade) |
 |----------------|-----------------|
-| 1 (init overhead) | 5,972 |
-| 10 | **5,579** |
-| 100 | **5,579** |
-| 500 | **5,579** |
-| 1,000 | **5,579** |
-| 2,000 | **5,579** |
-| 4,000 | **5,579** |
+| 1 (init overhead) | 6,969 |
+| 10 | **6,568** |
+| 100 | **6,568** |
+| 500 | **6,568** |
+| 1,000 | **6,568** |
+| 2,000 | **6,568** |
+| 4,000 | **6,568** |
 
 No CU growth with slab population. **Scales to any number of concurrent traders.**
 
@@ -76,11 +142,12 @@ CU does not scale with trade size. No big-number penalty.
 
 | Size | CU |
 |------|----|
-| 1 | 5,338 |
-| 100 | 5,338 |
-| 1,000 | 5,338 |
-| 10,000 | 5,338 |
-| 100,000 | 5,579 |
+| 1 | 6,330 |
+| 10 | 6,338 |
+| 100 | 6,330 |
+| 1,000 | 6,330 |
+| 10,000 | 6,334 |
+| 100,000 | 6,334 |
 
 ---
 
@@ -97,7 +164,7 @@ This is a **breaking API change** — SDK and frontend callers must remove the c
 
 ## Next Optimization: TradeCpiV2 with Caller-Provided Bump
 
-The `TradeCpiV2` instruction (tag already implemented on-chain) eliminates `find_program_address` by having the caller pass the PDA bump. Expected savings:
+The `TradeCpiV2` instruction eliminates `find_program_address` by having the caller pass the PDA bump. Expected savings:
 
 | Source | CU saved |
 |--------|----------|
@@ -106,7 +173,7 @@ The `TradeCpiV2` instruction (tag already implemented on-chain) eliminates `find
 | Stack allocation (already done) | ~100–200 |
 | **Total additional** | **~1,538** |
 
-**Projected open trade CU with V2: ~3,800** (from current 5,338).  
+**Projected open trade CU with V2: ~4,800** (from current 6,330).  
 Requires SDK callers to pass the bump byte — pending SDK update.
 
 ---
