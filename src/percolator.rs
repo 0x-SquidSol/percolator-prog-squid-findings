@@ -5091,8 +5091,8 @@ pub mod oracle {
             }
 
             // SECURITY: verify vault_y is owned by spl_token or spl_token_2022
-            let is_valid_token_program =
-                *vault_y_ai.owner == crate::spl_token::id() || *vault_y_ai.owner == spl_token_2022::ID;
+            let is_valid_token_program = *vault_y_ai.owner == crate::spl_token::id()
+                || *vault_y_ai.owner == spl_token_2022::ID;
             if !is_valid_token_program {
                 return Err(PercolatorError::OracleInvalid.into());
             }
@@ -5723,7 +5723,8 @@ pub mod collateral {
             let cur = crate::spl_token::state::get_token_account_amount(&src_data)?;
             crate::spl_token::state::set_token_account_amount(
                 &mut src_data,
-                cur.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?,
+                cur.checked_sub(amount)
+                    .ok_or(ProgramError::InsufficientFunds)?,
             )?;
             drop(src_data);
 
@@ -5731,7 +5732,8 @@ pub mod collateral {
             let cur = crate::spl_token::state::get_token_account_amount(&dst_data)?;
             crate::spl_token::state::set_token_account_amount(
                 &mut dst_data,
-                cur.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?,
+                cur.checked_add(amount)
+                    .ok_or(ProgramError::InvalidAccountData)?,
             )?;
             Ok(())
         }
@@ -5775,7 +5777,8 @@ pub mod collateral {
             let cur = crate::spl_token::state::get_token_account_amount(&src_data)?;
             crate::spl_token::state::set_token_account_amount(
                 &mut src_data,
-                cur.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?,
+                cur.checked_sub(amount)
+                    .ok_or(ProgramError::InsufficientFunds)?,
             )?;
             drop(src_data);
 
@@ -5783,7 +5786,8 @@ pub mod collateral {
             let cur = crate::spl_token::state::get_token_account_amount(&dst_data)?;
             crate::spl_token::state::set_token_account_amount(
                 &mut dst_data,
-                cur.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?,
+                cur.checked_add(amount)
+                    .ok_or(ProgramError::InvalidAccountData)?,
             )?;
             Ok(())
         }
@@ -5862,7 +5866,13 @@ pub mod insurance_lp {
                 true,
                 decimals,
                 0,
-                Some(vault_authority.key.as_ref().try_into().map_err(|_| ProgramError::InvalidAccountData)?),
+                Some(
+                    vault_authority
+                        .key
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                ),
                 None,
             )?;
         }
@@ -5910,7 +5920,9 @@ pub mod insurance_lp {
             let supply = crate::spl_token::state::get_mint_supply(&mint_data)?;
             crate::spl_token::state::set_mint_supply(
                 &mut mint_data,
-                supply.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?,
+                supply
+                    .checked_add(amount)
+                    .ok_or(ProgramError::InvalidAccountData)?,
             )?;
             drop(mint_data);
 
@@ -5919,7 +5931,8 @@ pub mod insurance_lp {
             let cur = crate::spl_token::state::get_token_account_amount(&dst_data)?;
             crate::spl_token::state::set_token_account_amount(
                 &mut dst_data,
-                cur.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?,
+                cur.checked_add(amount)
+                    .ok_or(ProgramError::InvalidAccountData)?,
             )?;
             Ok(())
         }
@@ -5964,7 +5977,9 @@ pub mod insurance_lp {
             let supply = crate::spl_token::state::get_mint_supply(&mint_data)?;
             crate::spl_token::state::set_mint_supply(
                 &mut mint_data,
-                supply.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?,
+                supply
+                    .checked_sub(amount)
+                    .ok_or(ProgramError::InsufficientFunds)?,
             )?;
             drop(mint_data);
 
@@ -5973,7 +5988,8 @@ pub mod insurance_lp {
             let cur = crate::spl_token::state::get_token_account_amount(&src_data)?;
             crate::spl_token::state::set_token_account_amount(
                 &mut src_data,
-                cur.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?,
+                cur.checked_sub(amount)
+                    .ok_or(ProgramError::InsufficientFunds)?,
             )?;
             Ok(())
         }
@@ -9452,8 +9468,7 @@ pub mod processor {
                 let vault_data = a_vault
                     .try_borrow_data()
                     .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                crate::spl_token::state::get_token_account_amount(&vault_data)
-                    .unwrap_or(0)
+                crate::spl_token::state::get_token_account_amount(&vault_data).unwrap_or(0)
             };
             let state = crate::creator_lock::CreatorStakeLock {
                 magic: crate::creator_lock::CREATOR_LOCK_MAGIC,

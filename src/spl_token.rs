@@ -52,8 +52,15 @@ pub fn initialize_mint(
     }
     let mut accounts = Vec::with_capacity(2);
     accounts.push(AccountMeta::new(*mint, false));
-    accounts.push(AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false));
-    Ok(Instruction { program_id: id(), accounts, data: data.to_vec() })
+    accounts.push(AccountMeta::new_readonly(
+        solana_program::sysvar::rent::id(),
+        false,
+    ));
+    Ok(Instruction {
+        program_id: id(),
+        accounts,
+        data: data.to_vec(),
+    })
 }
 
 /// `Transfer` (tag 3).  Accounts: [WRITE] source, [WRITE] dest, [SIGNER] authority.
@@ -72,7 +79,11 @@ pub fn transfer(
     accounts.push(AccountMeta::new(*source, false));
     accounts.push(AccountMeta::new(*dest, false));
     accounts.push(AccountMeta::new_readonly(*authority, true));
-    Ok(Instruction { program_id: id(), accounts, data: data.to_vec() })
+    Ok(Instruction {
+        program_id: id(),
+        accounts,
+        data: data.to_vec(),
+    })
 }
 
 /// `MintTo` (tag 7).  Accounts: [WRITE] mint, [WRITE] destination, [SIGNER] authority.
@@ -91,7 +102,11 @@ pub fn mint_to(
     accounts.push(AccountMeta::new(*mint, false));
     accounts.push(AccountMeta::new(*destination, false));
     accounts.push(AccountMeta::new_readonly(*authority, true));
-    Ok(Instruction { program_id: id(), accounts, data: data.to_vec() })
+    Ok(Instruction {
+        program_id: id(),
+        accounts,
+        data: data.to_vec(),
+    })
 }
 
 /// `Burn` (tag 8).  Accounts: [WRITE] account, [WRITE] mint, [SIGNER] authority.
@@ -110,7 +125,11 @@ pub fn burn(
     accounts.push(AccountMeta::new(*account, false));
     accounts.push(AccountMeta::new(*mint, false));
     accounts.push(AccountMeta::new_readonly(*authority, true));
-    Ok(Instruction { program_id: id(), accounts, data: data.to_vec() })
+    Ok(Instruction {
+        program_id: id(),
+        accounts,
+        data: data.to_vec(),
+    })
 }
 
 // ─── State types (raw byte layout — same as spl-token and pinocchio-token) ───
@@ -152,7 +171,9 @@ pub mod state {
                 is_initialized: data[45] != 0,
                 decimals: data[44],
                 supply: u64::from_le_bytes(
-                    data[36..44].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                    data[36..44]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
                 ),
             })
         }
@@ -173,7 +194,9 @@ pub mod state {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(u64::from_le_bytes(
-            data[36..44].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+            data[36..44]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
         ))
     }
 
@@ -238,13 +261,19 @@ pub mod state {
                 return Err(ProgramError::InvalidAccountData);
             }
             let mint = Pubkey::new_from_array(
-                data[0..32].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                data[0..32]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
             );
             let owner = Pubkey::new_from_array(
-                data[32..64].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                data[32..64]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
             );
             let amount = u64::from_le_bytes(
-                data[64..72].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                data[64..72]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
             );
             // AccountState: 0=uninitialized, 1=initialized, 2=frozen
             // pinocchio_token::state::AccountState has the same discriminants.
@@ -253,7 +282,12 @@ pub mod state {
                 1 => AccountState::Initialized,
                 _ => AccountState::Frozen,
             };
-            Ok(Self { mint, owner, amount, state })
+            Ok(Self {
+                mint,
+                owner,
+                amount,
+                state,
+            })
         }
     }
 
@@ -263,7 +297,9 @@ pub mod state {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(u64::from_le_bytes(
-            data[64..72].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+            data[64..72]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
         ))
     }
 
