@@ -4515,9 +4515,11 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                // Policy is only relevant after resolution when insurance can be withdrawn.
-                if !state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
+                // Policy can be set on live or resolved markets.
+                // Live markets: enables rate-limited yield distribution.
+                // Resolved markets: enables post-resolution withdrawal.
+                if false {
+                    // Removed: resolution gate no longer required
                 }
 
                 let header = state::read_header(&data);
