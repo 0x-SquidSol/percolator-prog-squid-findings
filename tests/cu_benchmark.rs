@@ -606,6 +606,7 @@ impl TestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data,
         };

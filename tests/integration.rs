@@ -2872,6 +2872,7 @@ impl TestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data,
         };
@@ -4961,6 +4962,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data,
         };
@@ -12558,6 +12560,7 @@ impl TestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data,
         };
@@ -12843,6 +12846,7 @@ fn test_attack_topup_insurance_insufficient_balance() {
             AccountMeta::new(ata, false),
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data,
     };
@@ -24541,6 +24545,7 @@ fn test_attack_topup_insurance_wrong_vault() {
             AccountMeta::new(ata, false),
             AccountMeta::new(fake_vault, false), // Wrong vault
             AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data,
     };
