@@ -6845,16 +6845,15 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
     program_path();
 
     println!("=== MAINTENANCE FEE DRAIN & GC TEST ===");
-    println!("Verifying anti-DoS mechanism: fee drain -> dust -> GC");
+    println!("Per-slot maintenance fees are disabled in this revision (spec §8.2).");
+    println!("Verifying: SetMaintenanceFee is accepted, cranks succeed, but fees do NOT drain accounts.");
     println!();
 
     // Use standard TestEnv
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    // Set maintenance fee via SetMaintenanceFee instruction
-    // Fee: 1_000_000 per slot = 0.001 SOL per slot (in 9-decimal units)
-    // 500 slots will drain 0.5 SOL
+    // Set maintenance fee via SetMaintenanceFee instruction — should be accepted
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let maintenance_fee: u128 = 1_000_000;
     let result = env.try_set_maintenance_fee(&admin, maintenance_fee);
@@ -6863,161 +6862,54 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
         "SetMaintenanceFee should succeed: {:?}",
         result
     );
-    println!(
-        "Set maintenance_fee_per_slot = {} (0.001 SOL/slot)",
-        maintenance_fee
-    );
+    println!("Set maintenance_fee_per_slot = {} (accepted by engine)", maintenance_fee);
 
     // Create a user with small deposit
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 500_000_000); // 0.5 SOL
-    println!("Created user (idx={}) with 0.5 SOL deposit", user_idx);
+    let initial_capital = env.read_account_capital(user_idx);
+    println!("Created user (idx={}) with initial capital={}", user_idx, initial_capital);
 
-    // Read initial num_used_accounts
     let initial_used = env.read_num_used_accounts();
     println!("Initial num_used_accounts: {}", initial_used);
     assert!(initial_used >= 1, "Should have at least 1 account");
 
-    // Advance time to drain fees
-    // 0.5 SOL / 0.001 SOL per slot = 500 slots to drain
-    // Advance 600 slots to ensure complete drain
-    env.set_slot(700);
-    println!("Advanced to slot 700 (600 slots elapsed)");
-    println!(
-        "Expected fee drain: {} slots * {} = {} lamports (~0.6 SOL)",
-        600,
-        maintenance_fee,
-        600u128 * maintenance_fee
-    );
+    // Advance time and run multiple cranks
+    // Per-slot fees are disabled (spec §8.2), so capital should NOT be drained
+    for slot in [700u64, 800, 900, 1000, 1100, 1200] {
+        env.set_slot(slot);
+        env.crank();
+    }
+    println!("Ran multiple cranks through slot 1200");
 
-    // Run crank - this will:
-    // 1. Settle maintenance fees (draining capital)
-    // 2. Run GC on dust accounts
-    env.crank();
-    println!("Crank executed");
-
-    // Verify account was GC'd
+    // Capital should be unchanged (fees are disabled — no per-slot drain)
+    let final_capital = env.read_account_capital(user_idx);
     let final_used = env.read_num_used_accounts();
+    println!("Final capital: {} (initial: {})", final_capital, initial_capital);
     println!("Final num_used_accounts: {}", final_used);
 
-    // Helper closure to verify GC and account reuse
-    let verify_gc_and_reuse = |env: &mut TestEnv, freed_slot: u16| {
-        println!();
-        println!("=== VERIFYING ACCOUNT SLOT PROPERLY CLEARED ===");
+    assert_eq!(
+        final_capital, initial_capital,
+        "Per-slot maintenance fees are disabled: capital should not decrease. \
+         initial={} final={}",
+        initial_capital, final_capital
+    );
 
-        // 1. Verify bitmap bit is cleared
-        let is_used = env.is_slot_used(freed_slot);
-        println!(
-            "Bitmap bit for slot {}: {}",
-            freed_slot,
-            if is_used {
-                "SET (BAD!)"
-            } else {
-                "CLEARED (good)"
-            }
-        );
-        assert!(!is_used, "Bitmap bit should be cleared after GC");
+    // Account should NOT be GC'd since capital was not drained by fees
+    assert_eq!(
+        final_used, initial_used,
+        "No GC expected: account has non-zero capital (fees are disabled). \
+         initial_used={} final_used={}",
+        initial_used, final_used
+    );
 
-        // 2. Verify account capital is zeroed
-        let capital = env.read_account_capital(freed_slot);
-        println!("Account capital for slot {}: {}", freed_slot, capital);
-        assert_eq!(capital, 0, "Account capital should be zero after GC");
-
-        // 3. Create new user - the program should reuse the freed slot
-        // Note: The test helper's account_count is out of sync with the program's freelist.
-        // The program uses LIFO freelist, so it will reuse freed_slot (0).
-        // But init_user returns self.account_count which is wrong after GC.
-        println!();
-        println!("=== VERIFYING SLOT REUSE ===");
-        let num_used_before = env.read_num_used_accounts();
-        println!("num_used_accounts before new user: {}", num_used_before);
-
-        let new_user = Keypair::new();
-        let _helper_idx = env.init_user(&new_user); // Helper returns wrong idx, ignore it
-
-        // The program's freelist is LIFO - freed slot 0 should be reused
-        // Verify by checking that the bitmap bit for slot 0 is now SET
-        let slot_0_used = env.is_slot_used(freed_slot);
-        println!(
-            "After init_user, bitmap bit for slot {}: {}",
-            freed_slot,
-            if slot_0_used {
-                "SET (slot reused!)"
-            } else {
-                "still cleared"
-            }
-        );
-        assert!(
-            slot_0_used,
-            "Freed slot should be reused by new user (LIFO freelist)"
-        );
-
-        // 4. Verify num_used_accounts incremented (not doubled - slot was reused)
-        let num_used_after = env.read_num_used_accounts();
-        println!("num_used_accounts after new user: {}", num_used_after);
-        assert_eq!(
-            num_used_after, 1,
-            "Should have exactly 1 account (slot reused, not new slot)"
-        );
-
-        // 5. Verify new account has fresh state by checking it can receive deposits
-        // The actual slot is 0 (the freed slot), deposit using that
-        env.deposit(&new_user, freed_slot, 100_000_000); // 0.1 SOL
-        let new_capital = env.read_account_capital(freed_slot);
-        println!(
-            "Account capital at slot {} after deposit: {}",
-            freed_slot, new_capital
-        );
-        assert!(
-            new_capital > 0,
-            "Reused slot should accept deposits (fresh state)"
-        );
-
-        println!();
-        println!("ACCOUNT REUSE VERIFIED SAFE:");
-        println!("  1. Bitmap bit cleared after GC");
-        println!("  2. Account data zeroed after GC");
-        println!("  3. Freed slot reused by next allocation (LIFO freelist)");
-        println!("  4. Reused slot has fresh state (accepts deposits)");
-        println!("  5. No stale data leaked to new account");
-    };
-
-    if final_used < initial_used {
-        println!();
-        println!("SUCCESS: Account was garbage collected!");
-        println!("  Initial accounts: {}", initial_used);
-        println!("  Final accounts: {}", final_used);
-        println!("  Accounts freed: {}", initial_used - final_used);
-
-        verify_gc_and_reuse(&mut env, user_idx);
-    } else {
-        // Account might not be GC'd immediately due to fee_credits absorbing fees first
-        // Run additional cranks to fully drain
-        println!();
-        println!("First crank did not GC account - running additional cranks...");
-
-        for i in 0..5 {
-            env.set_slot(800 + i * 100);
-            env.crank();
-            let used = env.read_num_used_accounts();
-            println!("After crank at slot {}: num_used = {}", 800 + i * 100, used);
-            if used < initial_used {
-                println!();
-                println!("SUCCESS: Account GC'd after {} additional cranks", i + 1);
-                verify_gc_and_reuse(&mut env, user_idx);
-                println!();
-                println!("MAINTENANCE FEE DRAIN TEST COMPLETE");
-                return;
-            }
-        }
-
-        // If still not GC'd, it's likely the account has some residual state
-        panic!("Account was not GC'd after multiple cranks - test failed");
-    }
+    // SPL vault balance is preserved (no token transfers from fee drain)
+    let vault = env.vault_balance();
+    assert!(vault > 0, "Vault should still hold user's tokens");
 
     println!();
-    println!("MAINTENANCE FEE DRAIN TEST COMPLETE");
+    println!("MAINTENANCE FEE DRAIN TEST COMPLETE (fees disabled, capital preserved)");
 }
 
 // ============================================================================
@@ -7102,10 +6994,18 @@ fn test_premarket_resolution_full_lifecycle() {
     // Verify market is resolved
     assert!(env.is_market_resolved(), "Market should be resolved");
 
-    // Step 3: Crank to force-close positions
+    // Step 3: Crank to settle PnL, then force-close accounts
     env.set_slot(200);
     env.crank();
-    println!("Crank executed to force-close positions");
+    println!("Crank executed to settle PnL");
+
+    // The resolved crank only settles PnL; position zeroing and account freeing
+    // happen when users call CloseAccount or admin calls AdminForceCloseAccount.
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    println!("Positions force-closed via AdminForceCloseAccount");
 
     // Verify positions are closed
     let lp_pos_after = env.read_account_position(lp_idx);
@@ -7322,10 +7222,17 @@ fn test_withdraw_insurance_requires_positions_closed() {
     );
     println!("WithdrawInsurance blocked with open positions: OK");
 
-    // Now crank to close positions
+    // Now crank to settle PnL, then force-close accounts
     env.set_slot(200);
     env.crank();
-    println!("Crank executed to force-close positions");
+    println!("Crank executed to settle PnL");
+
+    // The resolved crank only settles PnL; position zeroing requires AdminForceCloseAccount
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    println!("Positions force-closed via AdminForceCloseAccount");
 
     // Now withdrawal should succeed
     let result = env.try_withdraw_insurance(&admin);
@@ -7957,18 +7864,23 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
         "rejected open-position limited withdraw must not change insurance"
     );
 
-    // Close positions via resolved crank path.
+    // Close positions via resolved crank path + AdminForceCloseAccount.
+    // The resolved crank only settles PnL; AdminForceCloseAccount zeros positions.
     env.set_slot(200);
     env.crank();
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
     assert_eq!(
         env.read_account_position(user_idx),
         0,
-        "precondition: user position should be closed after crank"
+        "precondition: user position should be closed after force-close"
     );
     assert_eq!(
         env.read_account_position(lp_idx),
         0,
-        "precondition: lp position should be closed after crank"
+        "precondition: lp position should be closed after force-close"
     );
 
     // Misaligned amount should be rejected for unit_scale=1000.
@@ -8159,47 +8071,41 @@ fn test_premarket_paginated_force_close() {
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved");
 
-    // Crank multiple times to close all positions (BATCH_SIZE = 8 per crank)
-    let mut crank_count = 0;
-    let max_cranks = 20; // Safety limit (ceil(101/8) = 13 cranks needed)
-
-    loop {
-        env.set_slot(200 + crank_count * 10);
+    // The resolved crank now only settles PnL (paginated, BATCH_SIZE=8 per crank).
+    // Position zeroing and account freeing happen via AdminForceCloseAccount.
+    // Run enough cranks to settle PnL for all accounts (ceil(101/8) = 13 cranks).
+    let num_cranks = 20; // Safety margin above ceil(101/8)
+    for i in 0..num_cranks {
+        env.set_slot(200 + i * 10);
         env.crank();
-        crank_count += 1;
+    }
+    println!("Ran {} cranks to settle PnL for all accounts", num_cranks);
 
-        // Check if all positions closed
-        let mut remaining_positions = 0;
-        for (_, idx) in &users {
-            if env.read_account_position(*idx) != 0 {
-                remaining_positions += 1;
-            }
-        }
-        // Also check LP
-        if env.read_account_position(lp_idx) != 0 {
+    // Force-close all user accounts via AdminForceCloseAccount
+    for (user, idx) in &users {
+        let result = env.try_admin_force_close_account(&admin, *idx, &user.pubkey());
+        assert!(result.is_ok(), "AdminForceCloseAccount user {} failed: {:?}", idx, result);
+    }
+    // Force-close LP account
+    let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
+    assert!(result.is_ok(), "AdminForceCloseAccount LP failed: {:?}", result);
+    println!("All accounts force-closed via AdminForceCloseAccount");
+
+    // Verify all positions are zero
+    let mut remaining_positions = 0;
+    for (_, idx) in &users {
+        if env.read_account_position(*idx) != 0 {
             remaining_positions += 1;
         }
-
-        println!(
-            "After crank {}: {} positions remaining",
-            crank_count, remaining_positions
-        );
-
-        if remaining_positions == 0 {
-            break;
-        }
-        if crank_count >= max_cranks {
-            panic!("Failed to close all positions after {} cranks", max_cranks);
-        }
     }
-
-    println!();
-    println!("All positions closed after {} cranks", crank_count);
-    println!(
-        "Expected cranks for {} accounts: ~{}",
-        NUM_USERS + 1,
-        (NUM_USERS + 1 + 63) / 64
+    if env.read_account_position(lp_idx) != 0 {
+        remaining_positions += 1;
+    }
+    assert_eq!(
+        remaining_positions, 0,
+        "All positions should be zero after AdminForceCloseAccount"
     );
+    println!("All {} positions confirmed zero", NUM_USERS + 1);
 
     // Verify insurance can now be withdrawn
     let result = env.try_withdraw_insurance(&admin);
@@ -8265,31 +8171,40 @@ fn test_premarket_binary_outcome_price_zero() {
     env.set_slot(200);
     env.crank();
 
+    // The resolved crank settles PnL but doesn't zero positions.
+    // Read PnL/capital BEFORE force-closing (while PnL field still exists).
+    let user_capital_before_close = env.read_account_capital(user_idx);
+    let user_pnl_before_close = env.read_account_pnl(user_idx);
+    let lp_capital_before_close = env.read_account_capital(lp_idx);
+    let lp_pnl_before_close = env.read_account_pnl(lp_idx);
+
+    // Force-close accounts to zero positions
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+
     // User should have lost (position closed at ~0, entry was ~0.5)
     let user_pos = env.read_account_position(user_idx);
     assert_eq!(user_pos, 0, "Position should be closed");
 
     // User went long at ~0.5, market resolved at ~0. User LOST.
-    // Check using equity = capital + max(pnl, 0) since PnL may be in warmup.
-    let user_capital = env.read_account_capital(user_idx);
-    let user_pnl = env.read_account_pnl(user_idx);
-    let user_equity = user_capital as i128 + user_pnl;
+    // Check using equity = capital + pnl (at time of settlement, before force-close)
+    let user_equity = user_capital_before_close as i128 + user_pnl_before_close;
     assert!(
         user_equity < 1_000_000_000,
         "NO outcome: Long user equity should be below initial deposit. \
          capital={}, pnl={}, equity={}, initial=1_000_000_000",
-        user_capital, user_pnl, user_equity
+        user_capital_before_close, user_pnl_before_close, user_equity
     );
 
     // LP (short side) should have gained or at least not lost.
-    let lp_capital = env.read_account_capital(lp_idx);
-    let lp_pnl = env.read_account_pnl(lp_idx);
-    let lp_equity = lp_capital as i128 + lp_pnl;
+    let lp_equity = lp_capital_before_close as i128 + lp_pnl_before_close;
     assert!(
         lp_equity >= 10_000_000_000,
         "NO outcome: LP (short) equity should be >= initial deposit. \
          capital={}, pnl={}, equity={}, initial=10_000_000_000",
-        lp_capital, lp_pnl, lp_equity
+        lp_capital_before_close, lp_pnl_before_close, lp_equity
     );
 }
 
@@ -8344,31 +8259,40 @@ fn test_premarket_binary_outcome_price_one() {
     env.set_slot(200);
     env.crank();
 
+    // The resolved crank settles PnL but doesn't zero positions.
+    // Read PnL/capital BEFORE force-closing (while PnL field still exists).
+    let user_capital_before_close = env.read_account_capital(user_idx);
+    let user_pnl_before_close = env.read_account_pnl(user_idx);
+    let lp_capital_before_close = env.read_account_capital(lp_idx);
+    let lp_pnl_before_close = env.read_account_pnl(lp_idx);
+
+    // Force-close accounts to zero positions
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+
     // User should have won (position closed at 1.0, entry was ~0.5)
     let user_pos = env.read_account_position(user_idx);
     assert_eq!(user_pos, 0, "Position should be closed");
 
     // User went long at ~0.5, market resolved at 1.0. User WON.
-    // Check using equity = capital + max(pnl, 0) since PnL may be in warmup.
-    let user_capital = env.read_account_capital(user_idx);
-    let user_pnl = env.read_account_pnl(user_idx);
-    let user_equity = user_capital as i128 + user_pnl;
+    // Check using equity = capital + pnl (at time of settlement, before force-close)
+    let user_equity = user_capital_before_close as i128 + user_pnl_before_close;
     assert!(
         user_equity > 1_000_000_000,
         "YES outcome: Long user equity should exceed initial deposit. \
          capital={}, pnl={}, equity={}, initial=1_000_000_000",
-        user_capital, user_pnl, user_equity
+        user_capital_before_close, user_pnl_before_close, user_equity
     );
 
     // LP (short side) should have lost
-    let lp_capital = env.read_account_capital(lp_idx);
-    let lp_pnl = env.read_account_pnl(lp_idx);
-    let lp_equity = lp_capital as i128 + lp_pnl;
+    let lp_equity = lp_capital_before_close as i128 + lp_pnl_before_close;
     assert!(
         lp_equity < 10_000_000_000,
         "YES outcome: LP (short) equity should be below initial deposit. \
          capital={}, pnl={}, equity={}, initial=10_000_000_000",
-        lp_capital, lp_pnl, lp_equity
+        lp_capital_before_close, lp_pnl_before_close, lp_equity
     );
 }
 
@@ -8538,12 +8462,23 @@ fn test_premarket_force_close_cu_benchmark() {
         }
     }
 
-    // Multiple cranks needed: batch_size=8, 65 total accounts (1 LP + 64 users).
-    // Need ceil(65/8) = 9 cranks total. First crank already ran above, so 8 more.
+    // Multiple cranks needed to settle PnL for all accounts.
+    // batch_size=8, 65 total accounts (1 LP + 64 users) → ceil(65/8) = 9 cranks.
+    // First crank already ran above, so 8 more to ensure all PnL settled.
     for i in 0..8 {
         env.set_slot(210 + i * 10);
         env.crank();
     }
+
+    // The resolved crank only settles PnL; position zeroing requires AdminForceCloseAccount.
+    // Force-close all user accounts.
+    for (user, idx) in &users {
+        let result = env.try_admin_force_close_account(&admin, *idx, &user.pubkey());
+        assert!(result.is_ok(), "AdminForceCloseAccount user {} failed: {:?}", idx, result);
+    }
+    // Force-close LP
+    let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
+    assert!(result.is_ok(), "AdminForceCloseAccount LP failed: {:?}", result);
 
     let mut remaining = 0;
     for (_, idx) in &users {
@@ -8553,7 +8488,7 @@ fn test_premarket_force_close_cu_benchmark() {
     }
     assert_eq!(
         remaining, 0,
-        "All positions should be closed after multiple cranks"
+        "All positions should be closed after AdminForceCloseAccount"
     );
 
     println!();
@@ -8630,29 +8565,26 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved at price 2.0");
 
-    // Force-close by cranking
+    // The resolved crank settles PnL via touch_account_full (uses set_pnl).
+    // Position is NOT zeroed by the crank; read PnL/pnl_pos_tot now.
     env.set_slot(150);
     env.crank();
 
-    // Verify position was closed
-    let pos_after = env.read_account_position(user_long_idx);
-    assert_eq!(pos_after, 0, "Position should be closed after force-close");
-
-    // Check user's PnL - should be positive (they were long and price went up)
+    // Check user's PnL after crank settles mark-to-oracle
+    // (should be positive: long position, price doubled)
     let user_pnl = env.read_account_pnl(user_long_idx);
-    println!("User PnL after force-close: {}", user_pnl);
+    println!("User PnL after crank settlement: {}", user_pnl);
 
     // *** BUG #10 FIX VERIFICATION ***
     // Force-close now uses set_pnl() to maintain pnl_pos_tot aggregate.
-    // Verify pnl_pos_tot includes the user's positive PnL after force-close.
+    // Verify pnl_pos_tot includes the user's positive PnL after settlement.
     let pnl_pos_tot_after = env.read_pnl_pos_tot();
-    println!("pnl_pos_tot after force-close: {}", pnl_pos_tot_after);
+    println!("pnl_pos_tot after crank settlement: {}", pnl_pos_tot_after);
 
     // If user has positive PnL, pnl_pos_tot must be at least that large
     // (it may also include LP's positive PnL if LP has any)
     if user_pnl > 0 {
         // pnl_pos_tot should be >= user's positive PnL
-        // It equals sum of max(0, pnl_i) for all accounts
         assert!(
             pnl_pos_tot_after >= user_pnl as u128,
             "Bug #10 not fixed! pnl_pos_tot should include user's positive PnL. \
@@ -8661,17 +8593,27 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
             user_pnl
         );
 
-        // Also verify it changed from before (was 0 or small before force-close)
+        // Also verify it changed from before (was 0 or small before resolution)
         assert!(
             pnl_pos_tot_after > pnl_pos_tot_before,
-            "pnl_pos_tot should have increased after force-close created positive PnL. \
+            "pnl_pos_tot should have increased after crank settled positive PnL. \
              before={}, after={}",
             pnl_pos_tot_before,
             pnl_pos_tot_after
         );
 
-        println!("FIX VERIFIED: pnl_pos_tot correctly updated after force-close");
+        println!("FIX VERIFIED: pnl_pos_tot correctly updated after settlement");
     }
+
+    // Now force-close to zero the position
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_long_idx, &user_long.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+
+    // Verify position was zeroed
+    let pos_after = env.read_account_position(user_long_idx);
+    assert_eq!(pos_after, 0, "Position should be zero after AdminForceCloseAccount");
 
     println!("REGRESSION TEST PASSED: pnl_pos_tot correctly maintained after force-close");
 }
@@ -11975,7 +11917,7 @@ fn test_attack_trade_after_force_close() {
     )
     .expect("pre-resolution TradeCpi setup must succeed");
 
-    // Resolve + force close
+    // Resolve + settle PnL via crank + force-close positions
     env.set_slot(200);
     env.try_push_oracle_price(&admin, 1_000_000, 200)
         .expect("oracle price push must succeed");
@@ -11984,11 +11926,18 @@ fn test_attack_trade_after_force_close() {
     env.set_slot(300);
     env.crank();
 
+    // The resolved crank settles PnL but doesn't zero positions.
+    // Force-close both accounts via AdminForceCloseAccount.
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+
     // Verify position force-closed
     let pos = env.read_account_position(user_idx);
-    assert_eq!(pos, 0, "Position should be force-closed");
+    assert_eq!(pos, 0, "Position should be force-closed after AdminForceCloseAccount");
 
-    // Try to open new trade - should fail (market resolved)
+    // Try to open new trade - should fail (market resolved, account closed)
     let result = env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -13348,13 +13297,20 @@ fn test_attack_maintenance_fee_u128_max() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    // Advance time and crank - per spec §1.5, fee_per_slot * dt uses checked
-    // arithmetic. u128::MAX * dt > u128 → EngineOverflow. Crank must fail.
+    // Advance time and crank - maintenance fees are disabled (spec §8.2),
+    // so even u128::MAX fee does not trigger overflow. Crank must succeed.
+    let capital_before = env.read_account_capital(user_idx);
     env.set_slot(200);
     let result = env.try_crank();
     assert!(
-        result.is_err(),
-        "Crank with u128::MAX fee should fail (checked arithmetic overflow per §1.5)"
+        result.is_ok(),
+        "Crank must succeed even with u128::MAX fee (fees disabled per §8.2): {:?}",
+        result
+    );
+    let capital_after = env.read_account_capital(user_idx);
+    assert_eq!(
+        capital_after, capital_before,
+        "Capital must not change when maintenance fees are disabled"
     );
 }
 
@@ -14679,11 +14635,19 @@ fn test_attack_premarket_force_close_pnl_conservation() {
     env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap(); // 50% up
     env.try_resolve_market(&admin).unwrap();
 
-    // Force-close via crank
+    // Force-close via crank (settles PnL only; positions require AdminForceCloseAccount)
     env.set_slot(300);
     env.crank();
     env.set_slot(400);
     env.crank(); // Second crank in case pagination needed
+
+    // Close each account explicitly
+    for (user, user_idx) in &users {
+        env.try_admin_force_close_account(&admin, *user_idx, &user.pubkey())
+            .expect("AdminForceCloseAccount user must succeed");
+    }
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
 
     // All positions should be closed
     for (_, user_idx) in &users {
@@ -14817,6 +14781,12 @@ fn test_attack_premarket_extra_cranks_idempotent() {
     env.set_slot(200);
     env.crank();
 
+    // Crank settles PnL but does not zero positions; use AdminForceCloseAccount
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+
     // Verify positions are closed
     assert_eq!(env.read_account_position(user_idx), 0);
     assert_eq!(env.read_account_position(lp_idx), 0);
@@ -14914,6 +14884,12 @@ fn test_attack_premarket_resolve_extreme_high_price() {
     // Force-close: should handle extreme PnL without panicking
     env.set_slot(5000);
     env.crank();
+
+    // Crank settles PnL; positions require explicit AdminForceCloseAccount
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed after extreme resolution");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed after extreme resolution");
 
     // Verify positions are closed (no overflow crash)
     assert_eq!(
@@ -15028,6 +15004,12 @@ fn test_attack_double_withdraw_insurance() {
     env.try_resolve_market(&admin).unwrap();
     env.set_slot(200);
     env.crank();
+
+    // Crank settles PnL; positions must be explicitly closed before insurance withdrawal
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
 
     let _vault_before_first_withdraw = env.read_vault();
 
@@ -15519,6 +15501,12 @@ fn test_attack_lp_close_account_with_pnl_after_force_close() {
 
     env.set_slot(200);
     env.crank();
+
+    // Crank settles PnL; positions require explicit AdminForceCloseAccount
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
 
     // Positions should be zero
     assert_eq!(env.read_account_position(lp_idx), 0);
@@ -17793,11 +17781,17 @@ fn test_attack_premarket_paginated_force_close() {
     env.try_push_oracle_price(&admin, 1_000_000, 2000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    // Force-close via multiple cranks (paginated)
+    // Settle PnL via multiple cranks (paginated)
     for slot in (200..=400).step_by(50) {
         env.set_slot(slot);
         env.crank();
     }
+
+    // Positions require explicit AdminForceCloseAccount to be zeroed
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
 
     // All positions should be closed
     let user_pos = env.read_account_position(user_idx);
@@ -18544,11 +18538,17 @@ fn test_attack_force_close_pnl_accuracy() {
     env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    // Force-close
+    // Settle PnL via cranks
     for slot in (200..=500).step_by(50) {
         env.set_slot(slot);
         env.crank();
     }
+
+    // Positions require explicit AdminForceCloseAccount to be zeroed
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
 
     // User should have profit (long position, price doubled)
     let user_pos = env.read_account_position(user_idx);
@@ -18989,8 +18989,9 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
 
     env.crank();
 
-    // Set maintenance fee to accrue insurance fees
-    env.try_set_maintenance_fee(&admin, 100).unwrap(); // 1% - must succeed
+    // Maintenance fees are disabled (spec §8.2). SetMaintenanceFee is accepted
+    // but fees are not applied during crank. Insurance only grows via TopUpInsurance.
+    env.try_set_maintenance_fee(&admin, 100).unwrap(); // Accepted but no-op
 
     // Top up insurance to disable force-realize
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -18998,18 +18999,18 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
     // Trade to create positions
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
 
-    // Record insurance before fee accrual
+    // Record insurance before crank
     let insurance_before = env.read_insurance_balance();
 
-    // Advance time to accrue fees (1000 slots * maintenance_fee_per_slot)
+    // Advance time — fees are disabled, so insurance must NOT grow from them
     env.set_slot(1000);
     env.crank();
 
-    // Insurance should have grown from fees
+    // Insurance should remain unchanged (maintenance fees disabled)
     let insurance_after = env.read_insurance_balance();
-    assert!(
-        insurance_after > insurance_before,
-        "Insurance should grow from maintenance fees! before={} after={}",
+    assert_eq!(
+        insurance_after, insurance_before,
+        "ATTACK: Insurance grew from maintenance fees that are supposed to be disabled! before={} after={}",
         insurance_before,
         insurance_after
     );
@@ -19028,8 +19029,7 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
     );
 
     // Haircut = min(residual, pnl_pos_tot) / pnl_pos_tot
-    // With growing insurance, residual = vault - c_tot - insurance decreases
-    // This makes haircut ratio smaller (safer), not larger
+    // With stable insurance, residual = vault - c_tot - insurance stays stable
     let residual = engine_vault - c_tot - insurance_after;
     let pnl_pos_tot = env.read_pnl_pos_tot();
     if pnl_pos_tot > 0 {
@@ -20154,11 +20154,15 @@ fn test_attack_liquidation_after_price_crash() {
     // maintenance_margin_bps=200 -> 2%, required margin = 100M*50/1e6*0.02 = 100 tokens
     // equity = 5000 - 8800 = -3800 -> deeply negative -> liquidated
     env.set_slot_and_price(100, 50_000_000);
-    env.crank(); // Crank to settle mark-to-oracle and liquidate
+    env.crank(); // Settle mark-to-oracle (crank does not liquidate with None hint)
 
-    // After crank with liquidation, user's position should be reduced or zeroed
+    // Use explicit liquidation instruction to liquidate the insolvent account
+    env.try_liquidate_target(user_idx)
+        .expect("Liquidation of insolvent account must succeed");
+
+    // After explicit liquidation, user's position should be reduced or zeroed
     let pos_after = env.read_account_position(user_idx);
-    // Crank may liquidate the position partially or fully
+    // Liquidation reduces or eliminates the position
     assert!(
         pos_after.abs() < pos.abs(),
         "ATTACK: Insolvent position not liquidated! before={} after={}",
@@ -22316,19 +22320,20 @@ fn test_attack_extreme_maintenance_fee_no_overflow() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Set high maintenance fee
+    // Set high maintenance fee - accepted but disabled (spec §8.2), no overflow possible
     env.try_set_maintenance_fee(&admin, 10_000_000_000).unwrap();
 
-    // Advance many slots to accrue fees
+    // Advance many slots - fees are disabled so capital must not decrease
+    let user_cap_before = env.read_account_capital(user_idx);
     env.set_slot(1000);
     env.crank();
 
-    // Capital should have decreased from fees (10B fee rate * 1000 slots)
+    // Capital must remain unchanged (fees disabled, no overflow risk)
     let user_cap = env.read_account_capital(user_idx);
-    assert!(
-        user_cap < 5_000_000_000,
-        "Extreme fees should reduce capital! cap={}",
-        user_cap
+    assert_eq!(
+        user_cap, user_cap_before,
+        "ATTACK: Capital changed even though maintenance fees are disabled! before={} after={}",
+        user_cap_before, user_cap
     );
 
     // Conservation still holds
@@ -22336,18 +22341,18 @@ fn test_attack_extreme_maintenance_fee_no_overflow() {
     let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
     assert_eq!(
         c_tot, sum,
-        "ATTACK: c_tot desync with extreme maintenance fee! c_tot={} sum={}",
+        "ATTACK: c_tot desync! c_tot={} sum={}",
         c_tot, sum
     );
 
-    // SPL vault unchanged (fees are internal accounting)
+    // SPL vault unchanged
     let spl_vault = {
         let vault_data = env.svm.get_account(&env.vault).unwrap().data;
         TokenAccount::unpack(&vault_data).unwrap().amount
     };
     assert_eq!(
         spl_vault, 26_000_000_000,
-        "ATTACK: SPL vault changed from maintenance fees!"
+        "ATTACK: SPL vault changed!"
     );
 }
 
@@ -26006,21 +26011,24 @@ fn test_attack_maintenance_fee_depletes_small_capital() {
 
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
 
-    // Set high maintenance fee
+    // Maintenance fees are disabled (spec §8.2). SetMaintenanceFee is accepted
+    // but no fee deductions happen during crank.
     env.try_set_maintenance_fee(&admin, 1_000_000).unwrap();
 
-    // Crank several times to accrue fees
+    let cap_before = env.read_account_capital(user_idx);
+
+    // Crank several times — capital must NOT be depleted
     for slot in (200..=1000).step_by(100) {
         env.set_slot(slot);
         env.crank();
     }
 
-    // Capital should not go negative (saturating)
+    // Capital must remain unchanged (fees disabled, no depletion)
     let cap = env.read_account_capital(user_idx);
-    assert!(
-        cap < 1_000_000,
-        "Capital should be depleted by maintenance fees: cap={}",
-        cap
+    assert_eq!(
+        cap, cap_before,
+        "ATTACK: Capital changed even though maintenance fees are disabled! before={} after={}",
+        cap_before, cap
     );
 
     // Conservation
@@ -26031,6 +26039,9 @@ fn test_attack_maintenance_fee_depletes_small_capital() {
         "Conservation: engine={} vault={}",
         engine_vault, vault
     );
+
+    // Suppress unused variable warning
+    let _ = lp_idx;
 }
 
 /// ATTACK: Mark precision with very small price increments.
@@ -27553,31 +27564,36 @@ fn test_attack_maintenance_fee_huge_dt_saturation() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Set maximum maintenance fee
+    // Maintenance fees are disabled (spec §8.2). Even with u64::MAX fee and
+    // huge dt, there is no overflow risk because fees are simply not applied.
     env.try_set_maintenance_fee(&admin, u64::MAX as u128)
         .unwrap();
 
-    // Jump forward a massive number of slots
+    let user_cap_before = env.read_account_capital(user_idx);
+
+    // Jump forward a massive number of slots — must not panic, must not deplete capital
     env.set_slot(1_000_000);
     env.crank();
 
-    // Fee * dt would overflow u128 without saturating math
-    // Verify no panic and conservation holds
+    // No panic, conservation holds
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
     assert_eq!(
         engine_vault as u64, vault,
-        "Conservation after huge dt fee: engine={} vault={}",
+        "Conservation after huge dt: engine={} vault={}",
         engine_vault, vault
     );
 
-    // User's capital should be depleted (or account GC'd)
+    // User's capital must remain unchanged (fees disabled)
     let user_cap = env.read_account_capital(user_idx);
     assert_eq!(
-        user_cap, 0,
-        "Huge fee should deplete user capital: cap={}",
-        user_cap
+        user_cap, user_cap_before,
+        "ATTACK: Capital changed even though maintenance fees are disabled! before={} after={}",
+        user_cap_before, user_cap
     );
+
+    // Suppress unused variable warning
+    let _ = lp_idx;
 }
 
 /// ATTACK: Trade with different sizes in rapid succession (consecutive slots).
@@ -28849,22 +28865,26 @@ fn test_attack_config_change_applied_to_next_instruction() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Set very high fee
+    // Maintenance fees are disabled (spec §8.2). Config changes are accepted
+    // but do not affect per-slot capital deductions during crank.
     env.try_set_maintenance_fee(&admin, 1_000_000).unwrap();
 
     // Trade immediately after config change
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
 
-    // Advance slots - high fee should take effect
+    // Record capital after trade (trading fees may reduce capital slightly)
+    let user_cap_after_trade = env.read_account_capital(user_idx);
+
+    // Advance slots — maintenance fees must NOT reduce capital further
     env.set_slot(200);
     env.crank();
 
-    // User capital should have decreased more than with low fee
+    // User capital must remain the same as after the trade (no fee deductions)
     let user_cap = env.read_account_capital(user_idx);
-    assert!(
-        user_cap < 5_000_000_000,
-        "High fee should have reduced user capital: cap={}",
-        user_cap
+    assert_eq!(
+        user_cap, user_cap_after_trade,
+        "ATTACK: Maintenance fee config change affected capital even though fees are disabled! before_crank={} after_crank={}",
+        user_cap_after_trade, user_cap
     );
 
     // Conservation
@@ -29812,51 +29832,48 @@ fn test_binary_market_complete_lifecycle_conservation() {
         .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
-    // Force-close all positions (may need multiple cranks for paginated)
+    // Settle PnL via crank (positions require explicit AdminForceCloseAccount)
     env.set_slot(200);
     env.crank();
 
-    // After force-close: positions should be zero
+    // Crank should not move SPL tokens (PnL settlement is internal accounting)
+    let vault_after_crank = env.vault_balance();
     assert_eq!(
-        env.read_account_position(user_a_idx),
-        0,
-        "user_a position should be zero after force-close"
-    );
-    assert_eq!(
-        env.read_account_position(user_b_idx),
-        0,
-        "user_b position should be zero after force-close"
-    );
-    assert_eq!(
-        env.read_account_position(lp_idx),
-        0,
-        "LP position should be zero after force-close"
+        vault_before, vault_after_crank,
+        "vault SPL balance should not change during crank-based PnL settlement"
     );
 
-    // Vault SPL balance unchanged by force-close (no token transfers)
-    let vault_after_close = env.vault_balance();
-    assert_eq!(
-        vault_before, vault_after_close,
-        "vault SPL balance should not change during force-close"
-    );
-
-    // Conservation: engine vault >= c_tot + insurance
-    let engine_vault = env.read_vault();
-    let c_tot = env.read_c_tot();
-    let insurance = env.read_insurance_balance();
+    // Conservation after crank: engine vault >= c_tot + insurance
+    let engine_vault_after_crank = env.read_vault();
+    let c_tot_after_crank = env.read_c_tot();
+    let insurance_after_crank = env.read_insurance_balance();
     assert!(
-        engine_vault >= c_tot + insurance,
-        "Conservation after force-close: vault={} c_tot={} ins={}",
-        engine_vault,
-        c_tot,
-        insurance
+        engine_vault_after_crank >= c_tot_after_crank + insurance_after_crank,
+        "Conservation after crank: vault={} c_tot={} ins={}",
+        engine_vault_after_crank,
+        c_tot_after_crank,
+        insurance_after_crank
     );
 
-    // Withdraw insurance
+    // Close all positions explicitly (AdminForceCloseAccount zeros pos, returns capital to ATAs)
+    env.try_admin_force_close_account(&admin, user_a_idx, &user_a.pubkey())
+        .expect("AdminForceCloseAccount user_a must succeed");
+    env.try_admin_force_close_account(&admin, user_b_idx, &user_b.pubkey())
+        .expect("AdminForceCloseAccount user_b must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+
+    // After AdminForceCloseAccount: all accounts are freed
+    assert_eq!(
+        env.read_num_used_accounts(), 0,
+        "All accounts should be freed after AdminForceCloseAccount"
+    );
+
+    // Withdraw insurance (all accounts closed, so withdrawal should succeed)
     let result = env.try_withdraw_insurance(&admin);
     assert!(
         result.is_ok(),
-        "WithdrawInsurance should succeed after force-close: {:?}",
+        "WithdrawInsurance should succeed after all accounts closed: {:?}",
         result
     );
 
@@ -29867,19 +29884,7 @@ fn test_binary_market_complete_lifecycle_conservation() {
         "insurance should be zero after withdrawal"
     );
 
-    // Crank to settle warmup (with warmup_period=0, one crank converts PnL to capital)
-    env.set_slot(300);
-    env.crank();
-
-    // Close all user accounts (with warmup=0, PnL converts after crank)
-    let close_a = env.try_close_account(&user_a, user_a_idx);
-    assert!(close_a.is_ok(), "User A close should succeed: {:?}", close_a);
-    let close_b = env.try_close_account(&user_b, user_b_idx);
-    assert!(close_b.is_ok(), "User B close should succeed: {:?}", close_b);
-    let close_lp = env.try_close_account(&lp, lp_idx);
-    assert!(close_lp.is_ok(), "LP close should succeed: {:?}", close_lp);
-
-    // Final vault balance should be >= 0 (all tokens accounted for)
+    // Final SPL vault should be near zero (all capital returned to users, insurance withdrawn)
     let final_vault = env.vault_balance();
     println!("Final vault SPL balance: {}", final_vault);
     println!("BINARY MARKET COMPLETE LIFECYCLE CONSERVATION: PASSED");
@@ -29936,31 +29941,34 @@ fn test_binary_market_close_account_warmup_delay() {
         .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
-    // Force-close
+    // Settle PnL via crank; positions require explicit AdminForceCloseAccount
     env.set_slot(200);
     env.crank();
+
+    // Read PnL BEFORE AdminForceCloseAccount (which will zero and return capital)
+    let pnl_before_close = env.read_account_pnl(user_idx);
+    println!("PnL after crank (before AdminForceCloseAccount): {}", pnl_before_close);
+    assert!(
+        pnl_before_close > 0,
+        "profitable user should have positive PnL after crank: {}",
+        pnl_before_close
+    );
+
+    // AdminForceCloseAccount converts PnL to capital and returns it (bypasses warmup)
+    // This is the "fast path" for resolved markets — no warmup delay.
+    let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
+    assert!(
+        result.is_ok(),
+        "AdminForceCloseAccount user must succeed (resolved market fast path): {:?}",
+        result
+    );
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+
+    // Account is now freed (slot zeroed)
     assert_eq!(env.read_account_position(user_idx), 0, "position zeroed");
 
-    // User should have positive PnL from force-close
-    let pnl_after_close = env.read_account_pnl(user_idx);
-    println!("PnL after force-close: {}", pnl_after_close);
-    assert!(
-        pnl_after_close > 0,
-        "profitable user should have positive PnL: {}",
-        pnl_after_close
-    );
-
-    // In the ADL engine, CloseAccount on a RESOLVED market uses a fast path that
-    // directly zeroes PnL and capital without calling touch_account_full or
-    // checking warmup. This allows immediate close regardless of warmup state.
-    let result1 = env.try_close_account(&user, user_idx);
-    assert!(
-        result1.is_ok(),
-        "close should succeed on resolved market (ADL engine fast path): {:?}",
-        result1
-    );
-    println!("CloseAccount succeeded immediately on resolved market");
-
+    println!("CloseAccount via AdminForceCloseAccount succeeded immediately on resolved market");
     println!("BINARY MARKET WARMUP DELAY: PASSED (ADL resolved fast-path)");
 }
 
@@ -30013,6 +30021,12 @@ fn test_binary_market_negative_pnl_close_immediate() {
 
     env.set_slot(200);
     env.crank();
+
+    // Crank settles PnL; positions require explicit AdminForceCloseAccount
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
 
     // User had a losing trade (long at 1.0, resolved at 0.5).
     // With warmup_period=100 but force-close loss settlement is instant (§6.1),
@@ -30099,36 +30113,39 @@ fn test_binary_market_force_close_pnl_correctness() {
     env.set_slot(200);
     env.crank();
 
-    // After force-close
-    let final_pos = env.read_account_position(user_idx);
-    let final_cap = env.read_account_capital(user_idx);
-    assert_eq!(final_pos, 0, "position should be zero");
-
-    // With warmup_period=0, PnL converts to capital instantly.
-    // Long position with price doubling should yield profit reflected in capital.
+    // Read PnL BEFORE AdminForceCloseAccount (which will convert PnL to capital and free account)
+    let pnl_after_crank = env.read_account_pnl(user_idx);
+    let cap_after_crank2 = env.read_account_capital(user_idx);
     println!(
-        "Final capital: {} (started at {}, after crank {})",
-        final_cap, cap_before_resolution, cap_after_crank
+        "After crank: cap={} pnl={} (started at {})",
+        cap_after_crank2, pnl_after_crank, cap_before_resolution
     );
 
-    // Force-close uses attach_effective_position which may settle PnL to capital
-    // or leave it in the pnl field depending on the engine version.
-    // Check that profit is reflected either in capital or pnl field.
-    let final_pnl = env.read_account_pnl(user_idx);
+    // Price doubled → long position should show profit in PnL field after crank
     assert!(
-        final_cap > cap_before_resolution || final_pnl > 0,
+        pnl_after_crank > 0 || cap_after_crank2 > cap_before_resolution,
         "long position with price doubling should be profitable (capital or PnL should increase): \
-         initial_cap={} final_cap={} final_pnl={}",
-        cap_before_resolution, final_cap, final_pnl
+         initial_cap={} cap_after_crank={} pnl_after_crank={}",
+        cap_before_resolution, cap_after_crank2, pnl_after_crank
     );
 
-    // pnl_pos_tot may have residual values with the matured PnL model
+    // pnl_pos_tot should reflect outstanding positive PnL
     let pnl_pos_tot = env.read_pnl_pos_tot();
     assert!(
         pnl_pos_tot >= 0,
-        "pnl_pos_tot must be non-negative after force-close: {}",
+        "pnl_pos_tot must be non-negative after crank: {}",
         pnl_pos_tot
     );
+
+    // AdminForceCloseAccount converts PnL to capital (with haircut) and returns capital
+    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
+        .expect("AdminForceCloseAccount user must succeed");
+    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
+        .expect("AdminForceCloseAccount LP must succeed");
+
+    // After AdminForceCloseAccount: account is freed, position is zero
+    let final_pos = env.read_account_position(user_idx);
+    assert_eq!(final_pos, 0, "position should be zero after AdminForceCloseAccount");
 
     println!("BINARY MARKET FORCE-CLOSE PNL CORRECTNESS: PASSED");
 }
@@ -30229,26 +30246,26 @@ fn test_admin_force_close_account_happy_path() {
         .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
-    // Crank to force-close positions
+    // Crank settles PnL; positions require explicit AdminForceCloseAccount
     env.set_slot(200);
     env.crank();
-
-    assert_eq!(
-        env.read_account_position(user_idx),
-        0,
-        "user position should be zero"
-    );
 
     let capital_before = env.read_account_capital(user_idx);
     assert!(capital_before > 0, "user should have capital");
     let used_before = env.read_num_used_accounts();
 
-    // Admin force-close account
+    // Admin force-close account (zeros position and frees slot)
     let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
     assert!(
         result.is_ok(),
         "AdminForceCloseAccount should succeed: {:?}",
         result
+    );
+
+    assert_eq!(
+        env.read_account_position(user_idx),
+        0,
+        "user position should be zero after AdminForceCloseAccount"
     );
 
     let used_after = env.read_num_used_accounts();
@@ -30424,54 +30441,39 @@ fn test_admin_force_close_account_requires_zero_position() {
         .expect("oracle price push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
-    let user_cap_before = env.read_account_capital(user_idx);
     let user_pos_before = env.read_account_position(user_idx);
-    let lp_cap_before = env.read_account_capital(lp_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
     let used_before = env.read_num_used_accounts();
-    let vault_before = env.vault_balance();
-
-    // Try force-close account without cranking — should fail (position != 0)
-    let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
-    assert!(result.is_err(), "Should fail when position is not zero");
-
-    let user_cap_after = env.read_account_capital(user_idx);
-    let user_pos_after = env.read_account_position(user_idx);
-    let lp_cap_after = env.read_account_capital(lp_idx);
-    let lp_pos_after = env.read_account_position(lp_idx);
-    let used_after = env.read_num_used_accounts();
-    let vault_after = env.vault_balance();
 
     assert_ne!(
         user_pos_before, 0,
         "Precondition: user must still have open position before force-close"
     );
-    assert_eq!(
-        user_cap_after, user_cap_before,
-        "Rejected force-close (non-zero position) must not change user capital"
-    );
-    assert_eq!(
-        user_pos_after, user_pos_before,
-        "Rejected force-close (non-zero position) must not change user position"
-    );
-    assert_eq!(
-        lp_cap_after, lp_cap_before,
-        "Rejected force-close (non-zero position) must not change LP capital"
-    );
-    assert_eq!(
-        lp_pos_after, lp_pos_before,
-        "Rejected force-close (non-zero position) must not change LP position"
-    );
-    assert_eq!(
-        used_after, used_before,
-        "Rejected force-close (non-zero position) must not change num_used_accounts"
-    );
-    assert_eq!(
-        vault_after, vault_before,
-        "Rejected force-close (non-zero position) must not move vault funds"
+
+    // The zero-position precondition was removed from AdminForceCloseAccount.
+    // close_account_resolved now zeros the position internally, so this must SUCCEED
+    // even without a prior crank.
+    let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
+    assert!(
+        result.is_ok(),
+        "AdminForceCloseAccount should succeed even with open position (precondition removed): {:?}",
+        result
     );
 
-    println!("ADMIN FORCE CLOSE ACCOUNT REQUIRES ZERO POSITION: PASSED");
+    // Position should now be zero
+    let user_pos_after = env.read_account_position(user_idx);
+    assert_eq!(
+        user_pos_after, 0,
+        "AdminForceCloseAccount should zero position regardless of prior state"
+    );
+
+    // Account slot should be freed
+    let used_after = env.read_num_used_accounts();
+    assert_eq!(
+        used_after, used_before - 1,
+        "AdminForceCloseAccount should decrement num_used_accounts"
+    );
+
+    println!("ADMIN FORCE CLOSE ACCOUNT REQUIRES ZERO POSITION: PASSED (precondition removed)");
 }
 
 /// AdminForceCloseAccount with positive PnL applies haircut
@@ -31363,19 +31365,19 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     assert!(result.is_ok(), "Resolve should succeed: {:?}", result);
     assert!(env.is_market_resolved(), "Market should be resolved");
 
-    // Crank to force-close positions
+    // Crank settles PnL; positions require explicit AdminForceCloseAccount
     env.crank();
 
-    // Verify positions are zeroed after crank
-    assert_eq!(env.read_account_position(user_idx), 0, "User position should be 0 after force-close crank");
-    assert_eq!(env.read_account_position(lp_idx), 0, "LP position should be 0 after force-close crank");
-
-    // Admin force-close both accounts (handles PnL settlement, fee forgiveness)
+    // Admin force-close both accounts (zeros positions, handles PnL settlement, fee forgiveness)
     let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
     assert!(result.is_ok(), "Admin force close user should succeed: {:?}", result);
 
     let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
     assert!(result.is_ok(), "Admin force close LP should succeed: {:?}", result);
+
+    // Verify positions are zeroed after AdminForceCloseAccount
+    assert_eq!(env.read_account_position(user_idx), 0, "User position should be 0 after AdminForceCloseAccount");
+    assert_eq!(env.read_account_position(lp_idx), 0, "LP position should be 0 after AdminForceCloseAccount");
 
     assert_eq!(env.read_num_used_accounts(), 0, "All accounts should be closed");
 
@@ -31873,9 +31875,9 @@ fn test_crank_threshold_ewma_bounded_by_limit() {
         .send_transaction(tx)
         .expect("UpdateConfig failed");
 
-    // Helper: read engine's insurance_floor directly from slab bytes
-    // insurance_floor is at BPF engine offset 560 (after all preceding fields)
-    const RISK_THRESHOLD_OFF: usize = 440 + 592;
+    // Helper: read engine's insurance_floor directly from slab bytes.
+    // Layout: slab_header(440) + engine.params(+32) + insurance_floor(+176) = 648
+    const RISK_THRESHOLD_OFF: usize = 648;
     let read_engine_threshold = |env: &TestEnv| -> u128 {
         let slab = env.svm.get_account(&env.slab).unwrap();
         u128::from_le_bytes(
