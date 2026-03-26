@@ -5927,10 +5927,16 @@ fn test_gh1724_clear_pending_settlement_requires_admin() {
         percolator_prog::position_nft::derive_position_nft(&f.program_id, &f.slab.key, user_idx);
     let nft_mint_key = Pubkey::new_unique();
     let position_owner_key = Pubkey::new_unique();
-    let nft_data = make_nft_pda_data(&nft_mint_key, &f.slab.key, &position_owner_key, user_idx, bump, 1);
+    let nft_data = make_nft_pda_data(
+        &nft_mint_key,
+        &f.slab.key,
+        &position_owner_key,
+        user_idx,
+        bump,
+        1,
+    );
 
-    let mut nft_pda_account =
-        TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
+    let mut nft_pda_account = TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
 
     // 3. Attacker (non-admin) attempts to clear pending_settlement
     let mut attacker = TestAccount::new(
@@ -5997,10 +6003,16 @@ fn test_gh1724_clear_pending_settlement_admin_succeeds() {
         percolator_prog::position_nft::derive_position_nft(&f.program_id, &f.slab.key, user_idx);
     let nft_mint_key = Pubkey::new_unique();
     let position_owner_key = Pubkey::new_unique();
-    let nft_data = make_nft_pda_data(&nft_mint_key, &f.slab.key, &position_owner_key, user_idx, bump, 1);
+    let nft_data = make_nft_pda_data(
+        &nft_mint_key,
+        &f.slab.key,
+        &position_owner_key,
+        user_idx,
+        bump,
+        1,
+    );
 
-    let mut nft_pda_account =
-        TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
+    let mut nft_pda_account = TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
 
     // 3. Admin clears pending_settlement — must succeed
     let result = process_instruction(
@@ -6059,10 +6071,16 @@ fn test_gh1724_set_pending_settlement_also_requires_admin() {
         percolator_prog::position_nft::derive_position_nft(&f.program_id, &f.slab.key, user_idx);
     let nft_mint_key = Pubkey::new_unique();
     let position_owner_key = Pubkey::new_unique();
-    let nft_data = make_nft_pda_data(&nft_mint_key, &f.slab.key, &position_owner_key, user_idx, bump, 0);
+    let nft_data = make_nft_pda_data(
+        &nft_mint_key,
+        &f.slab.key,
+        &position_owner_key,
+        user_idx,
+        bump,
+        0,
+    );
 
-    let mut nft_pda_account =
-        TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
+    let mut nft_pda_account = TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
 
     // 3. Griever (non-admin) attempts to set pending_settlement — must be rejected
     let mut griever = TestAccount::new(
