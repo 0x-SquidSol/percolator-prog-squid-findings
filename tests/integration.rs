@@ -29953,7 +29953,7 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&50_000u128.to_le_bytes()); // risk_reduction_threshold == limit
-    data.extend_from_slice(&1000u128.to_le_bytes()); // maintenance_fee == limit
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee (must be 0 per §8.2)
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap

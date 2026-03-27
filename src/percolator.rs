@@ -2907,7 +2907,8 @@ pub mod processor {
                 if insurance_floor > max_insurance_floor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                if risk_params.maintenance_fee_per_slot.get() > max_maintenance_fee_per_slot {
+                // §8.2: recurring maintenance fees disabled. Reject non-zero at init.
+                if risk_params.maintenance_fee_per_slot.get() != 0 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
@@ -3242,8 +3243,6 @@ pub mod processor {
 
                 let resolved = state::is_resolved(&data);
                 let clock = Clock::from_account_info(a_clock)?;
-                // Resolved markets use fixed settlement price.
-                // Unresolved markets use regular oracle paths.
                 let price = if resolved {
                     let settlement = config.authority_price_e6;
                     if settlement == 0 {
@@ -3253,11 +3252,12 @@ pub mod processor {
                 } else {
                     let is_hyperp = oracle::is_hyperp_mode(&config);
                     let px = if is_hyperp {
-                        let idx = config.last_effective_price_e6;
-                        if idx == 0 {
-                            return Err(PercolatorError::OracleInvalid.into());
-                        }
-                        idx
+                        let eng = zc::engine_ref(&data)?;
+                        let last_slot = eng.current_slot;
+                        oracle::get_engine_oracle_price_e6(
+                            last_slot, clock.slot, clock.unix_timestamp,
+                            &mut config, a_oracle_idx,
+                        )?
                     } else {
                         oracle::read_price_clamped(&mut config, a_oracle_idx, clock.unix_timestamp)?
                     };
@@ -3951,8 +3951,6 @@ pub mod processor {
 
                 let resolved = state::is_resolved(&data);
                 let clock = Clock::from_account_info(&accounts[6])?;
-                // Resolved markets use fixed settlement price.
-                // Unresolved markets use regular oracle paths.
                 let price = if resolved {
                     let settlement = config.authority_price_e6;
                     if settlement == 0 {
@@ -3962,11 +3960,12 @@ pub mod processor {
                 } else {
                     let is_hyperp = oracle::is_hyperp_mode(&config);
                     let px = if is_hyperp {
-                        let idx = config.last_effective_price_e6;
-                        if idx == 0 {
-                            return Err(PercolatorError::OracleInvalid.into());
-                        }
-                        idx
+                        let eng = zc::engine_ref(&data)?;
+                        let last_slot = eng.current_slot;
+                        oracle::get_engine_oracle_price_e6(
+                            last_slot, clock.slot, clock.unix_timestamp,
+                            &mut config, a_oracle,
+                        )?
                     } else {
                         oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
                     };
