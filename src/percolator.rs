@@ -743,35 +743,18 @@ pub mod zc {
     const SM_LONG_OFF: usize = offset_of!(RiskEngine, side_mode_long);
     /// Offset of side_mode_short within RiskEngine (repr(u8) enum)
     const SM_SHORT_OFF: usize = offset_of!(RiskEngine, side_mode_short);
-    /// Offset of Account::kind within Account (repr(u8) enum)
-    const KIND_OFF_IN_ACCOUNT: usize = offset_of!(percolator::Account, kind);
-    /// Size of one Account struct
-    const ACCOUNT_SIZE: usize = core::mem::size_of::<percolator::Account>();
 
-    /// Validate enum discriminants from raw bytes BEFORE casting to RiskEngine.
-    /// Creating a reference to an enum with an invalid discriminant is UB,
-    /// so we must check the raw bytes at the known offsets first.
+    /// Validate SideMode discriminants from raw bytes BEFORE casting.
+    /// O(1) — only checks the two SideMode bytes (externally settable via
+    /// engine state). AccountKind is only written by add_user/add_lp so
+    /// invalid values require a program bug, not external corruption.
+    #[inline]
     fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
-        // SideMode: valid values 0..=2
         let sm_long = data[base + SM_LONG_OFF];
         let sm_short = data[base + SM_SHORT_OFF];
         if sm_long > 2 || sm_short > 2 {
             return Err(ProgramError::InvalidAccountData);
-        }
-        // AccountKind: valid values 0..=1 — only check used slots.
-        // Account::is_used checks account_id != 0, which is a u64 at offset 0.
-        for i in 0..percolator::MAX_ACCOUNTS {
-            let acc_base = base + ACCOUNTS_OFFSET + i * ACCOUNT_SIZE;
-            // account_id is a u64 at offset 0 of Account
-            let id_bytes = &data[acc_base..acc_base + 8];
-            let account_id = u64::from_le_bytes(id_bytes.try_into().unwrap());
-            if account_id != 0 {
-                let kind_byte = data[acc_base + KIND_OFF_IN_ACCOUNT];
-                if kind_byte > 1 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-            }
         }
         Ok(())
     }
