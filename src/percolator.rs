@@ -2355,6 +2355,10 @@ pub mod oracle {
         a_oracle: &AccountInfo,
     ) -> Result<u64, ProgramError> {
         // Hyperp mode: index_feed_id == 0
+        // NOTE: Hyperp mark staleness is not enforced here because
+        // authority_timestamp stores the funding rate, not a push timestamp.
+        // Staleness is bounded operationally by the crank cadence requirement
+        // (require_fresh_crank) and the rate-limited index smoothing.
         if is_hyperp_mode(config) {
             let mark = config.authority_price_e6;
             if mark == 0 {
@@ -2746,16 +2750,37 @@ pub mod processor {
         Ok(())
     }
 
-    /// verify_vault + require zero balance (for InitMarket). Single unpack.
+    /// verify_vault + require zero balance (for InitMarket).
+    /// Reuses the unpack from verify_vault logic (single unpack).
     fn verify_vault_empty(
         a_vault: &AccountInfo,
         expected_owner: &Pubkey,
         expected_mint: &Pubkey,
         expected_pubkey: &Pubkey,
     ) -> Result<(), ProgramError> {
-        verify_vault(a_vault, expected_owner, expected_mint, expected_pubkey)?;
+        if a_vault.key != expected_pubkey {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
+        if a_vault.owner != &spl_token::ID {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
+        if a_vault.data_len() != spl_token::state::Account::LEN {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
         let data = a_vault.try_borrow_data()?;
         let tok = spl_token::state::Account::unpack(&data)?;
+        if tok.mint != *expected_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        if tok.owner != *expected_owner {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
+        if tok.state != spl_token::state::AccountState::Initialized {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
+        if tok.delegate.is_some() || tok.close_authority.is_some() {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
         if tok.amount != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -3844,13 +3869,12 @@ pub mod processor {
                     }
                     state::write_req_nonce(&mut data, req_id);
 
-                    // Hyperp: update mark price with exec price from matcher.
-                    // exec_price_e6 is already engine-space (matcher received
-                    // oracle_price_e6 in engine-space and returns in the same
-                    // space). No normalization needed — clamp directly.
+                    // Hyperp: update mark with exec price (already engine-space).
+                    // Clamp against previous mark (not index) for consistency
+                    // with PushOraclePrice. Circuit breaker bounds the jump.
                     if is_hyperp {
                         let clamped_mark = oracle::clamp_oracle_price(
-                            config.last_effective_price_e6,
+                            config.authority_price_e6, // clamp against previous mark
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
@@ -4402,15 +4426,22 @@ pub mod processor {
                     return Err(PercolatorError::OracleStale.into());
                 }
 
-                // Clamp against circuit breaker (both sides in same price space)
+                // Clamp against circuit breaker.
+                // Hyperp: clamp against previous MARK (authority_price_e6)
+                //   to prevent large jumps from mark, not from index.
+                // Non-Hyperp: clamp against last_effective_price_e6 baseline.
+                let clamp_base = if is_hyperp {
+                    config.authority_price_e6
+                } else {
+                    config.last_effective_price_e6
+                };
                 let clamped = oracle::clamp_oracle_price(
-                    config.last_effective_price_e6,
+                    clamp_base,
                     normalized_price,
                     config.oracle_price_cap_e2bps,
                 );
                 config.authority_price_e6 = clamped;
                 if !is_hyperp {
-                    // Non-Hyperp: update timestamp and circuit breaker baseline
                     config.authority_timestamp = timestamp;
                     config.last_effective_price_e6 = clamped;
                 }
@@ -4547,12 +4578,11 @@ pub mod processor {
                     return Ok(()); // Nothing to withdraw
                 }
 
-                // Cap at u64::MAX for conversion (should never happen in practice)
-                let units_u64 = if insurance_units > u64::MAX as u128 {
-                    u64::MAX
-                } else {
-                    insurance_units as u64
-                };
+                // Reject if balance exceeds u64 — silent truncation would
+                // zero the engine balance but only pay out a capped amount.
+                let units_u64: u64 = insurance_units
+                    .try_into()
+                    .map_err(|_| PercolatorError::EngineOverflow)?;
                 let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
