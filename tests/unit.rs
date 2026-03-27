@@ -6216,11 +6216,19 @@ fn test_set_wallet_cap_roundtrip_state() {
     state::set_max_wallet_pos_e6(&mut cfg, 1_000_000_000);
     let stored = state::get_max_wallet_pos_e6(&cfg);
     // Stored as kilo-e6 → stored = 1_000_000_000 / 1_000 * 1_000 = 1_000_000_000 (exact)
-    assert_eq!(stored, 1_000_000_000, "Round-trip $1K cap failed: got {}", stored);
+    assert_eq!(
+        stored, 1_000_000_000,
+        "Round-trip $1K cap failed: got {}",
+        stored
+    );
 
     // Disable: set to 0
     state::set_max_wallet_pos_e6(&mut cfg, 0);
-    assert_eq!(state::get_max_wallet_pos_e6(&cfg), 0, "Disabling cap failed");
+    assert_eq!(
+        state::get_max_wallet_pos_e6(&cfg),
+        0,
+        "Disabling cap failed"
+    );
 
     // $10K cap
     state::set_max_wallet_pos_e6(&mut cfg, 10_000_000_000);
@@ -6276,7 +6284,11 @@ fn test_set_wallet_cap_disable() {
         let data = encode_set_wallet_cap(0);
         let accounts = vec![f.admin.to_info(), f.slab.to_info()];
         let result = process_instruction(&f.program_id, &accounts, &data);
-        assert!(result.is_ok(), "SetWalletCap(0) disable must succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "SetWalletCap(0) disable must succeed: {:?}",
+            result
+        );
     }
 }
 
@@ -6373,12 +6385,7 @@ fn test_wallet_cap_blocks_trade_exceeding_limit() {
             f.vault.to_info(),
             f.token_prog.to_info(),
         ];
-        process_instruction(
-            &f.program_id,
-            &accs,
-            &encode_init_lp(d1.key, d2.key, 0),
-        )
-        .unwrap();
+        process_instruction(&f.program_id, &accs, &encode_init_lp(d1.key, d2.key, 0)).unwrap();
     }
     let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
     {
@@ -6401,7 +6408,11 @@ fn test_wallet_cap_blocks_trade_exceeding_limit() {
             f.slab.to_info(),
             f.pyth_index.to_info(),
         ];
-        process_instruction(&f.program_id, &accounts, &encode_trade(lp_idx, user_idx, 1000))
+        process_instruction(
+            &f.program_id,
+            &accounts,
+            &encode_trade(lp_idx, user_idx, 1000),
+        )
     };
     assert_eq!(
         result,
@@ -6501,7 +6512,7 @@ fn test_wallet_cap_allows_trade_within_limit() {
             f.vault.to_info(),
             f.token_prog.to_info(),
         ];
-        process_instruction(&f.program_id,&accs, &encode_init_lp(d1.key, d2.key, 0)).unwrap();
+        process_instruction(&f.program_id, &accs, &encode_init_lp(d1.key, d2.key, 0)).unwrap();
     }
     let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
     {
@@ -6524,7 +6535,11 @@ fn test_wallet_cap_allows_trade_within_limit() {
             f.slab.to_info(),
             f.pyth_index.to_info(),
         ];
-        process_instruction(&f.program_id, &accounts, &encode_trade(lp_idx, user_idx, 100))
+        process_instruction(
+            &f.program_id,
+            &accounts,
+            &encode_trade(lp_idx, user_idx, 100),
+        )
     };
     assert!(
         result.is_ok(),
