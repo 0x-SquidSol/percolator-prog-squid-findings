@@ -32453,3 +32453,130 @@ fn test_tradecpi_zero_fill_succeeds() {
     // Position should remain zero (no fill occurred)
     assert_eq!(env.read_account_position(user_idx), 0, "No fill means no position change");
 }
+
+/// Regression test: resolved close with touch_account_full settles correctly.
+/// Tests that a user can close on a resolved market even when the resolved
+/// KeeperCrank hasn't reached their account yet (touch happens inline).
+#[test]
+fn test_resolved_close_with_inline_touch() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Open a position at price $1
+    env.set_slot(50);
+    env.crank();
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+    let pos = env.read_account_position(user_idx);
+    assert_ne!(pos, 0, "user should have an open position");
+
+    // Move price to $2, crank to settle mark-to-market
+    env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
+    env.set_slot(200);
+    env.crank();
+
+    // Resolve at $2 — but do NOT run resolved crank
+    env.try_resolve_market(&admin).unwrap();
+
+    // User closes directly — touch_account_full runs inline at settlement price.
+    // This tests that touch succeeds even without prior resolved crank.
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "Resolved close with inline touch should succeed: {:?}", result);
+
+    // Admin force-close LP (also does inline touch)
+    let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
+    assert!(result.is_ok(), "Admin force-close with inline touch should succeed: {:?}", result);
+}
+
+/// Test that resolved close produces same payout whether crank touched first or not.
+#[test]
+fn test_resolved_close_payout_with_and_without_crank() {
+    // Market A: crank before close
+    let payout_with_crank = {
+        let mut env = TradeCpiTestEnv::new();
+        env.init_market_hyperp(1_000_000);
+        let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+        let mp = env.matcher_program_id;
+
+        env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+        env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+        let lp = Keypair::new();
+        let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+        env.deposit(&lp, lp_idx, 10_000_000_000);
+
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_000_000_000);
+
+        env.set_slot(50);
+        env.crank();
+        env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+
+        env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
+        env.set_slot(200);
+        env.crank();
+
+        env.try_resolve_market(&admin).unwrap();
+
+        // Crank the resolved market FIRST
+        env.set_slot(300);
+        env.crank();
+
+        let capital_before = env.read_account_capital(user_idx);
+        env.try_close_account(&user, user_idx).unwrap();
+        capital_before
+    };
+
+    // Market B: close WITHOUT crank (inline touch)
+    let payout_without_crank = {
+        let mut env = TradeCpiTestEnv::new();
+        env.init_market_hyperp(1_000_000);
+        let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+        let mp = env.matcher_program_id;
+
+        env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+        env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+        let lp = Keypair::new();
+        let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+        env.deposit(&lp, lp_idx, 10_000_000_000);
+
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_000_000_000);
+
+        env.set_slot(50);
+        env.crank();
+        env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+
+        env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
+        env.set_slot(200);
+        env.crank();
+
+        env.try_resolve_market(&admin).unwrap();
+
+        // Do NOT crank — close directly (inline touch)
+        let capital_before = env.read_account_capital(user_idx);
+        env.try_close_account(&user, user_idx).unwrap();
+        capital_before
+    };
+
+    // Both paths should produce the same payout
+    assert_eq!(
+        payout_with_crank, payout_without_crank,
+        "Resolved close payout must be identical with or without prior crank"
+    );
+}

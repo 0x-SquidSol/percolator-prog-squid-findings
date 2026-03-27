@@ -4000,15 +4000,15 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // close_account_resolved operates on stored local state without
-                    // calling accrue_market_to or settle_side_effects. Settlement
-                    // should happen via resolved KeeperCrank before close.
-                    //
-                    // If crank-time touch succeeded: account is fully settled.
-                    // If crank-time touch failed: convergence property guarantees
-                    //   next crank will complete it, OR close_account_resolved
-                    //   handles the account using best-available stored state
-                    //   (designed for ADL-overflow scenarios).
+                    // Settle lazy A/K/mark effects at the fixed settlement price.
+                    // Convergence: accrue_market_to writes last_oracle_price LAST
+                    // (after K updates). Failed K updates leave stored price
+                    // unchanged → retry recomputes same delta_p. After success,
+                    // next call with same fixed price is a no-op. So touch is
+                    // idempotent and safe to propagate errors from.
+                    engine.touch_account_full(
+                        user_idx as usize, price, clock.slot,
+                    ).map_err(map_risk_error)?;
                     engine.close_account_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -4967,9 +4967,11 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // close_account_resolved is designed for resolved/frozen markets
-                // where touch_account_full may not be viable (ADL overflow).
-                // Settlement should happen via resolved KeeperCrank before close.
+                // Settle lazy effects at settlement price before closing.
+                // See convergence argument in CloseAccount resolved path.
+                engine.touch_account_full(
+                    user_idx as usize, price, clock.slot,
+                ).map_err(map_risk_error)?;
                 let amt_units = engine.close_account_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
