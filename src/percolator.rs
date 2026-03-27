@@ -1795,6 +1795,10 @@ pub mod state {
 
     /// Flag bit: Market is resolved (withdraw-only mode)
     pub const FLAG_RESOLVED: u8 = 1 << 0;
+    /// Flag bit: SetInsuranceWithdrawPolicy has been explicitly called.
+    /// Prevents WithdrawInsuranceLimited from misinterpreting oracle
+    /// timestamps as policy metadata via authority_timestamp bit patterns.
+    pub const FLAG_POLICY_CONFIGURED: u8 = 1 << 1;
 
     /// Read market flags from _padding[0].
     pub fn read_flags(data: &[u8]) -> u8 {
@@ -1814,6 +1818,17 @@ pub mod state {
     /// Set the resolved flag.
     pub fn set_resolved(data: &mut [u8]) {
         let flags = read_flags(data) | FLAG_RESOLVED;
+        write_flags(data, flags);
+    }
+
+    /// Check if insurance withdraw policy was explicitly configured.
+    pub fn is_policy_configured(data: &[u8]) -> bool {
+        read_flags(data) & FLAG_POLICY_CONFIGURED != 0
+    }
+
+    /// Set the policy-configured flag.
+    pub fn set_policy_configured(data: &mut [u8]) {
+        let flags = read_flags(data) | FLAG_POLICY_CONFIGURED;
         write_flags(data, flags);
     }
 
@@ -4652,6 +4667,9 @@ pub mod processor {
                 config.oracle_price_cap_e2bps = cooldown_slots;
                 config.authority_timestamp = packed;
                 state::write_config(&mut data, &config);
+                // Set explicit flag so WithdrawInsuranceLimited can distinguish
+                // real policy from oracle timestamp bit patterns.
+                state::set_policy_configured(&mut data);
             }
 
             Instruction::WithdrawInsuranceLimited { amount } => {
@@ -4684,9 +4702,15 @@ pub mod processor {
                 }
                 let clock = Clock::from_account_info(a_clock)?;
 
-                // Use immutable config caps if set, else fall back to configured policy
-                let (stored_bps, stored_last_slot) = unpack_ins_withdraw_meta(config.authority_timestamp);
-                let configured = (1..=10_000).contains(&stored_bps);
+                // Use explicit flag to determine if SetInsuranceWithdrawPolicy was called.
+                // Previously inferred from authority_timestamp bit patterns, which an
+                // oracle authority could forge via crafted PushOraclePrice timestamps.
+                let configured = state::is_policy_configured(&data);
+                let (stored_bps, stored_last_slot) = if configured {
+                    unpack_ins_withdraw_meta(config.authority_timestamp)
+                } else {
+                    (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
+                };
                 let policy_authority = if configured {
                     config.oracle_authority
                 } else {
@@ -4715,8 +4739,8 @@ pub mod processor {
                 };
                 let last_withdraw_slot = if configured {
                     stored_last_slot
-                } else if !resolved && config.last_insurance_withdraw_slot > 0 {
-                    // Live market: use dedicated config field
+                } else if config.last_insurance_withdraw_slot > 0 {
+                    // Unconfigured: always use dedicated config field (live or resolved)
                     config.last_insurance_withdraw_slot
                 } else {
                     crate::INS_WITHDRAW_LAST_SLOT_NONE
@@ -4821,10 +4845,9 @@ pub mod processor {
                     engine.vault = engine.vault - req;
                 }
 
-                // Persist cooldown slot. On resolved markets, use oracle-field
-                // overloading (legacy). On live markets, use dedicated config field
-                // to avoid corrupting the oracle state.
-                if resolved {
+                // Persist cooldown slot.
+                if configured {
+                    // Configured policy: pack slot into authority_timestamp
                     let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
                         .ok_or(PercolatorError::EngineOverflow)?;
                     config.oracle_authority = policy_authority;
@@ -4832,7 +4855,7 @@ pub mod processor {
                     config.oracle_price_cap_e2bps = policy_cooldown;
                     config.authority_timestamp = packed;
                 } else {
-                    // Only update the cooldown slot — do NOT touch oracle fields
+                    // Unconfigured (default): use dedicated field for cooldown
                     config.last_insurance_withdraw_slot = clock.slot;
                 }
                 state::write_config(&mut data, &config);
