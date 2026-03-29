@@ -3954,9 +3954,13 @@ fn test_security_set_oracle_price_cap_zero_floor_admin_oracle() {
     }
 
     let mut env = TestEnv::new();
-    // init_market_with_invert creates an admin-oracle market (non-Hyperp, non-Pyth-pinned)
+    // init_market_with_invert starts with Pyth-pinned mode (oracle_authority=[0;32],
+    // index_feed_id=TEST_FEED_ID). Promote to admin-oracle by setting oracle authority
+    // to the admin key — this makes it non-Pyth-pinned, non-Hyperp (admin-oracle market).
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("SetOracleAuthority should succeed");
 
     // cap=0 must be rejected for admin-oracle markets (PERC-8191)
     let result = env.try_set_oracle_price_cap(&admin, 0);
