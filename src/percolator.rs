@@ -16,7 +16,6 @@ pub mod constants {
     use percolator::RiskEngine;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
-    pub const VERSION: u32 = 1;
 
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
@@ -2553,7 +2552,7 @@ pub mod processor {
             DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN,
             DEFAULT_THRESH_MIN_STEP, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS,
             DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG,
-            SLAB_LEN, VERSION,
+            SLAB_LEN,
         },
         error::{map_risk_error, PercolatorError},
         ix::Instruction,
@@ -2610,11 +2609,14 @@ pub mod processor {
                 let old_c_tot = engine.c_tot.get();
                 engine.c_tot = U128::new(old_c_tot.saturating_sub(cap).saturating_add(new_cap));
                 engine.accounts[i].capital = U128::new(new_cap);
-                // set_pnl inline: update aggregates
-                // Cap pay at i128::MAX to prevent overflow on cast
-                let pay_i128 = if pay > i128::MAX as u128 { i128::MAX } else { pay as i128 };
-                let new_pnl = pnl.saturating_add(pay_i128);
-                // old pnl < 0, so no pnl_pos_tot change
+                // set_pnl inline: if capital fully covers the loss, zero PnL directly.
+                // This avoids i128::MIN + i128::MAX = -1 edge case.
+                let new_pnl = if pay == need {
+                    0i128
+                } else {
+                    let pay_i128 = if pay > i128::MAX as u128 { i128::MAX } else { pay as i128 };
+                    pnl.saturating_add(pay_i128)
+                };
                 engine.accounts[i].pnl = new_pnl;
             }
         }
@@ -2647,14 +2649,29 @@ pub mod processor {
                 engine.accounts[i].reserved_pnl = 0;
             }
 
-            // Compute haircutted payout
+            // Compute haircutted payout using wide mul/div
             let (h_num, h_den) = engine.haircut_ratio();
             let y = if h_den == 0 {
                 pos_pnl
             } else {
                 // wide_mul_div_floor: (pos_pnl * h_num) / h_den
-                let num = (pos_pnl as u128).checked_mul(h_num).unwrap_or(u128::MAX);
-                num / h_den
+                // Use u128 checked_mul first; if overflow, fall back to
+                // decomposed multiplication: split into hi*lo parts.
+                match (pos_pnl as u128).checked_mul(h_num) {
+                    Some(product) => product / h_den,
+                    None => {
+                        // Overflow: use floor(a*b/c) via decomposition
+                        // a*b/c = a*(b/c) + a*(b%c)/c
+                        let quot = h_num / h_den;
+                        let rem = h_num % h_den;
+                        let term1 = pos_pnl.saturating_mul(quot);
+                        let term2 = (pos_pnl as u128)
+                            .checked_mul(rem)
+                            .map(|p| p / h_den)
+                            .unwrap_or(pos_pnl); // worst case: full payout
+                        term1.saturating_add(term2)
+                    }
+                }
             };
 
             // consume_released_pnl: decrease PnL and aggregates
@@ -2865,9 +2882,6 @@ pub mod processor {
         let h = state::read_header(data);
         if h.magic != MAGIC {
             return Err(PercolatorError::NotInitialized.into());
-        }
-        if h.version != VERSION {
-            return Err(PercolatorError::InvalidVersion.into());
         }
         Ok(())
     }
@@ -3265,7 +3279,7 @@ pub mod processor {
 
                 let new_header = SlabHeader {
                     magic: MAGIC,
-                    version: VERSION,
+                    version: 0, // unused, no versioning
                     bump,
                     _padding: [0; 3],
                     admin: a_admin.key.to_bytes(),
@@ -4523,17 +4537,6 @@ pub mod processor {
                 if state::is_resolved(&data) {
                     return Err(ProgramError::InvalidAccountData);
                 }
-                // Require fresh crank before config changes to create a clean
-                // accrual boundary. Without this, new params would be applied
-                // retroactively over the unaccrued interval.
-                let clock = Clock::from_account_info(a_clock)?;
-                {
-                    let engine = zc::engine_ref(&data)?;
-                    if engine.current_slot < clock.slot {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
@@ -4558,9 +4561,21 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
-                // Stamp the engine's funding rate from OLD config before update.
-                // This ensures the next accrual uses the pre-change rate for
-                // the interval up to this point (anti-retroactivity boundary).
+                // Flush Hyperp index to current slot before changing params.
+                // This creates a real accrual boundary — the index is updated
+                // to the change slot, so new params only affect future intervals.
+                let clock = Clock::from_account_info(a_clock)?;
+                if oracle::is_hyperp_mode(&config) {
+                    let eng = zc::engine_ref(&data)?;
+                    let last_slot = eng.current_slot;
+                    // Advance index in config (writes last_effective_price_e6)
+                    let _ = oracle::get_engine_oracle_price_e6(
+                        last_slot, clock.slot, clock.unix_timestamp,
+                        &mut config, &accounts[1], // a_slab as oracle placeholder (unused in Hyperp)
+                    );
+                    state::write_config(&mut data, &config);
+                }
+                // Stamp funding rate from OLD config (pre-change params)
                 {
                     let old_rate = compute_current_funding_rate(&config);
                     let engine = zc::engine_mut(&mut data)?;
@@ -4630,16 +4645,20 @@ pub mod processor {
 
                 let mut config = state::read_config(&data);
                 let is_hyperp = oracle::is_hyperp_mode(&config);
-                // Hyperp: require fresh crank before mark push to create a
-                // clean accrual boundary. Without this, the new mark/index
-                // smoothing would be applied retroactively.
+                // Hyperp: flush index to current slot before mark push.
+                // Creates a real accrual boundary — index reflects pre-push state.
                 if is_hyperp {
                     let push_clock = Clock::get()
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    let engine = zc::engine_ref(&data)?;
-                    if engine.current_slot < push_clock.slot {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
+                    let eng = zc::engine_ref(&data)?;
+                    let last_slot = eng.current_slot;
+                    let _ = oracle::get_engine_oracle_price_e6(
+                        last_slot, push_clock.slot, push_clock.unix_timestamp,
+                        &mut config, a_slab, // Hyperp ignores oracle account
+                    );
+                    state::write_config(&mut data, &config);
+                    // Re-read config after write (get_engine_oracle_price_e6 mutated it)
+                    config = state::read_config(&data);
                 }
                 if config.oracle_authority == [0u8; 32] {
                     return Err(PercolatorError::EngineUnauthorized.into());
@@ -4726,17 +4745,20 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 let is_hyperp = oracle::is_hyperp_mode(&config);
 
-                // Require fresh crank before cap changes (same boundary
-                // logic as UpdateConfig and PushOraclePrice)
+                // Flush Hyperp index to current slot before cap change
                 if is_hyperp {
                     let clock = Clock::from_account_info(a_clock)?;
-                    let engine = zc::engine_ref(&data)?;
-                    if engine.current_slot < clock.slot {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
+                    let eng = zc::engine_ref(&data)?;
+                    let last_slot = eng.current_slot;
+                    let _ = oracle::get_engine_oracle_price_e6(
+                        last_slot, clock.slot, clock.unix_timestamp,
+                        &mut config, a_slab,
+                    );
+                    state::write_config(&mut data, &config);
+                    config = state::read_config(&data);
                 }
 
                 // Hyperp markets must not set cap to 0 — it would freeze index
@@ -4751,7 +4773,6 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
-                let mut config = config;
                 config.oracle_price_cap_e2bps = max_change_e2bps;
                 state::write_config(&mut data, &config);
             }
