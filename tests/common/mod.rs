@@ -4379,6 +4379,146 @@ impl TestEnv {
         }
         u128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
     }
+
+    /// Read account kind (u8) for an account slot.
+    /// kind is at offset 24 within Account (0 = User, 1 = LP).
+    pub fn read_account_kind(&self, idx: u16) -> u8 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const KIND_OFFSET: usize = 24;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
+        if slab_data.len() < off + 1 {
+            return 0;
+        }
+        slab_data[off]
+    }
+
+    /// Read matcher_program ([u8; 32]) for an account slot.
+    /// matcher_program is at offset 144 within Account (BPF layout).
+    pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const MATCHER_PROG_OFFSET: usize = 144;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&slab_data[off..off + 32]);
+        buf
+    }
+
+    /// Read matcher_context ([u8; 32]) for an account slot.
+    /// matcher_context is at offset 176 within Account (BPF layout).
+    pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const MATCHER_CTX_OFFSET: usize = 176;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&slab_data[off..off + 32]);
+        buf
+    }
+
+    /// Try to init user with specific fee, returns Result.
+    pub fn try_init_user_with_fee(&mut self, owner: &Keypair, fee: u64) -> Result<u16, String> {
+        let idx = self.account_count;
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let ata = self.create_ata(&owner.pubkey(), fee);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_col, false),
+            ],
+            data: encode_init_user(fee),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
+        );
+        match self.svm.send_transaction(tx) {
+            Ok(_) => {
+                self.account_count += 1;
+                Ok(idx)
+            }
+            Err(e) => Err(format!("{:?}", e)),
+        }
+    }
+
+    /// Try to init LP with correct 8-account layout, returns Result.
+    pub fn try_init_lp_proper(&mut self, owner: &Keypair, matcher: &Pubkey, ctx: &Pubkey, fee: u64) -> Result<u16, String> {
+        let idx = self.account_count;
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let ata = self.create_ata(&owner.pubkey(), fee);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(*matcher, false),
+                AccountMeta::new_readonly(*ctx, false),
+            ],
+            data: encode_init_lp(matcher, ctx, fee),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
+        );
+        match self.svm.send_transaction(tx) {
+            Ok(_) => {
+                self.account_count += 1;
+                Ok(idx)
+            }
+            Err(e) => Err(format!("{:?}", e)),
+        }
+    }
+
+    /// Try ReclaimEmptyAccount (tag 25), permissionless.
+    pub fn try_reclaim_empty_account(&mut self, target_idx: u16) -> Result<(), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let mut data = vec![25u8];
+        data.extend_from_slice(&target_idx.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
 }
 
 // ============================================================================

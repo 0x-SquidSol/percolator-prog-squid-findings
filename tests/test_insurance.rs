@@ -1879,3 +1879,57 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     assert!(result.is_err(), "insurance_withdraw_max_bps > 10000 must be rejected");
 }
 
+// ============================================================================
+// TopUpInsurance (tag 9) additional coverage
+// ============================================================================
+
+/// Spec: TopUpInsurance is blocked on resolved markets.
+#[test]
+fn test_top_up_insurance_blocked_on_resolved() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    assert!(env.is_market_resolved());
+
+    let payer = Keypair::new();
+    env.svm.airdrop(&payer.pubkey(), 5_000_000_000).unwrap();
+    let result = env.try_top_up_insurance(&payer, 1_000_000_000);
+    assert!(
+        result.is_err(),
+        "TopUpInsurance must be rejected on a resolved market"
+    );
+}
+
+/// Spec: TopUpInsurance increases the insurance fund balance by the deposited amount.
+#[test]
+fn test_top_up_insurance_increases_balance() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let insurance_before = env.read_insurance_balance();
+    let vault_before = env.vault_balance();
+
+    let payer = Keypair::new();
+    env.svm.airdrop(&payer.pubkey(), 5_000_000_000).unwrap();
+    let amount = 2_000_000_000u64;
+    env.top_up_insurance(&payer, amount);
+
+    let insurance_after = env.read_insurance_balance();
+    let vault_after = env.vault_balance();
+
+    assert_eq!(
+        insurance_after - insurance_before, amount as u128,
+        "Insurance balance must increase by the top-up amount"
+    );
+    assert_eq!(
+        vault_after - vault_before, amount,
+        "Vault SPL balance must increase by the top-up amount"
+    );
+}
+

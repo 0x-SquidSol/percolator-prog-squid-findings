@@ -747,3 +747,63 @@ fn test_resolved_crank_sweeps_dust_to_zero() {
     );
 }
 
+// ============================================================================
+// AdminForceCloseAccount (tag 21) additional coverage
+// ============================================================================
+
+/// Spec: AdminForceCloseAccount requires the market to be resolved.
+/// It must be rejected on live (non-resolved) markets.
+#[test]
+fn test_admin_force_close_requires_resolved() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Market is NOT resolved; force-close should fail.
+    assert!(!env.is_market_resolved(), "Precondition: market must not be resolved");
+    let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
+    assert!(
+        result.is_err(),
+        "AdminForceCloseAccount must be rejected on a live (non-resolved) market"
+    );
+}
+
+/// Spec: AdminForceCloseAccount is admin-only; non-admin signers are rejected.
+#[test]
+fn test_admin_force_close_admin_only() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Resolve the market
+    env.try_resolve_market(&admin).unwrap();
+    assert!(env.is_market_resolved());
+
+    // Crank to settle
+    env.set_slot(200);
+    env.crank();
+
+    // Non-admin tries force-close
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let result = env.try_admin_force_close_account(&attacker, user_idx, &user.pubkey());
+    assert!(
+        result.is_err(),
+        "AdminForceCloseAccount must reject non-admin signer"
+    );
+}
+

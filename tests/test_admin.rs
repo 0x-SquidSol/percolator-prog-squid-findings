@@ -1063,3 +1063,75 @@ fn test_init_market_rejects_nonempty_vault() {
     );
 }
 
+// ============================================================================
+// UpdateConfig (tag 14) additional coverage
+// ============================================================================
+
+/// Spec: UpdateConfig rejects funding_horizon_slots = 0 (would cause division by zero).
+#[test]
+fn test_update_config_rejects_zero_horizon() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let result = env.try_update_config_with_params(
+        &admin,
+        0,                        // funding_horizon_slots = 0 (invalid)
+        1_000_000_000_000u128,    // funding_inv_scale_notional_e6
+        1000,                     // thresh_alpha_bps
+        0u128,                    // thresh_min
+        1_000_000_000_000_000u128, // thresh_max
+    );
+    assert!(
+        result.is_err(),
+        "UpdateConfig must reject funding_horizon_slots = 0"
+    );
+}
+
+/// Spec: UpdateConfig rejects funding_inv_scale_notional_e6 = 0 (would cause division by zero).
+#[test]
+fn test_update_config_rejects_zero_inv_scale() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let result = env.try_update_config_with_params(
+        &admin,
+        3600,   // funding_horizon_slots (valid)
+        0u128,  // funding_inv_scale_notional_e6 = 0 (invalid)
+        1000,
+        0u128,
+        1_000_000_000_000_000u128,
+    );
+    assert!(
+        result.is_err(),
+        "UpdateConfig must reject funding_inv_scale_notional_e6 = 0"
+    );
+}
+
+/// Spec: UpdateConfig is admin-only; non-admin signers are rejected.
+#[test]
+fn test_update_config_admin_only() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    let result = env.try_update_config_with_params(
+        &attacker,
+        3600,
+        1_000_000_000_000u128,
+        1000,
+        0u128,
+        1_000_000_000_000_000u128,
+    );
+    assert!(
+        result.is_err(),
+        "UpdateConfig must reject non-admin signer"
+    );
+}
+

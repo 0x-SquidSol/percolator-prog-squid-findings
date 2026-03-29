@@ -2451,3 +2451,291 @@ fn test_query_lp_fees_returns_cumulative() {
     );
 }
 
+// ============================================================================
+// InitUser (tag 1) additional coverage
+// ============================================================================
+
+/// Spec: InitUser transfers new_account_fee to insurance fund.
+/// After InitUser, insurance balance must increase by exactly new_account_fee.
+#[test]
+fn test_init_user_charges_new_account_fee() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Market with new_account_fee = 500
+    env.init_market_full(0, 0, 500);
+
+    let insurance_before = env.read_insurance_balance();
+
+    let user = Keypair::new();
+    // Fee payment must be >= new_account_fee (500) AND >= min_initial_deposit (100)
+    let _user_idx = env.init_user_with_fee(&user, 500);
+
+    let insurance_after = env.read_insurance_balance();
+    assert_eq!(
+        insurance_after - insurance_before, 500,
+        "Insurance must increase by exactly new_account_fee (500). Before={}, after={}",
+        insurance_before, insurance_after
+    );
+}
+
+/// Spec: InitUser is blocked on resolved markets.
+#[test]
+fn test_init_user_blocked_on_resolved() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    assert!(env.is_market_resolved());
+
+    let user = Keypair::new();
+    let result = env.try_init_user_with_fee(&user, 100);
+    assert!(
+        result.is_err(),
+        "InitUser must be rejected on a resolved market"
+    );
+}
+
+/// Spec: InitUser fee_payment below min_initial_deposit is rejected.
+#[test]
+fn test_init_user_requires_min_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    // min_initial_deposit = 100 (set in encode_init_market_full_v2)
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    // Provide only 50 tokens -- below min_initial_deposit of 100
+    let result = env.try_init_user_with_fee(&user, 50);
+    assert!(
+        result.is_err(),
+        "InitUser must reject fee_payment below min_initial_deposit"
+    );
+}
+
+// ============================================================================
+// InitLP (tag 2) additional coverage
+// ============================================================================
+
+/// Spec: After InitLP, the account kind is LP and matcher fields match the
+/// values provided during initialization.
+#[test]
+fn test_init_lp_sets_matcher_fields() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    // Note: try_init_lp_proper will airdrop internally
+
+    let matcher = spl_token::ID; // Use token program as matcher (accepted by test setup)
+    let ctx = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            ctx,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; 320],
+                owner: matcher,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let lp_idx = env.try_init_lp_proper(&lp, &matcher, &ctx, 100)
+        .expect("InitLP should succeed");
+
+    // Verify kind == LP (1)
+    assert_eq!(
+        env.read_account_kind(lp_idx), 1,
+        "Account kind must be LP (1) after InitLP"
+    );
+
+    // Verify matcher_program matches what was passed
+    let stored_matcher = env.read_account_matcher_program(lp_idx);
+    assert_eq!(
+        stored_matcher, matcher.to_bytes(),
+        "matcher_program must match the program provided at InitLP"
+    );
+
+    // Verify matcher_context matches what was passed
+    let stored_ctx = env.read_account_matcher_context(lp_idx);
+    assert_eq!(
+        stored_ctx, ctx.to_bytes(),
+        "matcher_context must match the context provided at InitLP"
+    );
+}
+
+/// Spec: InitLP is blocked on resolved markets.
+#[test]
+fn test_init_lp_blocked_on_resolved() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    assert!(env.is_market_resolved());
+
+    let lp = Keypair::new();
+    // Note: try_init_lp_proper will airdrop internally
+    let matcher = spl_token::ID;
+    let ctx = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            ctx,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; 320],
+                owner: matcher,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let result = env.try_init_lp_proper(&lp, &matcher, &ctx, 100);
+    assert!(
+        result.is_err(),
+        "InitLP must be rejected on a resolved market"
+    );
+}
+
+// ============================================================================
+// ReclaimEmptyAccount (tag 25) additional coverage
+// ============================================================================
+
+/// Spec SS 10.7: Reclaim rejects accounts with non-dust capital
+/// (capital >= min_initial_deposit).
+#[test]
+fn test_reclaim_rejects_account_with_capital() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    // Deposit enough so capital is well above min_initial_deposit (100)
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let capital = env.read_account_capital(user_idx);
+    assert!(capital >= 100, "Precondition: capital must be >= min_initial_deposit");
+
+    let result = env.try_reclaim_empty_account(user_idx);
+    assert!(
+        result.is_err(),
+        "ReclaimEmptyAccount must reject account with non-dust capital"
+    );
+}
+
+/// Spec SS 10.7: Reclaim rejects accounts with an open position.
+#[test]
+fn test_reclaim_rejects_account_with_position() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    // Open a position
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_ne!(env.read_account_position(user_idx), 0, "Precondition: user has position");
+
+    let result = env.try_reclaim_empty_account(user_idx);
+    assert!(
+        result.is_err(),
+        "ReclaimEmptyAccount must reject account with an open position"
+    );
+}
+
+/// Spec: ReclaimEmptyAccount is blocked on resolved markets.
+#[test]
+fn test_reclaim_blocked_on_resolved() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    // Withdraw to make account empty for reclaim
+    env.crank();
+    env.try_withdraw(&user, user_idx, 100).unwrap();
+
+    // Resolve the market
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    assert!(env.is_market_resolved());
+
+    let result = env.try_reclaim_empty_account(user_idx);
+    assert!(
+        result.is_err(),
+        "ReclaimEmptyAccount must be rejected on a resolved market"
+    );
+}
+
+// ============================================================================
+// QueryLpFees (tag 24) additional coverage
+// ============================================================================
+
+/// Spec SS 2.2: QueryLpFees rejects non-LP (user) accounts.
+#[test]
+fn test_query_lp_fees_rejects_non_lp() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let result = env.try_query_lp_fees(user_idx);
+    assert!(
+        result.is_err(),
+        "QueryLpFees must reject a non-LP (user) account"
+    );
+}
+
+/// Spec: QueryLpFees rejects an out-of-bounds or unused index.
+#[test]
+fn test_query_lp_fees_rejects_invalid_idx() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // No accounts created yet; index 0 is unused.
+    let result = env.try_query_lp_fees(0);
+    assert!(
+        result.is_err(),
+        "QueryLpFees must reject an unused account index"
+    );
+
+    // Also test a clearly out-of-bounds index
+    let result = env.try_query_lp_fees(4095);
+    assert!(
+        result.is_err(),
+        "QueryLpFees must reject an out-of-bounds index"
+    );
+}
+

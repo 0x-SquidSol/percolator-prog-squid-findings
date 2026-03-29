@@ -1718,7 +1718,7 @@ pub mod state {
         /// Last slot when insurance_floor was changed (for rate-limiting).
         pub resolution_slot: u64,
         /// Padding for u128 alignment.
-        pub _ifc_padding: u64,
+        pub last_hyperp_index_slot: u64,
         /// Insurance floor value at last change (for computing delta).
         pub last_mark_push_slot: u128,
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
@@ -2374,11 +2374,17 @@ pub mod oracle {
             }
 
             let prev_index = config.last_effective_price_e6;
-            let dt = now_slot.saturating_sub(engine_last_slot);
+            // Use dedicated last_hyperp_index_slot, not engine.current_slot.
+            // This tracks exactly when the index was last updated, preventing
+            // both under-counting dt (unrelated user activity) and over-counting
+            // dt (admin flush without engine.current_slot advance).
+            let last_idx_slot = config.last_hyperp_index_slot;
+            let dt = now_slot.saturating_sub(last_idx_slot);
             let new_index =
                 clamp_toward_with_dt(prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt);
 
             config.last_effective_price_e6 = new_index;
+            config.last_hyperp_index_slot = now_slot;
             return Ok(new_index);
         }
 
@@ -2660,16 +2666,17 @@ pub mod processor {
                 match (pos_pnl as u128).checked_mul(h_num) {
                     Some(product) => product / h_den,
                     None => {
-                        // Overflow: use floor(a*b/c) via decomposition
-                        // a*b/c = a*(b/c) + a*(b%c)/c
+                        // Decomposed: floor(a*b/c) = a*(b/c) + a*(b%c)/c
                         let quot = h_num / h_den;
                         let rem = h_num % h_den;
-                        let term1 = pos_pnl.saturating_mul(quot);
+                        let term1 = pos_pnl.checked_mul(quot)
+                            .ok_or(RiskError::Overflow)?;
                         let term2 = (pos_pnl as u128)
                             .checked_mul(rem)
-                            .map(|p| p / h_den)
-                            .unwrap_or(pos_pnl); // worst case: full payout
-                        term1.saturating_add(term2)
+                            .ok_or(RiskError::Overflow)?
+                            / h_den;
+                        term1.checked_add(term2)
+                            .ok_or(RiskError::Overflow)?
                     }
                 }
             };
@@ -3264,7 +3271,7 @@ pub mod processor {
                     _iw_padding2: 0,
                     max_insurance_floor_change_per_day,
                     resolution_slot: clock.slot,
-                    _ifc_padding: 0,
+                    last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
                     // Hyperp: stamp init slot so stale check works from genesis.
                     // Non-Hyperp: 0 (no mark push concept).
                     last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
@@ -4295,7 +4302,12 @@ pub mod processor {
                     );
                     let funding_rate = compute_current_funding_rate(&config);
                     engine.close_account(user_idx, frozen_slot, price, funding_rate)
-                        .or_else(|_| settle_and_close_resolved(engine, user_idx))
+                        .or_else(|e| match e {
+                            // CorruptState = real engine invariant violation — don't mask
+                            percolator::RiskError::CorruptState => Err(e),
+                            // All other errors: same-epoch position, PnL not settled, etc.
+                            _ => settle_and_close_resolved(engine, user_idx),
+                        })
                         .map_err(map_risk_error)?
                 } else {
                     engine
@@ -4569,10 +4581,10 @@ pub mod processor {
                     let eng = zc::engine_ref(&data)?;
                     let last_slot = eng.current_slot;
                     // Advance index in config (writes last_effective_price_e6)
-                    let _ = oracle::get_engine_oracle_price_e6(
+                    oracle::get_engine_oracle_price_e6(
                         last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, &accounts[1], // a_slab as oracle placeholder (unused in Hyperp)
-                    );
+                        &mut config, &accounts[1],
+                    )?;
                     state::write_config(&mut data, &config);
                 }
                 // Stamp funding rate from OLD config (pre-change params)
@@ -4652,12 +4664,11 @@ pub mod processor {
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     let eng = zc::engine_ref(&data)?;
                     let last_slot = eng.current_slot;
-                    let _ = oracle::get_engine_oracle_price_e6(
+                    oracle::get_engine_oracle_price_e6(
                         last_slot, push_clock.slot, push_clock.unix_timestamp,
-                        &mut config, a_slab, // Hyperp ignores oracle account
-                    );
+                        &mut config, a_slab,
+                    )?;
                     state::write_config(&mut data, &config);
-                    // Re-read config after write (get_engine_oracle_price_e6 mutated it)
                     config = state::read_config(&data);
                 }
                 if config.oracle_authority == [0u8; 32] {
@@ -4753,10 +4764,10 @@ pub mod processor {
                     let clock = Clock::from_account_info(a_clock)?;
                     let eng = zc::engine_ref(&data)?;
                     let last_slot = eng.current_slot;
-                    let _ = oracle::get_engine_oracle_price_e6(
+                    oracle::get_engine_oracle_price_e6(
                         last_slot, clock.slot, clock.unix_timestamp,
                         &mut config, a_slab,
-                    );
+                    )?;
                     state::write_config(&mut data, &config);
                     config = state::read_config(&data);
                 }
