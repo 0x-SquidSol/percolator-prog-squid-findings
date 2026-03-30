@@ -5397,6 +5397,38 @@ fn test_set_pyth_oracle_then_update_mark_price() {
     );
 }
 
+#[test]
+fn test_set_pyth_oracle_rejects_non_admin() {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 1000);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = [
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+    }
+
+    let mut attacker =
+        TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![])
+            .signer();
+    let set_pyth_data = encode_set_pyth_oracle(&TEST_FEED_ID, 300, 200);
+    let res = process_instruction(
+        &f.program_id,
+        &[attacker.to_info(), f.slab.to_info()],
+        &set_pyth_data,
+    );
+    assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+}
+
 // =============================================================================
 // PERC-118: compute_blend_mark_price — Unit Tests
 // =============================================================================
