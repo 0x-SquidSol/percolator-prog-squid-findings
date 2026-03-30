@@ -10183,6 +10183,21 @@ pub mod processor {
                 )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                // Fail fast on authorization/index checks before token CPI.
+                // Solana is atomic, but ordering checks before external transfer
+                // avoids unnecessary CPI work on rejects and reduces reliance on
+                // transaction rollback semantics for intermediate effects.
+                {
+                    let engine = zc::engine_ref(&data)?;
+                    check_idx(engine, user_idx)?;
+
+                    // Owner authorization via verify helper (Kani-provable)
+                    let owner = engine.accounts[user_idx as usize].owner;
+                    if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
+                }
+
                 let clock = Clock::from_account_info(a_clock)?;
 
                 // Transfer base tokens to vault
@@ -10196,15 +10211,6 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, user_idx)?;
-
-                // Owner authorization via verify helper (Kani-provable)
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
                 engine
                     .deposit(user_idx, units as u128, clock.slot)
                     .map_err(map_risk_error)?;
