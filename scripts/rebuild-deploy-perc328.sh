@@ -135,6 +135,9 @@ for tier in "${TIERS[@]}"; do
 done
 
 log "=== All requested tiers deployed ==="
+log "⚠️  REQUIRED NEXT STEP: immediately call InitSharedVault for each deployed program."
+log "    Do NOT leave shared-vault PDA uninitialized (first-caller-wins)."
+log "    Verify shared-vault params on-chain before onboarding LPs/users."
 log "Next step: run devnet smoke tests (QA agent / percolator-prog tests)"
 log "  cargo test-sbf --features devnet,small  # smoke Small"
 log "  cargo test-sbf --features devnet,medium # smoke Medium"

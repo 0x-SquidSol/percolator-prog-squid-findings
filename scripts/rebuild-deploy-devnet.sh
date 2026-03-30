@@ -57,3 +57,6 @@ log "LARGE deployed ✅"
 
 log "=== All 3 tiers rebuilt and deployed from 314391b ==="
 log "Deployer balance after: $(solana balance $UPGRADE_AUTH --url $RPC)"
+log "⚠️  REQUIRED NEXT STEP: immediately call InitSharedVault for each deployed program."
+log "    Do NOT leave shared-vault PDA uninitialized (first-caller-wins)."
+log "    Verify on-chain params before onboarding LPs/users."
