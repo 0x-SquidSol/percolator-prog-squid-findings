@@ -162,7 +162,9 @@ This section describes intent and operational ordering, not argument-by-argument
 Percolator treats a matcher like a price/size oracle **with rules** chosen by the LP, but enforces a hard safety envelope.
 
 ### What Percolator enforces (non-negotiable)
-- **Signer checks**: user and LP owner must sign
+- **Signer checks**:
+  - `TradeNoCpi`: user and LP owner must sign
+  - `TradeCpi`: user must sign; LP owner key must match registered owner (LP owner signature is not required)
 - **LP identity signer**: LP PDA is derived, not provided by the user
 - **Matcher identity binding**: matcher program + context must equal what the LP registered
 - **Matcher account shape**:
