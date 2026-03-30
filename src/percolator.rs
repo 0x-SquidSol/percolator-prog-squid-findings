@@ -1922,6 +1922,74 @@ pub mod matcher_abi {
     }
 }
 
+#[cfg(test)]
+mod matcher_abi_unit_tests {
+    use super::matcher_abi::{
+        read_matcher_return, validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID,
+    };
+    use crate::constants::MATCHER_ABI_VERSION;
+    use solana_program::program_error::ProgramError;
+
+    fn valid_ret(exec_size: i128) -> MatcherReturn {
+        MatcherReturn {
+            abi_version: MATCHER_ABI_VERSION,
+            flags: FLAG_VALID,
+            exec_price_e6: 100_000_000,
+            exec_size,
+            req_id: 7,
+            lp_account_id: 11,
+            oracle_price_e6: 100_000_000,
+            reserved: 0,
+        }
+    }
+
+    #[test]
+    fn read_matcher_return_rejects_short_context() {
+        let ctx = [0u8; 63];
+        let err = read_matcher_return(&ctx).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn validate_accepts_i128_min_when_request_matches() {
+        let ret = valid_ret(i128::MIN);
+        let res = validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            i128::MIN,
+            ret.req_id,
+        );
+        assert!(res.is_ok(), "i128::MIN exact-size match should be valid");
+    }
+
+    #[test]
+    fn validate_rejects_i128_min_when_request_smaller() {
+        let ret = valid_ret(i128::MIN);
+        let res = validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            -1,
+            ret.req_id,
+        );
+        assert!(res.is_err(), "i128::MIN must reject when req_size is smaller");
+    }
+
+    #[test]
+    fn validate_zero_exec_size_requires_partial_ok_flag() {
+        let mut ret = valid_ret(0);
+        let reject =
+            validate_matcher_return(&ret, ret.lp_account_id, ret.oracle_price_e6, 1, ret.req_id);
+        assert!(reject.is_err(), "zero exec_size without PARTIAL_OK must reject");
+
+        ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
+        let accept =
+            validate_matcher_return(&ret, ret.lp_account_id, ret.oracle_price_e6, 1, ret.req_id);
+        assert!(accept.is_ok(), "zero exec_size with PARTIAL_OK should be accepted");
+    }
+}
+
 // 3. mod error
 pub mod error {
     use percolator::RiskError;
@@ -5611,12 +5679,19 @@ pub mod oracle {
     /// Check that the Hyperp oracle price is not stale.
     /// Returns `OracleStale` if the engine hasn't been cranked within
     /// `max_crank_staleness_slots` slots.
+    /// Returns `OracleInvalid` if stored engine slot is ahead of the clock sysvar
+    /// (inconsistent state): otherwise `saturating_sub` would yield zero age and
+    /// incorrectly treat the engine as freshly cranked.
     #[inline]
     pub fn check_hyperp_staleness(
         engine_current_slot: u64,
         max_crank_staleness_slots: u64,
         clock_slot: u64,
     ) -> Result<(), ProgramError> {
+        if engine_current_slot > clock_slot {
+            solana_program::msg!("Hyperp engine slot ahead of clock");
+            return Err(super::error::PercolatorError::OracleInvalid.into());
+        }
         if max_crank_staleness_slots > 0 && max_crank_staleness_slots != u64::MAX {
             let age = clock_slot.saturating_sub(engine_current_slot);
             if age > max_crank_staleness_slots {
@@ -9145,6 +9220,20 @@ pub mod processor {
             // Engine just cranked (same slot)
             assert!(check_hyperp_staleness(500, 100, 500).is_ok());
         }
+
+        #[test]
+        fn staleness_rejects_engine_slot_ahead_of_clock() {
+            // Without an explicit guard, age = clock.saturating_sub(engine) would be 0
+            // and bypass staleness even when engine state is inconsistent.
+            let result = check_hyperp_staleness(200, 100, 150);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn engine_ahead_of_clock_rejected_even_when_staleness_disabled() {
+            assert!(check_hyperp_staleness(500, 0, 400).is_err());
+            assert!(check_hyperp_staleness(500, u64::MAX, 400).is_err());
+        }
     }
 
     #[cfg(test)]
@@ -9585,6 +9674,55 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn coin_margined_settlement_pnl_delta(pos: i128, entry_price_e6: u64, settle_price_e6: u64) -> i128 {
+        if pos == 0 || settle_price_e6 == 0 {
+            return 0;
+        }
+
+        let entry = entry_price_e6 as i128;
+        let settle = settle_price_e6 as i128;
+        let directional_diff = if pos > 0 {
+            settle.saturating_sub(entry)
+        } else {
+            entry.saturating_sub(settle)
+        };
+        let magnitude = directional_diff
+            .unsigned_abs()
+            .saturating_mul(pos.unsigned_abs())
+            .checked_div(settle_price_e6 as u128)
+            .unwrap_or(0)
+            .min(i128::MAX as u128) as i128;
+
+        if directional_diff < 0 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+
+    #[cfg(test)]
+    mod resolved_settlement_pnl_tests {
+        use super::coin_margined_settlement_pnl_delta;
+
+        #[test]
+        fn pnl_delta_long_position_profit() {
+            let pnl = coin_margined_settlement_pnl_delta(1_000_000, 100_000_000, 120_000_000);
+            assert!(pnl > 0, "long should profit when settlement > entry");
+        }
+
+        #[test]
+        fn pnl_delta_short_position_profit() {
+            let pnl = coin_margined_settlement_pnl_delta(-1_000_000, 120_000_000, 100_000_000);
+            assert!(pnl > 0, "short should profit when settlement < entry");
+        }
+
+        #[test]
+        fn pnl_delta_handles_i128_min_without_overflow() {
+            let pnl = coin_margined_settlement_pnl_delta(i128::MIN, 120_000_000, 100_000_000);
+            assert!(pnl >= 0, "must not overflow or flip sign on i128::MIN");
+        }
+    }
     /// PERC-328: PDA derivation in its own frame.
     /// `Pubkey::find_program_address` hashes SHA-256 in a loop; under LTO the
     /// ~200 B hash state can be inlined into the caller, contributing to frame
@@ -10066,6 +10204,21 @@ pub mod processor {
                 )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                // Fail fast on authorization/index checks before token CPI.
+                // Solana is atomic, but ordering checks before external transfer
+                // avoids unnecessary CPI work on rejects and reduces reliance on
+                // transaction rollback semantics for intermediate effects.
+                {
+                    let engine = zc::engine_ref(&data)?;
+                    check_idx(engine, user_idx)?;
+
+                    // Owner authorization via verify helper (Kani-provable)
+                    let owner = engine.accounts[user_idx as usize].owner;
+                    if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
+                }
+
                 let clock = Clock::from_account_info(a_clock)?;
 
                 // Transfer base tokens to vault
@@ -10079,15 +10232,6 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, user_idx)?;
-
-                // Owner authorization via verify helper (Kani-provable)
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
                 engine
                     .deposit(user_idx, units as u128, clock.slot)
                     .map_err(map_risk_error)?;
@@ -10273,21 +10417,11 @@ pub mod processor {
                                 // Settle position using COIN-MARGINED PnL formula
                                 // (matches mark_pnl_for_position in the risk engine)
                                 // PnL = diff * abs_pos / settle_price
-                                let entry = acc.entry_price as i128;
-                                let settle = settlement_price as i128;
-                                let abs_pos = if pos < 0 { pos.wrapping_neg() } else { pos };
-                                let diff = if pos > 0 {
-                                    settle.saturating_sub(entry)
-                                } else {
-                                    entry.saturating_sub(settle)
-                                };
-                                // Guard against division by zero (settle == 0 checked above,
-                                // but defense in depth)
-                                let pnl_delta = if settle != 0 {
-                                    diff.saturating_mul(abs_pos) / settle
-                                } else {
-                                    0i128
-                                };
+                                let pnl_delta = coin_margined_settlement_pnl_delta(
+                                    pos,
+                                    acc.entry_price,
+                                    settlement_price,
+                                );
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
                                 // SECURITY: Must use set_pnl() for correct haircut calculations
@@ -15541,11 +15675,6 @@ pub mod processor {
                     return Err(ProgramError::IncorrectProgramId);
                 }
 
-                // #983: Validate system program
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
                 // Verify admin on slab_a (#958: slab_a admin check)
                 {
                     let data_a = a_slab_a.try_borrow_data()?;
@@ -15668,11 +15797,6 @@ pub mod processor {
                 accounts::expect_signer(a_payer)?;
                 accounts::expect_writable(a_payer)?;
                 accounts::expect_writable(a_attestation)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                // #983: Validate system program
                 if *a_system.key != solana_program::system_program::id() {
                     return Err(ProgramError::IncorrectProgramId);
                 }

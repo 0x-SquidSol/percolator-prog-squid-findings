@@ -23,7 +23,6 @@ log "Deployer balance: $(solana balance $UPGRADE_AUTH --url $RPC)"
 log "=== Building SMALL tier (features: small,devnet) ==="
 cargo build-sbf --features small,devnet 2>&1
 cp target/deploy/percolator_prog.so target/deploy/percolator_prog_small.so
-cp target/deploy/percolator_prog.so deploy-artifacts/percolator_prog_small.so
 log "=== Deploying SMALL → $SMALL_ID ==="
 solana program deploy \
   --program-id "$SMALL_ID" \
@@ -36,7 +35,6 @@ log "SMALL deployed ✅"
 log "=== Building MEDIUM tier (features: medium,devnet) ==="
 cargo build-sbf --features medium,devnet 2>&1
 cp target/deploy/percolator_prog.so target/deploy/percolator_prog_medium.so
-cp target/deploy/percolator_prog.so deploy-artifacts/percolator_prog_medium.so
 log "=== Deploying MEDIUM → $MEDIUM_ID ==="
 solana program deploy \
   --program-id "$MEDIUM_ID" \
@@ -59,3 +57,6 @@ log "LARGE deployed ✅"
 
 log "=== All 3 tiers rebuilt and deployed from 314391b ==="
 log "Deployer balance after: $(solana balance $UPGRADE_AUTH --url $RPC)"
+log "⚠️  REQUIRED NEXT STEP: immediately call InitSharedVault for each deployed program."
+log "    Do NOT leave shared-vault PDA uninitialized (first-caller-wins)."
+log "    Verify on-chain params before onboarding LPs/users."

@@ -162,7 +162,9 @@ This section describes intent and operational ordering, not argument-by-argument
 Percolator treats a matcher like a price/size oracle **with rules** chosen by the LP, but enforces a hard safety envelope.
 
 ### What Percolator enforces (non-negotiable)
-- **Signer checks**: user and LP owner must sign
+- **Signer checks**:
+  - `TradeNoCpi`: user and LP owner must sign
+  - `TradeCpi`: user must sign; LP owner key must match registered owner (LP owner signature is not required)
 - **LP identity signer**: LP PDA is derived, not provided by the user
 - **Matcher identity binding**: matcher program + context must equal what the LP registered
 - **Matcher account shape**:
@@ -312,7 +314,11 @@ Call `InitMarket` with:
 - staleness/conf filter params
 - `RiskParams` (warmup, margins, fees, liquidation knobs, crank staleness, etc.)
 
-### Step 2: Onboard LPs and users
+### Step 2: InitSharedVault (must be immediate)
+Call `InitSharedVault` immediately after deploy/InitMarket and verify expected parameters on-chain
+before onboarding LPs or users. Do not leave the shared-vault PDA uninitialized.
+
+### Step 3: Onboard LPs and users
 - LP:
   - deploy or choose matcher program
   - create matcher context account owned by matcher program
@@ -322,13 +328,13 @@ Call `InitMarket` with:
   - `InitUser(fee_payment)`
   - deposit collateral
 
-### Step 3: Fund insurance
+### Step 4: Fund insurance
 Call `TopUpInsurance` as needed.
 
-### Step 4: Start keepers
+### Step 5: Start keepers
 Run `KeeperCrank` continuously.
 
-### Step 5: Enable trading
+### Step 6: Enable trading
 - Use `TradeNoCpi` for local testing or deterministic environments
 - Use `TradeCpi` for production execution via matcher CPI
 
