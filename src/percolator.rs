@@ -2032,6 +2032,12 @@ pub mod error {
         OiImbalanceHardBlock,
         /// Entry price must be positive when opening a position (RiskError::InvalidEntryPrice).
         EngineInvalidEntryPrice,
+        /// PERC-8297: SideMode is DrainOnly or ResetPending — new position blocked on this side.
+        /// Distinct from EngineOverflow for better diagnostics (pre-audit).
+        EngineSideBlocked,
+        /// PERC-8297: Engine detected a corrupt state invariant violation.
+        /// Distinct from EngineOverflow for better diagnostics (pre-audit).
+        EngineCorruptState,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2053,9 +2059,9 @@ pub mod error {
             RiskError::PositionSizeMismatch => PercolatorError::EnginePositionSizeMismatch,
             RiskError::AccountKindMismatch => PercolatorError::EngineAccountKindMismatch,
             RiskError::InvalidEntryPrice => PercolatorError::EngineInvalidEntryPrice,
-            // Added in PERC-8270: new variants from two-phase crank
-            RiskError::SideBlocked => PercolatorError::EngineOverflow,
-            RiskError::CorruptState => PercolatorError::EngineOverflow,
+            // PERC-8297: distinct error codes for pre-audit diagnostics
+            RiskError::SideBlocked => PercolatorError::EngineSideBlocked,
+            RiskError::CorruptState => PercolatorError::EngineCorruptState,
         };
         ProgramError::Custom(err as u32)
     }
