@@ -631,6 +631,100 @@ fn test_vault_validation() {
     assert_eq!(res, Err(PercolatorError::InvalidVaultAta.into()));
 }
 
+/// Malicious account substitution: vault authority PDA must be `[vault, slab]` for this program.
+#[test]
+#[cfg(feature = "test")]
+fn test_withdraw_rejects_wrong_vault_authority_pda() {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, u64::MAX);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let init_accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+    }
+
+    let mut user = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut user_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, user.key, 1000),
+    )
+    .writable();
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+    }
+    let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 500)).unwrap();
+    }
+
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            f.clock.to_info(),
+            f.pyth_index.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_crank(user_idx, 0)).unwrap();
+    }
+
+    let wrong_auth = Pubkey::new_unique();
+    let mut fake_vault_pda = TestAccount::new(wrong_auth, solana_program::system_program::id(), 0, vec![]);
+
+    let res = process_instruction(
+        &f.program_id,
+        &vec![
+            user.to_info(),
+            f.slab.to_info(),
+            f.vault.to_info(),
+            user_ata.to_info(),
+            fake_vault_pda.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.pyth_index.to_info(),
+        ],
+        &encode_withdraw(user_idx, 200),
+    );
+    assert_eq!(
+        res,
+        Err(ProgramError::InvalidArgument),
+        "withdraw must require accounts::derive_vault_authority(program_id, slab) as vault PDA"
+    );
+}
+
 #[test]
 #[cfg(feature = "test")]
 #[ignore = "PERC-199: TradeCpi uses Clock::get() syscall, unavailable in unit tests — migrate to LiteSVM"]
