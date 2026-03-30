@@ -2696,6 +2696,7 @@ pub mod ix {
                 }
                 TAG_CLOSE_SLAB => {
                     // CloseSlab
+                    require_no_trailing_bytes(rest)?;
                     Ok(Instruction::CloseSlab)
                 }
                 TAG_UPDATE_CONFIG => {
@@ -2771,10 +2772,17 @@ pub mod ix {
                 TAG_SET_ORACLE_PRICE_CAP => {
                     // SetOraclePriceCap
                     let max_change_e2bps = read_u64(&mut rest)?;
+                    require_no_trailing_bytes(rest)?;
                     Ok(Instruction::SetOraclePriceCap { max_change_e2bps })
                 }
-                TAG_RESOLVE_MARKET => Ok(Instruction::ResolveMarket),
-                TAG_WITHDRAW_INSURANCE => Ok(Instruction::WithdrawInsurance),
+                TAG_RESOLVE_MARKET => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::ResolveMarket)
+                }
+                TAG_WITHDRAW_INSURANCE => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::WithdrawInsurance)
+                }
                 TAG_ADMIN_FORCE_CLOSE => {
                     // AdminForceClose
                     let target_idx = read_u16(&mut rest)?;
@@ -2889,7 +2897,10 @@ pub mod ix {
                     let confirmation = read_u64(&mut rest)?;
                     Ok(Instruction::RenounceAdmin { confirmation })
                 }
-                TAG_CREATE_INSURANCE_MINT => Ok(Instruction::CreateInsuranceMint),
+                TAG_CREATE_INSURANCE_MINT => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::CreateInsuranceMint)
+                }
                 TAG_DEPOSIT_INSURANCE_LP => {
                     // DepositInsuranceLP
                     let amount = read_u64(&mut rest)?;
@@ -2900,13 +2911,22 @@ pub mod ix {
                     let lp_amount = read_u64(&mut rest)?;
                     Ok(Instruction::WithdrawInsuranceLP { lp_amount })
                 }
-                TAG_PAUSE_MARKET => Ok(Instruction::PauseMarket),
-                TAG_UNPAUSE_MARKET => Ok(Instruction::UnpauseMarket),
-                TAG_ACCEPT_ADMIN => Ok(Instruction::AcceptAdmin),
+                TAG_PAUSE_MARKET => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::PauseMarket)
+                }
+                TAG_UNPAUSE_MARKET => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::UnpauseMarket)
+                }
+                TAG_ACCEPT_ADMIN => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::AcceptAdmin)
+                }
                 TAG_SET_INSURANCE_WITHDRAW_POLICY => {
                     // SetInsuranceWithdrawPolicy (Tag 30):
                     // authority(32) + min_withdraw_base(8) + max_withdraw_bps(2) + cooldown_slots(8) = 50 bytes
-                    if rest.len() < 50 {
+                    if rest.len() != 50 {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     let authority = {
@@ -2939,7 +2959,7 @@ pub mod ix {
                 }
                 TAG_WITHDRAW_INSURANCE_LIMITED => {
                     // WithdrawInsuranceLimited (Tag 31): amount(8 bytes)
-                    if rest.len() < 8 {
+                    if rest.len() != 8 {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     let amount = u64::from_le_bytes(
@@ -2950,7 +2970,7 @@ pub mod ix {
                     Ok(Instruction::WithdrawInsuranceLimited { amount })
                 }
                 TAG_SET_PYTH_ORACLE => {
-                    if rest.len() < 42 {
+                    if rest.len() != 42 {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     let feed_id: [u8; 32] = rest[..32]
@@ -2972,8 +2992,14 @@ pub mod ix {
                         conf_filter_bps,
                     })
                 }
-                TAG_UPDATE_MARK_PRICE => Ok(Instruction::UpdateMarkPrice),
-                TAG_UPDATE_HYPERP_MARK => Ok(Instruction::UpdateHyperpMark),
+                TAG_UPDATE_MARK_PRICE => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::UpdateMarkPrice)
+                }
+                TAG_UPDATE_HYPERP_MARK => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::UpdateHyperpMark)
+                }
                 TAG_TRADE_CPI_V2 => {
                     // PERC-154: TradeCpiV2 — same as TradeCpi but includes PDA bump byte
                     let lp_idx = read_u16(&mut rest)?;
@@ -3012,7 +3038,10 @@ pub mod ix {
                     let lp_amount = read_u64(&mut rest)?;
                     Ok(Instruction::LpVaultWithdraw { lp_amount })
                 }
-                TAG_LP_VAULT_CRANK_FEES => Ok(Instruction::LpVaultCrankFees),
+                TAG_LP_VAULT_CRANK_FEES => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::LpVaultCrankFees)
+                }
                 TAG_FUND_MARKET_INSURANCE => {
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::FundMarketInsurance { amount })
@@ -3049,28 +3078,43 @@ pub mod ix {
                     let lp_amount = read_u64(&mut rest)?;
                     Ok(Instruction::QueueWithdrawal { lp_amount })
                 }
-                TAG_CLAIM_QUEUED_WITHDRAWAL => Ok(Instruction::ClaimQueuedWithdrawal),
-                TAG_CANCEL_QUEUED_WITHDRAWAL => Ok(Instruction::CancelQueuedWithdrawal),
+                TAG_CLAIM_QUEUED_WITHDRAWAL => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::ClaimQueuedWithdrawal)
+                }
+                TAG_CANCEL_QUEUED_WITHDRAWAL => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::CancelQueuedWithdrawal)
+                }
                 TAG_EXECUTE_ADL => {
                     let target_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ExecuteAdl { target_idx })
                 }
-                TAG_CLOSE_STALE_SLAB => Ok(Instruction::CloseStaleSlabs),
-                TAG_RECLAIM_SLAB_RENT => Ok(Instruction::ReclaimSlabRent),
+                TAG_CLOSE_STALE_SLAB => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::CloseStaleSlabs)
+                }
+                TAG_RECLAIM_SLAB_RENT => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::ReclaimSlabRent)
+                }
                 TAG_TRANSFER_OWNERSHIP_CPI => {
                     let user_idx = read_u16(&mut rest)?;
-                    let mut new_owner = [0u8; 32];
-                    if rest.len() < 32 {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    new_owner.copy_from_slice(&rest[..32]);
+                    let new_owner = read_bytes32(&mut rest)?;
+                    require_no_trailing_bytes(rest)?;
                     Ok(Instruction::TransferOwnershipCpi {
                         user_idx,
                         new_owner,
                     })
                 }
-                TAG_ADVANCE_ORACLE_PHASE => Ok(Instruction::AdvanceOraclePhase),
-                TAG_AUDIT_CRANK => Ok(Instruction::AuditCrank),
+                TAG_ADVANCE_ORACLE_PHASE => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::AdvanceOraclePhase)
+                }
+                TAG_AUDIT_CRANK => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::AuditCrank)
+                }
                 TAG_SET_OFFSET_PAIR => {
                     let offset_bps = read_u16(&mut rest)?;
                     Ok(Instruction::SetOffsetPair { offset_bps })
@@ -3103,8 +3147,14 @@ pub mod ix {
                     let lp_amount = read_u64(&mut rest)?;
                     Ok(Instruction::QueueWithdrawalSV { lp_amount })
                 }
-                TAG_CLAIM_EPOCH_WITHDRAWAL => Ok(Instruction::ClaimEpochWithdrawal),
-                TAG_ADVANCE_EPOCH => Ok(Instruction::AdvanceEpoch),
+                TAG_CLAIM_EPOCH_WITHDRAWAL => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::ClaimEpochWithdrawal)
+                }
+                TAG_ADVANCE_EPOCH => {
+                    require_no_trailing_bytes(rest)?;
+                    Ok(Instruction::AdvanceEpoch)
+                }
 
                 // ── PERC-608: Position NFT instructions ──────────────────
                 TAG_MINT_POSITION_NFT => {
@@ -3225,6 +3275,15 @@ pub mod ix {
         Ok(bytes.try_into().unwrap())
     }
 
+    /// Reject unexpected trailing bytes after a fully parsed instruction payload.
+    #[inline]
+    pub(crate) fn require_no_trailing_bytes(rest: &[u8]) -> Result<(), ProgramError> {
+        if !rest.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_risk_params(input: &mut &[u8]) -> Result<RiskParams, ProgramError> {
         Ok(RiskParams {
             warmup_period_slots: read_u64(input)?,
@@ -3286,6 +3345,16 @@ pub mod ix {
             v.extend_from_slice(&50u64.to_le_bytes()); // maintenance_margin_bps
             v.extend_from_slice(rest);
             v
+        }
+
+        #[test]
+        fn test_fieldless_instruction_rejects_trailing_byte() {
+            let mut data = vec![crate::tags::TAG_PAUSE_MARKET];
+            data.push(0u8);
+            assert_eq!(
+                Instruction::decode(&data).unwrap_err(),
+                solana_program::program_error::ProgramError::InvalidInstructionData,
+            );
         }
 
         // ── PERC-649: invalid tail lengths must be rejected ──────────────────────
