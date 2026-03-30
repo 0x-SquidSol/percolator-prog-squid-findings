@@ -9585,6 +9585,71 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn normalize_shared_vault_init_params(
+        epoch_duration_slots: u64,
+        max_market_exposure_bps: u16,
+    ) -> Result<(u64, u16), ProgramError> {
+        if epoch_duration_slots != 0
+            && epoch_duration_slots != crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if max_market_exposure_bps != 0
+            && max_market_exposure_bps != crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let duration = if epoch_duration_slots == 0 {
+            crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
+        } else {
+            epoch_duration_slots
+        };
+        let max_bps = if max_market_exposure_bps == 0 {
+            crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
+        } else {
+            max_market_exposure_bps
+        };
+        Ok((duration, max_bps))
+    }
+
+    #[cfg(test)]
+    mod init_shared_vault_param_tests {
+        use super::normalize_shared_vault_init_params;
+
+        #[test]
+        fn accepts_zero_as_default() {
+            let (duration, max_bps) =
+                normalize_shared_vault_init_params(0, 0).expect("zero params must normalize");
+            assert_eq!(duration, crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS);
+            assert_eq!(max_bps, crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS);
+        }
+
+        #[test]
+        fn accepts_explicit_defaults() {
+            let (duration, max_bps) = normalize_shared_vault_init_params(
+                crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS,
+                crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS,
+            )
+            .expect("explicit defaults must be accepted");
+            assert_eq!(duration, crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS);
+            assert_eq!(max_bps, crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS);
+        }
+
+        #[test]
+        fn rejects_non_default_epoch_duration() {
+            let res = normalize_shared_vault_init_params(1, 0);
+            assert!(res.is_err(), "non-default epoch duration must be rejected");
+        }
+
+        #[test]
+        fn rejects_non_default_exposure_bps() {
+            let res = normalize_shared_vault_init_params(0, 9999);
+            assert!(res.is_err(), "non-default exposure bps must be rejected");
+        }
+    }
+
     /// PERC-328: PDA derivation in its own frame.
     /// `Pubkey::find_program_address` hashes SHA-256 in a loop; under LTO the
     /// ~200 B hash state can be inlined into the caller, contributing to frame
@@ -15999,16 +16064,10 @@ pub mod processor {
                 )?;
 
                 let clock = solana_program::clock::Clock::get()?;
-                let duration = if epoch_duration_slots == 0 {
-                    crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
-                } else {
-                    epoch_duration_slots
-                };
-                let max_bps = if max_market_exposure_bps == 0 {
-                    crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
-                } else {
-                    max_market_exposure_bps.min(10_000)
-                };
+                let (duration, max_bps) = normalize_shared_vault_init_params(
+                    epoch_duration_slots,
+                    max_market_exposure_bps,
+                )?;
 
                 let state = crate::shared_vault::SharedVaultState {
                     magic: crate::shared_vault::SHARED_VAULT_MAGIC,
