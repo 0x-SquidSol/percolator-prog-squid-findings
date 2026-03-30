@@ -9585,6 +9585,55 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn coin_margined_settlement_pnl_delta(pos: i128, entry_price_e6: u64, settle_price_e6: u64) -> i128 {
+        if pos == 0 || settle_price_e6 == 0 {
+            return 0;
+        }
+
+        let entry = entry_price_e6 as i128;
+        let settle = settle_price_e6 as i128;
+        let directional_diff = if pos > 0 {
+            settle.saturating_sub(entry)
+        } else {
+            entry.saturating_sub(settle)
+        };
+        let magnitude = directional_diff
+            .unsigned_abs()
+            .saturating_mul(pos.unsigned_abs())
+            .checked_div(settle_price_e6 as u128)
+            .unwrap_or(0)
+            .min(i128::MAX as u128) as i128;
+
+        if directional_diff < 0 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+
+    #[cfg(test)]
+    mod resolved_settlement_pnl_tests {
+        use super::coin_margined_settlement_pnl_delta;
+
+        #[test]
+        fn pnl_delta_long_position_profit() {
+            let pnl = coin_margined_settlement_pnl_delta(1_000_000, 100_000_000, 120_000_000);
+            assert!(pnl > 0, "long should profit when settlement > entry");
+        }
+
+        #[test]
+        fn pnl_delta_short_position_profit() {
+            let pnl = coin_margined_settlement_pnl_delta(-1_000_000, 120_000_000, 100_000_000);
+            assert!(pnl > 0, "short should profit when settlement < entry");
+        }
+
+        #[test]
+        fn pnl_delta_handles_i128_min_without_overflow() {
+            let pnl = coin_margined_settlement_pnl_delta(i128::MIN, 120_000_000, 100_000_000);
+            assert!(pnl >= 0, "must not overflow or flip sign on i128::MIN");
+        }
+    }
     /// PERC-328: PDA derivation in its own frame.
     /// `Pubkey::find_program_address` hashes SHA-256 in a loop; under LTO the
     /// ~200 B hash state can be inlined into the caller, contributing to frame
@@ -10273,21 +10322,11 @@ pub mod processor {
                                 // Settle position using COIN-MARGINED PnL formula
                                 // (matches mark_pnl_for_position in the risk engine)
                                 // PnL = diff * abs_pos / settle_price
-                                let entry = acc.entry_price as i128;
-                                let settle = settlement_price as i128;
-                                let abs_pos = if pos < 0 { pos.wrapping_neg() } else { pos };
-                                let diff = if pos > 0 {
-                                    settle.saturating_sub(entry)
-                                } else {
-                                    entry.saturating_sub(settle)
-                                };
-                                // Guard against division by zero (settle == 0 checked above,
-                                // but defense in depth)
-                                let pnl_delta = if settle != 0 {
-                                    diff.saturating_mul(abs_pos) / settle
-                                } else {
-                                    0i128
-                                };
+                                let pnl_delta = coin_margined_settlement_pnl_delta(
+                                    pos,
+                                    acc.entry_price,
+                                    settlement_price,
+                                );
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
                                 // SECURITY: Must use set_pnl() for correct haircut calculations
