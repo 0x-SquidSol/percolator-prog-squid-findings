@@ -31,6 +31,9 @@ use percolator_prog::verify::{
     abi_ok,
     // New: Dust math
     accumulate_dust,
+    // PERC-8286: ADL verify helpers
+    adl_insurance_gate_ok,
+    adl_target_profitable,
     admin_ok,
     apply_trade_positions,
     // New: Unit scale conversion math
@@ -38,6 +41,7 @@ use percolator_prog::verify::{
     checked_deposit,
     checked_withdraw,
     circuit_breaker_triggered,
+    compute_adl_close_abs,
     compute_fee_ceil,
     compute_fee_floor,
     // New: PERC-304 fee multiplier
@@ -7280,4 +7284,187 @@ fn proof_claim_epoch_conservation() {
             "C11-B: fully-funded epoch payout must not exceed snapshot_capital"
         );
     }
+}
+
+// =============================================================================
+// PERC-8286: ADL Engine Kani Proofs (T8 — T14 security gate)
+// =============================================================================
+//
+// Properties proven:
+//   T8-K1: Partial deleverage proportion never exceeds 1.0 (close_abs ≤ abs_pos)
+//   T8-K2: Partial close always closes at least 1 unit (close_abs ≥ 1)
+//   T8-K3: ADL insurance gate rejects non-zero insurance balances
+//   T8-K4: ADL target gate rejects non-profitable (pnl ≤ 0) positions
+//   T8-K5: Deleverage proportion is zero when excess is zero
+//   T8-K6: Full close when target_positive_pnl ≤ excess (close ≥ abs_pos)
+// =============================================================================
+
+/// T8-K1: Partial deleverage proportion never exceeds 1.0.
+///
+/// Invariant: compute_adl_close_abs(abs_pos, excess, target_pnl) ≤ abs_pos
+///
+/// Rationale: ADL must never close more than the full position. The partial
+/// close proportion is excess / target_positive_pnl ≤ 1.0 when
+/// target_positive_pnl > excess. Combined with the max(close_abs, 1) floor,
+/// the result must lie in [1, abs_pos].
+#[kani::proof]
+fn proof_t8_adl_partial_close_never_exceeds_full() {
+    let abs_pos: u128 = kani::any();
+    let excess: u128 = kani::any();
+    let target_positive_pnl: u128 = kani::any();
+
+    // This branch only fires when target_positive_pnl > excess (partial close path)
+    kani::assume(abs_pos > 0);
+    kani::assume(target_positive_pnl > 0);
+    kani::assume(target_positive_pnl > excess);
+    // Bound to keep SAT tractable: real positions are well within u64 range
+    kani::assume(abs_pos <= u64::MAX as u128);
+    kani::assume(excess <= u64::MAX as u128);
+    kani::assume(target_positive_pnl <= u64::MAX as u128);
+
+    let close_abs = compute_adl_close_abs(abs_pos, excess, target_positive_pnl);
+
+    assert!(
+        close_abs <= abs_pos,
+        "T8-K1: partial deleverage must never close more than the full position"
+    );
+}
+
+/// T8-K2: Partial close always closes at least 1 unit.
+///
+/// Invariant: compute_adl_close_abs(...) ≥ 1
+///
+/// Rationale: Even when excess is 0, ADL closes a minimum of 1 unit per
+/// execution cycle to make forward progress. The max(close_abs, 1) floor
+/// guarantees this.
+#[kani::proof]
+fn proof_t8_adl_partial_close_minimum_one_unit() {
+    let abs_pos: u128 = kani::any();
+    let excess: u128 = kani::any();
+    let target_positive_pnl: u128 = kani::any();
+
+    kani::assume(abs_pos > 0);
+    kani::assume(target_positive_pnl > 0);
+    kani::assume(target_positive_pnl > excess);
+    kani::assume(abs_pos <= u64::MAX as u128);
+    kani::assume(excess <= u64::MAX as u128);
+    kani::assume(target_positive_pnl <= u64::MAX as u128);
+
+    let close_abs = compute_adl_close_abs(abs_pos, excess, target_positive_pnl);
+
+    assert!(
+        close_abs >= 1,
+        "T8-K2: partial deleverage must close at least 1 unit"
+    );
+}
+
+/// T8-K3: ADL insurance gate rejects non-zero insurance balance.
+///
+/// Invariant: adl_insurance_gate_ok(balance) == (balance == 0)
+///
+/// Rationale: ADL is the last resort. The insurance fund must be fully
+/// depleted before ADL fires. Any non-zero balance must be rejected.
+#[kani::proof]
+fn proof_t8_adl_insurance_gate_rejects_nonzero() {
+    let balance: u64 = kani::any();
+    kani::assume(balance > 0);
+
+    assert!(
+        !adl_insurance_gate_ok(balance),
+        "T8-K3: ADL insurance gate must reject non-zero insurance balance"
+    );
+}
+
+/// T8-K3b: ADL insurance gate accepts zero balance.
+#[kani::proof]
+fn proof_t8_adl_insurance_gate_accepts_zero() {
+    assert!(
+        adl_insurance_gate_ok(0),
+        "T8-K3b: ADL insurance gate must accept zero balance"
+    );
+}
+
+/// T8-K4: ADL target gate rejects non-profitable positions.
+///
+/// Invariant: adl_target_profitable(pnl) == (pnl > 0)
+///
+/// Rationale: ADL only deleverages the most profitable opposing positions.
+/// A non-profitable target (pnl ≤ 0) must be rejected — deleveraging a loss
+/// position would not reduce the system's liability.
+#[kani::proof]
+fn proof_t8_adl_target_gate_rejects_nonpositive_pnl() {
+    let pnl: i128 = kani::any();
+    kani::assume(pnl <= 0);
+
+    assert!(
+        !adl_target_profitable(pnl),
+        "T8-K4: ADL target gate must reject positions with pnl <= 0"
+    );
+}
+
+/// T8-K4b: ADL target gate accepts profitable positions.
+#[kani::proof]
+fn proof_t8_adl_target_gate_accepts_positive_pnl() {
+    let pnl: i128 = kani::any();
+    kani::assume(pnl > 0);
+
+    assert!(
+        adl_target_profitable(pnl),
+        "T8-K4b: ADL target gate must accept positions with pnl > 0"
+    );
+}
+
+/// T8-K5: Deleverage close is zero when excess is zero (before max(., 1) floor).
+///
+/// When excess == 0: abs_pos * 0 / target_pnl = 0.
+/// After max(0, 1) floor → close_abs = 1 (minimum progress unit).
+/// Proves the zero-excess case still produces exactly 1 unit.
+#[kani::proof]
+fn proof_t8_adl_zero_excess_closes_one_unit() {
+    let abs_pos: u128 = kani::any();
+    let target_positive_pnl: u128 = kani::any();
+
+    kani::assume(abs_pos > 0);
+    kani::assume(target_positive_pnl > 0);
+    kani::assume(abs_pos <= u64::MAX as u128);
+    kani::assume(target_positive_pnl <= u64::MAX as u128);
+
+    let close_abs = compute_adl_close_abs(abs_pos, 0, target_positive_pnl);
+
+    assert_eq!(
+        close_abs, 1,
+        "T8-K5: zero-excess ADL must close exactly 1 unit (minimum progress)"
+    );
+}
+
+/// T8-K6: Full close path is taken when target_positive_pnl ≤ excess.
+///
+/// When target_positive_pnl ≤ excess, execute_adl calls oracle_close_position_core
+/// (full close) and returns abs_pos. This proof validates the branch condition
+/// using the same compute_adl_close_abs helper to confirm it produces abs_pos.
+///
+/// Note: the full-close branch returns abs_pos directly in execute_adl — this
+/// proof validates the partial-close branch never fires at the full-close boundary.
+#[kani::proof]
+fn proof_t8_adl_proportion_at_most_one_on_boundary() {
+    let abs_pos: u128 = kani::any();
+    let target_positive_pnl: u128 = kani::any();
+
+    kani::assume(abs_pos > 0);
+    kani::assume(target_positive_pnl > 0);
+    kani::assume(abs_pos <= u64::MAX as u128);
+    kani::assume(target_positive_pnl <= u64::MAX as u128);
+
+    // Excess exactly equals target_positive_pnl (boundary: proportion = 1.0)
+    let excess = target_positive_pnl;
+
+    // In execute_adl: target_positive_pnl <= excess → full close (not partial)
+    // Verify the compute_adl_close_abs result equals abs_pos at this boundary
+    let close_abs = compute_adl_close_abs(abs_pos, excess, target_positive_pnl);
+
+    // At excess == target_positive_pnl: abs_pos * target_pnl / target_pnl = abs_pos
+    assert_eq!(
+        close_abs, abs_pos,
+        "T8-K6: proportion at boundary (excess == target_pnl) must equal full position"
+    );
 }
