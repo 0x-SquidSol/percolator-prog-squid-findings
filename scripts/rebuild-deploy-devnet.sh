@@ -23,7 +23,6 @@ log "Deployer balance: $(solana balance $UPGRADE_AUTH --url $RPC)"
 log "=== Building SMALL tier (features: small,devnet) ==="
 cargo build-sbf --features small,devnet 2>&1
 cp target/deploy/percolator_prog.so target/deploy/percolator_prog_small.so
-cp target/deploy/percolator_prog.so deploy-artifacts/percolator_prog_small.so
 log "=== Deploying SMALL → $SMALL_ID ==="
 solana program deploy \
   --program-id "$SMALL_ID" \
@@ -36,7 +35,6 @@ log "SMALL deployed ✅"
 log "=== Building MEDIUM tier (features: medium,devnet) ==="
 cargo build-sbf --features medium,devnet 2>&1
 cp target/deploy/percolator_prog.so target/deploy/percolator_prog_medium.so
-cp target/deploy/percolator_prog.so deploy-artifacts/percolator_prog_medium.so
 log "=== Deploying MEDIUM → $MEDIUM_ID ==="
 solana program deploy \
   --program-id "$MEDIUM_ID" \
