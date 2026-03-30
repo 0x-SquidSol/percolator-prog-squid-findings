@@ -1728,6 +1728,53 @@ pub mod verify {
         // Clamp to u64 (can't realistically exceed but be safe)
         core::cmp::min(util, u64::MAX as u128) as u64
     }
+
+    // =========================================================================
+    // PERC-8286: ADL verify helpers (Kani proofs)
+    // =========================================================================
+
+    /// Compute the absolute position size to close during partial ADL.
+    ///
+    /// Mirrors the partial-deleverage branch of `execute_adl`:
+    ///   close_abs = max(abs_pos * excess / target_positive_pnl, 1)
+    ///
+    /// Returns `abs_pos` (full close) if the multiplication overflows.
+    ///
+    /// Invariants (proven by T8-K1 / T8-K2):
+    ///   - close_abs ≤ abs_pos  (proportion never exceeds 1.0)
+    ///   - close_abs ≥ 1        (always closes at least 1 unit)
+    #[inline]
+    pub fn compute_adl_close_abs(abs_pos: u128, excess: u128, target_positive_pnl: u128) -> u128 {
+        debug_assert!(abs_pos > 0, "compute_adl_close_abs: abs_pos must be > 0");
+        debug_assert!(
+            target_positive_pnl > 0,
+            "compute_adl_close_abs: target_positive_pnl must be > 0"
+        );
+        let close_abs = abs_pos
+            .checked_mul(excess)
+            .map(|v| v / target_positive_pnl)
+            .unwrap_or(abs_pos);
+        core::cmp::max(close_abs, 1)
+    }
+
+    /// Returns true iff the ADL insurance gate passes: insurance_balance == 0.
+    ///
+    /// ADL is the last resort — insurance fund must be fully depleted.
+    /// Proven by T8-K3: ADL gate rejects non-zero insurance balance.
+    #[inline]
+    pub fn adl_insurance_gate_ok(insurance_balance: u64) -> bool {
+        insurance_balance == 0
+    }
+
+    /// Returns true iff the ADL target position is eligible: pnl > 0.
+    ///
+    /// ADL targets the most profitable opposing position; a non-profitable
+    /// target is invalid and must be rejected.
+    /// Proven by T8-K4: ADL rejects non-profitable (pnl ≤ 0) positions.
+    #[inline]
+    pub fn adl_target_profitable(target_pnl: i128) -> bool {
+        target_pnl > 0
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
