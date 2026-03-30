@@ -631,6 +631,83 @@ fn test_vault_validation() {
     assert_eq!(res, Err(PercolatorError::InvalidVaultAta.into()));
 }
 
+/// Malicious account substitution: vault ATA must match `config.vault_pubkey`.
+#[test]
+#[cfg(feature = "test")]
+fn test_deposit_rejects_substituted_vault_account() {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, u64::MAX);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let init_accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+    }
+
+    let mut user = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut user_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, user.key, 1000),
+    )
+    .writable();
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+    }
+    let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+    // Same mint + vault authority as the real vault, but wrong token account address.
+    let wrong_vault_key = Pubkey::new_unique();
+    let mut wrong_vault = TestAccount::new(
+        wrong_vault_key,
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, f.vault_pda, VAULT_SEED),
+    )
+    .writable();
+
+    let res = process_instruction(
+        &f.program_id,
+        &vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            wrong_vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+        ],
+        &encode_deposit(user_idx, 500),
+    );
+    assert_eq!(
+        res,
+        Err(PercolatorError::InvalidVaultAta.into()),
+        "deposit must not accept a vault token account whose pubkey != config.vault_pubkey"
+    );
+}
+
 #[test]
 #[cfg(feature = "test")]
 #[ignore = "PERC-199: TradeCpi uses Clock::get() syscall, unavailable in unit tests — migrate to LiteSVM"]
