@@ -1922,6 +1922,74 @@ pub mod matcher_abi {
     }
 }
 
+#[cfg(test)]
+mod matcher_abi_unit_tests {
+    use super::matcher_abi::{
+        read_matcher_return, validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID,
+    };
+    use crate::constants::MATCHER_ABI_VERSION;
+    use solana_program::program_error::ProgramError;
+
+    fn valid_ret(exec_size: i128) -> MatcherReturn {
+        MatcherReturn {
+            abi_version: MATCHER_ABI_VERSION,
+            flags: FLAG_VALID,
+            exec_price_e6: 100_000_000,
+            exec_size,
+            req_id: 7,
+            lp_account_id: 11,
+            oracle_price_e6: 100_000_000,
+            reserved: 0,
+        }
+    }
+
+    #[test]
+    fn read_matcher_return_rejects_short_context() {
+        let ctx = [0u8; 63];
+        let err = read_matcher_return(&ctx).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn validate_accepts_i128_min_when_request_matches() {
+        let ret = valid_ret(i128::MIN);
+        let res = validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            i128::MIN,
+            ret.req_id,
+        );
+        assert!(res.is_ok(), "i128::MIN exact-size match should be valid");
+    }
+
+    #[test]
+    fn validate_rejects_i128_min_when_request_smaller() {
+        let ret = valid_ret(i128::MIN);
+        let res = validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            -1,
+            ret.req_id,
+        );
+        assert!(res.is_err(), "i128::MIN must reject when req_size is smaller");
+    }
+
+    #[test]
+    fn validate_zero_exec_size_requires_partial_ok_flag() {
+        let mut ret = valid_ret(0);
+        let reject =
+            validate_matcher_return(&ret, ret.lp_account_id, ret.oracle_price_e6, 1, ret.req_id);
+        assert!(reject.is_err(), "zero exec_size without PARTIAL_OK must reject");
+
+        ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
+        let accept =
+            validate_matcher_return(&ret, ret.lp_account_id, ret.oracle_price_e6, 1, ret.req_id);
+        assert!(accept.is_ok(), "zero exec_size with PARTIAL_OK should be accepted");
+    }
+}
+
 // 3. mod error
 pub mod error {
     use percolator::RiskError;
@@ -15580,11 +15648,6 @@ pub mod processor {
                     return Err(ProgramError::IncorrectProgramId);
                 }
 
-                // #983: Validate system program
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
                 // Verify admin on slab_a (#958: slab_a admin check)
                 {
                     let data_a = a_slab_a.try_borrow_data()?;
@@ -15707,11 +15770,6 @@ pub mod processor {
                 accounts::expect_signer(a_payer)?;
                 accounts::expect_writable(a_payer)?;
                 accounts::expect_writable(a_attestation)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                // #983: Validate system program
                 if *a_system.key != solana_program::system_program::id() {
                     return Err(ProgramError::IncorrectProgramId);
                 }
