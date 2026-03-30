@@ -2356,6 +2356,42 @@ fn test_non_admin_ops_rejected() {
 }
 
 #[test]
+fn test_set_maintenance_fee_requires_signer() {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+    }
+
+    // Build SetMaintenanceFee (tag 15): [15, new_fee(u128)].
+    let mut ix_data = vec![percolator_prog::tags::TAG_SET_MAINTENANCE_FEE];
+    ix_data.extend_from_slice(&1u128.to_le_bytes());
+
+    // Use current admin pubkey, but without signer privilege.
+    let mut admin_no_signer =
+        TestAccount::new(f.admin.key, solana_program::system_program::id(), 0, vec![]);
+    let res = process_instruction(
+        &f.program_id,
+        &[admin_no_signer.to_info(), f.slab.to_info()],
+        &ix_data,
+    );
+    assert_eq!(res, Err(PercolatorError::ExpectedSigner.into()));
+}
+
+#[test]
 fn test_oracle_inversion() {
     // Test that invert=1 correctly inverts the oracle price
     // Raw price: $100 = 100_000_000 e6
