@@ -28,7 +28,10 @@ use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-const SLAB_LEN: usize = 1025880; // MAX_ACCOUNTS=4096 (percolator@cf35789: +48 bytes from min_nonzero_mm_req, min_nonzero_im_req, insurance_floor in RiskParams)
+// Updated PERC-8271: PERC-8270 (ADL T5) grew Account by 56 bytes (4 fields) and RiskEngine by 24 bytes.
+// Previous BPF value: 1025880 (pre-PERC-8270, now a legacy tier in slab_guard).
+// BPF SLAB_LEN = 1288304 (8-byte i128 alignment). Native = 1321088 (16-byte).
+const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields, MAX_ACCOUNTS=4096
 const MAX_ACCOUNTS: usize = 4096;
 
 // PERC-328: Minimum seed deposit required by production binary (non-test feature).

@@ -32,7 +32,10 @@ use std::path::PathBuf;
 // ExternalAccountDataModified errors in LiteSVM's BPF runtime).
 // Build with: cargo build-sbf   (no --features test)
 // Note: BPF struct layout differs from native; these are BPF values.
-const SLAB_LEN: usize = 1025880; // MAX_ACCOUNTS=4096 (BPF, updated for PERC-8093: +48 bytes in RiskParams)
+// Updated PERC-8271: PERC-8270 (ADL T5) grew Account by 56 bytes (4 fields) and RiskEngine by 24 bytes.
+// Previous BPF value: 1025880 — now a legacy acceptance tier in slab_guard for devnet migration.
+// BPF SLAB_LEN = 1288304 (8-byte i128 alignment). Native = 1321088 (16-byte).
+const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields, MAX_ACCOUNTS=4096
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)

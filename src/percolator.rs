@@ -8649,18 +8649,23 @@ pub mod processor {
         data: &[u8],
     ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable).
-        // Three legacy sizes are accepted for backward compatibility:
-        //   SLAB_LEN        — current (PERC-118 + Account reorder)
-        //   SLAB_LEN - 16   — pre-PERC-118 (before trade_twap_e6 + twap_last_slot, +16 bytes)
-        //   SLAB_LEN - 24   — pre-PERC-118 + pre-Account-reorder (oldest devnet slabs, -8 bytes)
-        // New TWAP fields default to zero when read from old slabs → pure oracle mark (safe).
+        // Accepted sizes (backward compatibility across devnet upgrades):
+        //   SLAB_LEN           — current (PERC-8270 ADL fields: +56 bytes/account +24 bytes engine)
+        //   SLAB_LEN - 16      — pre-PERC-118 (before trade_twap_e6 + twap_last_slot, +16 bytes)
+        //   SLAB_LEN - 24      — pre-PERC-118 + pre-Account-reorder (oldest devnet slabs, -8 bytes)
+        //   PRE_ADL_SLAB_LEN   — pre-PERC-8270 slabs (295208 bytes smaller, 4096*56+24 growth)
+        // New ADL fields default to zero when read from pre-PERC-8270 slabs → safe conservative values.
         const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
         const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
+        // Pre-PERC-8270 devnet slabs (BPF): Account had no ADL fields, RiskEngine had no last_market_slot.
+        // BPF compiled value from percolator@cf35789 (pre-PERC-8270 struct layout).
+        const PRE_ADL_SLAB_LEN: usize = 1025880;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
             correct_len: data.len() == SLAB_LEN
                 || data.len() == PRE_118_SLAB_LEN
-                || data.len() == OLDEST_SLAB_LEN,
+                || data.len() == OLDEST_SLAB_LEN
+                || data.len() == PRE_ADL_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -15176,13 +15181,20 @@ pub mod processor {
                 }
 
                 // 2. Reject slabs with valid sizes — use CloseSlab for those.
+                // Valid tiers (kept in sync with slab_guard):
+                //   SLAB_LEN           — current (PERC-8270 ADL fields, BPF value)
+                //   PRE_118_SLAB_LEN   — pre-PERC-118 (SLAB_LEN - 16)
+                //   OLDEST_SLAB_LEN    — oldest devnet (SLAB_LEN - 24)
+                //   PRE_ADL_SLAB_LEN   — pre-PERC-8270 BPF (1025880)
                 const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
                 const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
+                const PRE_ADL_SLAB_LEN: usize = 1025880;
                 let slab_data = a_slab.try_borrow_data()?;
                 let slab_len = slab_data.len();
                 if slab_len == SLAB_LEN
                     || slab_len == PRE_118_SLAB_LEN
                     || slab_len == OLDEST_SLAB_LEN
+                    || slab_len == PRE_ADL_SLAB_LEN
                 {
                     return Err(PercolatorError::InvalidSlabLen.into());
                 }

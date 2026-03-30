@@ -24,9 +24,12 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-// Updated for PERC-328: matches SBF .so output after MarketConfig grew
-// (PERC-312 safety valve, PERC-314 dispute, PERC-315 LP collateral fields)
-const SLAB_LEN: usize = 1025880; // percolator@cf35789: +48 bytes from RiskParams new fields
+// Updated for PERC-8271: PERC-8270 (ADL T5) added 4 Account fields (+56 bytes/account) and
+// 3 RiskEngine fields — total layout growth.
+// NOTE: BPF layout differs from native (BPF uses 8-byte i128 alignment vs 16-byte native).
+// BPF SLAB_LEN = 1288304. Native = 1321088.
+// Previous BPF value: 1025880 (pre-PERC-8270, now a legacy tier in slab_guard).
+const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields (cargo build-sbf)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
