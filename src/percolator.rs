@@ -5679,12 +5679,19 @@ pub mod oracle {
     /// Check that the Hyperp oracle price is not stale.
     /// Returns `OracleStale` if the engine hasn't been cranked within
     /// `max_crank_staleness_slots` slots.
+    /// Returns `OracleInvalid` if stored engine slot is ahead of the clock sysvar
+    /// (inconsistent state): otherwise `saturating_sub` would yield zero age and
+    /// incorrectly treat the engine as freshly cranked.
     #[inline]
     pub fn check_hyperp_staleness(
         engine_current_slot: u64,
         max_crank_staleness_slots: u64,
         clock_slot: u64,
     ) -> Result<(), ProgramError> {
+        if engine_current_slot > clock_slot {
+            solana_program::msg!("Hyperp engine slot ahead of clock");
+            return Err(super::error::PercolatorError::OracleInvalid.into());
+        }
         if max_crank_staleness_slots > 0 && max_crank_staleness_slots != u64::MAX {
             let age = clock_slot.saturating_sub(engine_current_slot);
             if age > max_crank_staleness_slots {
@@ -9212,6 +9219,20 @@ pub mod processor {
         fn staleness_fresh_crank_always_ok() {
             // Engine just cranked (same slot)
             assert!(check_hyperp_staleness(500, 100, 500).is_ok());
+        }
+
+        #[test]
+        fn staleness_rejects_engine_slot_ahead_of_clock() {
+            // Without an explicit guard, age = clock.saturating_sub(engine) would be 0
+            // and bypass staleness even when engine state is inconsistent.
+            let result = check_hyperp_staleness(200, 100, 150);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn engine_ahead_of_clock_rejected_even_when_staleness_disabled() {
+            assert!(check_hyperp_staleness(500, 0, 400).is_err());
+            assert!(check_hyperp_staleness(500, u64::MAX, 400).is_err());
         }
     }
 
