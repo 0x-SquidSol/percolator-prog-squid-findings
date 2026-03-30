@@ -5232,7 +5232,17 @@ pub mod oracle {
                 return Err(ProgramError::InvalidAccountData);
             }
             // Raydium CLMM pool has a liquidity field (u128) at offset 237
-            // This represents the active in-range liquidity
+            // and sqrt_price_x64 (Q64.64 fixed-point) at offset 253.
+            //
+            // The raw L value is NOT denominated in tokens — it's the geometric mean
+            // of virtual reserves (L = sqrt(x * y)). To compare against
+            // MIN_DEX_QUOTE_LIQUIDITY (which is calibrated for PumpSwap's actual USDC
+            // vault balance), we convert L to virtual quote reserves:
+            //
+            //   virtual_quote = L * sqrt_price_x64 / 2^64
+            //
+            // This gives the quote-side depth in the same units as PumpSwap/Meteora
+            // (actual token lamports), making the threshold comparison apples-to-apples.
             const RAYDIUM_CLMM_OFF_LIQUIDITY: usize = 237;
             let liquidity = if data.len() >= RAYDIUM_CLMM_OFF_LIQUIDITY + 16 {
                 let liq = u128::from_le_bytes(
@@ -5240,9 +5250,15 @@ pub mod oracle {
                         .try_into()
                         .unwrap(),
                 );
-                // Convert to u64 by taking sqrt (liquidity in CLMM is L^2-like)
-                // Use a rough approximation: if liq > u64::MAX, saturate
-                core::cmp::min(liq, u64::MAX as u128) as u64
+                // Read sqrt_price_x64 (Q64.64) to convert L → virtual quote reserves
+                let sqrt_price_x64 = u128::from_le_bytes(
+                    data[RAYDIUM_CLMM_OFF_SQRT_PRICE_X64..RAYDIUM_CLMM_OFF_SQRT_PRICE_X64 + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                // virtual_quote = L * sqrt_price / 2^64 (right-shift by 64 for Q64.64)
+                let virtual_quote = (liq.checked_mul(sqrt_price_x64).unwrap_or(u128::MAX)) >> 64;
+                core::cmp::min(virtual_quote, u64::MAX as u128) as u64
             } else {
                 0
             };
