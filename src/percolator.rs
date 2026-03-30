@@ -653,7 +653,12 @@ pub mod verify {
         is_writable
     }
 
-    /// Account count requirement: must have at least `need` accounts.
+    /// Account count requirement: must have **at least** `need` accounts.
+    ///
+    /// Many instructions intentionally allow **trailing** accounts (e.g. backup
+    /// oracle accounts, CMOR attestation PDAs). Call sites that require a **fixed**
+    /// layout must additionally validate `accounts.len()` exactly or bound the tail
+    /// slice — do not assume `expect_len(n)` implies `accounts.len() == n`.
     #[inline]
     pub fn len_ok(actual: usize, need: usize) -> bool {
         actual >= need
@@ -3401,6 +3406,12 @@ pub mod accounts {
     use crate::error::PercolatorError;
     use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 
+    /// Require at least `n` accounts. Extra trailing accounts are allowed.
+    ///
+    /// This matches Solana’s common pattern for forward-compatible and variable-tail
+    /// account lists. It does **not** reject unexpected extras — handlers must not
+    /// rely on account-list length alone for security when extras could change CPI
+    /// slicing semantics.
     pub fn expect_len(accounts: &[AccountInfo], n: usize) -> Result<(), ProgramError> {
         // Length check via verify helper (Kani-provable)
         if !crate::verify::len_ok(accounts.len(), n) {
