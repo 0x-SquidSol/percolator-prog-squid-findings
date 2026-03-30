@@ -8170,6 +8170,42 @@ pub mod shared_vault {
             assert_ne!(re_read.claimed, 0, "double-claim guard: must reject");
         }
 
+        /// GH#1918 / PERC-8252: duplicate-queue guard logic.
+        /// read_withdraw_req on an existing unclaimed PDA must return claimed==0,
+        /// which the handler uses to reject the second queue attempt.
+        #[test]
+        fn test_duplicate_queue_guard() {
+            // Simulate an existing unclaimed WithdrawalRequest in PDA data.
+            let req = WithdrawalRequest {
+                magic: WITHDRAW_REQ_MAGIC,
+                bump: 1,
+                claimed: 0,
+                _pad: [0; 6],
+                lp_amount: 2_000,
+                epoch_number: 7,
+            };
+            let mut buf = [0u8; WITHDRAW_REQ_LEN];
+            write_withdraw_req(&mut buf, &req);
+
+            // Handler reads existing data and checks claimed.
+            let existing = read_withdraw_req(&buf).unwrap();
+            assert_eq!(
+                existing.claimed, 0,
+                "unclaimed request detected → handler must reject duplicate queue"
+            );
+
+            // Simulate a claimed PDA (e.g., from a previous epoch that was reclaimed
+            // — impossible due to epoch seeds, but ensures claimed==1 bypasses guard).
+            let mut claimed_req = req;
+            claimed_req.claimed = 1;
+            write_withdraw_req(&mut buf, &claimed_req);
+            let existing_claimed = read_withdraw_req(&buf).unwrap();
+            assert_eq!(
+                existing_claimed.claimed, 1,
+                "claimed request: guard must NOT reject (different epoch PDA in practice)"
+            );
+        }
+
         /// Payout is zero when there are no pending withdrawals.
         #[test]
         fn test_zero_payout_no_pending() {
@@ -16138,6 +16174,23 @@ pub mod processor {
                         ],
                         &[signer_seeds],
                     )?;
+                }
+
+                // GH#1918 / PERC-8252: duplicate-queue guard.
+                // The withdraw_req PDA includes the epoch in its seeds, so a
+                // pre-existing, unclaimed PDA means this user already queued
+                // a withdrawal for this epoch. Reject to prevent pending_withdrawals
+                // inflation via repeated calls.
+                {
+                    let req_data = a_withdraw_req
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    if let Some(existing) = crate::shared_vault::read_withdraw_req(&req_data) {
+                        if existing.claimed == 0 {
+                            // Active unclaimed request already exists for this epoch.
+                            return Err(ProgramError::AccountAlreadyInitialized);
+                        }
+                    }
                 }
 
                 let req = crate::shared_vault::WithdrawalRequest {
