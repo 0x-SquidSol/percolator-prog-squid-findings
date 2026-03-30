@@ -1299,10 +1299,30 @@ fn kani_tradecpi_any_accept_increments_nonce() {
 }
 
 // =============================================================================
-// Q. ACCOUNT VALIDATION HELPERS (2 proofs)
+// Q. ACCOUNT VALIDATION HELPERS (3 proofs)
 // =============================================================================
-// Note: signer_ok and writable_ok are identity functions (return input unchanged).
-// Testing them would be trivial (proving true==true). Only len_ok has real logic.
+
+/// Prove: signer_ok is identity on signer bit.
+#[kani::proof]
+fn kani_signer_ok_identity() {
+    let is_signer: bool = kani::any();
+    assert_eq!(
+        signer_ok(is_signer),
+        is_signer,
+        "signer_ok must return input unchanged"
+    );
+}
+
+/// Prove: writable_ok is identity on writable bit.
+#[kani::proof]
+fn kani_writable_ok_identity() {
+    let is_writable: bool = kani::any();
+    assert_eq!(
+        writable_ok(is_writable),
+        is_writable,
+        "writable_ok must return input unchanged"
+    );
+}
 
 /// Prove: len_ok requires actual >= need (universal)
 #[kani::proof]
