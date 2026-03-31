@@ -4586,6 +4586,10 @@ fn test_attack_circuit_breaker_clamping_second_price() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Set a non-zero oracle price cap so circuit breaker is active
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap(); // 1% per slot
+
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 10_000_000_000);
@@ -4600,22 +4604,36 @@ fn test_attack_circuit_breaker_clamping_second_price() {
     env.trade(&user, &lp, lp_idx, user_idx, 100);
     env.crank();
 
-    // Now set extreme price (10x increase)
-    env.set_slot_and_price(20, 1_380_000_000); // 10x normal price
+    // Read the baseline price before the extreme jump
+    let baseline = env.read_last_effective_price();
+    assert_eq!(baseline, 138_000_000, "Baseline should be $138");
 
-    // Crank with circuit breaker active - price should be clamped
+    // Now set extreme price (10x increase) — only 1 slot later
+    env.set_slot_and_price(20, 1_380_000_000); // 10x normal price
     env.crank();
 
-    // User should NOT have 10x profit due to clamping
+    // Verify the circuit breaker actually clamped: the stored price should
+    // NOT be 1.38B. With 1% cap and 1 slot, max move = 138M * 1% = 1.38M.
+    let clamped_price = env.read_last_effective_price();
+    assert!(
+        clamped_price < 200_000_000,
+        "Circuit breaker must clamp 10x price jump: got {} (expected near {})",
+        clamped_price, 138_000_000 + 1_380_000
+    );
+    assert!(
+        clamped_price > baseline,
+        "Price should have moved up (clamped): baseline={} clamped={}",
+        baseline, clamped_price
+    );
+
+    // Conservation: total capital should not exceed total deposits
+    // (init_lp=100 + deposit=10B + init_user=100 + deposit=10B = 20_000_000_200)
     let user_cap = env.read_account_capital(user_idx);
     let lp_cap = env.read_account_capital(lp_idx);
-
-    // Total capital should be conserved (within fee tolerance)
     assert!(
-        user_cap + lp_cap <= 20_000_000_000,
+        user_cap + lp_cap <= 20_000_000_200,
         "ATTACK: Circuit breaker failed - capital increased! user={} lp={}",
-        user_cap,
-        lp_cap
+        user_cap, lp_cap
     );
 }
 
@@ -8211,11 +8229,22 @@ fn test_attack_push_oracle_stale_timestamp() {
         result
     );
 
-    // Push with earlier timestamp=1000 (stale) must be rejected.
+    // Read the price after the 3000-timestamp push
+    let price_after_good_push = env.read_authority_price();
+
+    // Push with earlier timestamp=1000 (stale) must be rejected
     let stale_result = env.try_push_oracle_price(&admin, 2_000_000, 1000);
     assert!(
         stale_result.is_err(),
         "SECURITY: stale authority timestamp rollback must be rejected"
+    );
+
+    // State must be completely preserved after rejected stale push
+    let price_after_stale = env.read_authority_price();
+    assert_eq!(
+        price_after_good_push, price_after_stale,
+        "Stale push must not mutate authority_price: before={} after={}",
+        price_after_good_push, price_after_stale
     );
 }
 

@@ -1231,6 +1231,20 @@ impl TestEnv {
         u16::from_le_bytes(bytes)
     }
 
+    /// Read authority_price_e6 from config (mark price for Hyperp, settlement for non-Hyperp)
+    pub fn read_authority_price(&self) -> u64 {
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        const OFF: usize = 72 + 288; // CONFIG_OFF(72) + authority_price_e6 offset
+        u64::from_le_bytes(d[OFF..OFF + 8].try_into().unwrap())
+    }
+
+    /// Read last_effective_price_e6 from config (index for Hyperp, baseline for non-Hyperp)
+    pub fn read_last_effective_price(&self) -> u64 {
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        const OFF: usize = 72 + 312; // CONFIG_OFF(72) + last_effective_price_e6 offset
+        u64::from_le_bytes(d[OFF..OFF + 8].try_into().unwrap())
+    }
+
     /// Check if a slot is marked as used in the bitmap
     pub fn is_slot_used(&self, idx: u16) -> bool {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
