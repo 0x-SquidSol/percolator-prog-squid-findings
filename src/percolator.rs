@@ -4341,10 +4341,18 @@ pub mod processor {
                 }
                 let amt_units = if resolved {
                     let frozen_slot = config.resolution_slot;
-                    // Best-effort touch — but abort on CorruptState
-                    engine.touch_account_full(
+                    // Best-effort touch — abort on CorruptState only.
+                    // Same-epoch accounts legitimately fail here; the
+                    // settle_and_close_resolved fallback handles them.
+                    match engine.touch_account_full(
                         user_idx as usize, price, frozen_slot,
-                    ).map_err(map_risk_error)?;
+                    ) {
+                        Ok(()) => {}
+                        Err(percolator::RiskError::CorruptState) => {
+                            return Err(map_risk_error(percolator::RiskError::CorruptState));
+                        }
+                        Err(_) => {}
+                    }
                     let funding_rate = compute_current_funding_rate(&config);
                     engine.close_account(user_idx, frozen_slot, price, funding_rate)
                         .or_else(|e| match e {
@@ -5379,10 +5387,16 @@ pub mod processor {
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
                 // Best-effort touch to settle K-pair PnL at settlement price.
-                // Touch must succeed before close — all errors are fatal.
+                // Abort on CorruptState only — same-epoch accounts legitimately
+                // fail here; settle_and_close_resolved fallback handles them.
                 let frozen_slot = config.resolution_slot;
-                engine.touch_account_full(user_idx as usize, price, frozen_slot)
-                    .map_err(map_risk_error)?;
+                match engine.touch_account_full(user_idx as usize, price, frozen_slot) {
+                    Ok(()) => {}
+                    Err(percolator::RiskError::CorruptState) => {
+                        return Err(map_risk_error(percolator::RiskError::CorruptState));
+                    }
+                    Err(_) => {}
+                }
 
                 // Try canonical close first (handles stale-epoch accounts
                 // where touch_account_full already zeroed the position).
