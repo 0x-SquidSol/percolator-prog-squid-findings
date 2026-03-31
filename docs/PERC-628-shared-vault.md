@@ -110,6 +110,50 @@ pub const DEFAULT_MAX_MARKET_EXPOSURE_BPS: u16 = 2_000; // 20%
 5. Pending withdrawals never exceed total capital
 6. Available for allocation = total - allocated (no underflow)
 
+## Instruction Authorization Table
+
+> **Authoritative reference for auditors and integrators.**
+> The sole guard on AdvanceEpoch is `is_epoch_elapsed()` returning true — there is
+> **no signer requirement**. This was an audit finding (GH#1913 / PERC-8314) and is
+> intentional: epoch advancement is a permissionless keeper crank, consistent with
+> `TAG_ADVANCE_EPOCH` in `tags.rs` and the CRANK_NO_CALLER pattern used elsewhere.
+
+| Instruction          | Signer Required? | Auth Check                        | Notes                                                |
+|----------------------|------------------|-----------------------------------|------------------------------------------------------|
+| InitSharedVault      | ✅ admin          | `admin_ok()`                      | One-time initialisation; deploy-time first-caller guard (see GH#1915) |
+| AllocateMarket       | ✅ admin          | `admin_ok()`                      | Admin-gated market registration                      |
+| QueueWithdrawalSV    | ✅ user           | `owner_ok()`                      | User requests epoch withdrawal                       |
+| ClaimEpochWithdrawal | ✅ user           | `owner_ok()` + `claimed == 0`    | Kani-proven: no double-claim (C11-A), conservation (C11-B) |
+| AdvanceEpoch         | ❌ none           | `is_epoch_elapsed()` only         | **Permissionless crank** — any fee-payer may call once epoch has elapsed |
+
+## Deployment Procedure — InitSharedVault (PERC-8292 / GH#1915)
+
+> **Security note for deployers.** `InitSharedVault` requires a signer but does not
+> verify the signer against any stored admin key — it is a **first-caller-wins**
+> singleton init. The `AccountAlreadyInitialized` guard prevents double-init, so
+> once the PDA is created the design is safe. The race window only exists during
+> deployment.
+
+**Required deployment sequence (atomic or guarded):**
+
+1. Deploy the program binary (`solana program deploy`).
+2. In the **same transaction** (or immediately in the next block), submit `InitSharedVault`
+   signed by the intended admin keypair.
+3. Immediately submit `AllocateMarket` for each whitelisted market — this call *does*
+   verify `require_admin(header.admin, signer)` against the per-market slab, which
+   provides admin-gating for all subsequent market-level operations.
+
+**Why no upgrade-authority check?**  
+`SharedVaultState` has no stored admin field (adding one would be a breaking layout change
+mid-audit). The upgrade authority lives in the `BpfUpgradeableLoader` programdata account,
+which would require an extra account in the instruction and version-gated CPI. The
+deploy-time first-caller pattern is simpler, equally secure when the deployment sequence
+is followed, and is consistent with the PDA-guard pattern used throughout the program.
+
+**Mitigation for production:**  
+Use a multisig or governance program as the signer for `InitSharedVault`. Once init is
+confirmed on-chain, further admin ops are protected by per-market `require_admin` checks.
+
 ## Implementation Plan
 1. Pure logic module + design doc + tests + Kani proofs
 2. SharedVaultState + MarketAllocation + WithdrawalRequest PDAs

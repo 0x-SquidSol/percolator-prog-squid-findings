@@ -16197,6 +16197,14 @@ pub mod processor {
             }
 
             // PERC-628: InitSharedVault — admin creates the global shared vault PDA.
+            //
+            // PERC-8292 / GH#1915: First-caller-wins singleton init (intentional by design).
+            // The signer is required but is NOT checked against a stored admin key because
+            // SharedVaultState has no admin field (adding one would be a breaking layout change).
+            // Security: the `AccountAlreadyInitialized` guard on `a_shared_vault.data_is_empty()`
+            // prevents double-init, so the race window only exists during deployment.
+            // Mitigation: submit InitSharedVault in the same transaction as program deployment,
+            // or use a multisig signer. See docs/PERC-628-shared-vault.md §Deployment Procedure.
             Instruction::InitSharedVault {
                 epoch_duration_slots,
                 max_market_exposure_bps,
@@ -16405,11 +16413,15 @@ pub mod processor {
 
             // PERC-628: AdvanceEpoch — permissionless crank to advance the epoch.
             //
-            // PERC-8249: No signer required — this is a permissionless crank.
-            // Any caller can advance the epoch once is_epoch_elapsed() returns true.
-            // The epoch-elapsed check is the sole guard against premature execution.
+            // PERC-8249 / PERC-8314: No signer required — this is an intentional
+            // permissionless crank. Any fee-payer can advance the epoch once
+            // is_epoch_elapsed() returns true. The elapsed-time guard is the sole
+            // protection against premature execution; no authority check is needed
+            // because AdvanceEpoch only snapshots capital/advances the epoch counter
+            // and does not move funds. See docs/PERC-628-shared-vault.md §Instruction
+            // Authorization Table and GH#1913 for the full audit rationale.
             Instruction::AdvanceEpoch => {
-                // accounts: [0] caller (fee payer, NOT required to be a signer),
+                // accounts: [0] caller (fee payer — NOT required to be a signer),
                 //           [1] shared_vault PDA (writable)
                 accounts::expect_len(accounts, 2)?;
                 let a_shared_vault = &accounts[1];
