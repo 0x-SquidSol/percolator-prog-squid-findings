@@ -4124,18 +4124,35 @@ pub mod processor {
 
                 // User-side slippage protection.
                 // Normalize limit to engine-space (same invert+scale as exec_price).
+                // For inverted markets, inversion is order-reversing: a "better"
+                // raw buy price maps to a larger engine price, so inequalities flip.
                 if limit_price_e6 != 0 && ret.exec_size != 0 {
                     let limit_eng = crate::verify::to_engine_price(
                         limit_price_e6, config.invert, config.unit_scale,
                     ).ok_or(PercolatorError::OracleInvalid)?;
+                    let inverted = config.invert != 0;
                     if size > 0 {
-                        // User is buying — reject if exec price too high
-                        if ret.exec_price_e6 > limit_eng {
+                        // Buying: raw user wants exec <= limit (pay no more)
+                        // Normal:   exec_eng > limit_eng → reject
+                        // Inverted: exec_eng < limit_eng → reject (order flipped)
+                        let bad = if inverted {
+                            ret.exec_price_e6 < limit_eng
+                        } else {
+                            ret.exec_price_e6 > limit_eng
+                        };
+                        if bad {
                             return Err(ProgramError::InvalidAccountData);
                         }
                     } else {
-                        // User is selling — reject if exec price too low
-                        if ret.exec_price_e6 < limit_eng {
+                        // Selling: raw user wants exec >= limit (receive no less)
+                        // Normal:   exec_eng < limit_eng → reject
+                        // Inverted: exec_eng > limit_eng → reject (order flipped)
+                        let bad = if inverted {
+                            ret.exec_price_e6 > limit_eng
+                        } else {
+                            ret.exec_price_e6 < limit_eng
+                        };
+                        if bad {
                             return Err(ProgramError::InvalidAccountData);
                         }
                     }
@@ -4878,6 +4895,12 @@ pub mod processor {
                 }
 
                 config.oracle_price_cap_e2bps = max_change_e2bps;
+                // Stamp post-change funding rate for next interval
+                if is_hyperp {
+                    let new_rate = compute_current_funding_rate(&config);
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_bps_per_slot_last = new_rate;
+                }
                 state::write_config(&mut data, &config);
             }
 
