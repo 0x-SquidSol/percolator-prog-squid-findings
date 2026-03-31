@@ -13071,3 +13071,78 @@ fn test_attack_deposit_to_lp_wrong_owner() {
     );
 }
 
+/// ATTACK: i128::MIN trade size overflows -size_q (unary negation).
+///
+/// In BPF release builds (overflow checks off), -i128::MIN wraps to i128::MIN,
+/// passing a negative "absolute size" to the engine. Must be rejected.
+#[test]
+fn test_attack_trade_size_i128_min_overflow() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    let vault_before = env.vault_balance();
+    let user_pos_before = env.read_account_position(user_idx);
+    let lp_pos_before = env.read_account_position(lp_idx);
+
+    // Trade with i128::MIN — must be rejected, not overflow
+    let result = env.try_trade(&user, &lp, lp_idx, user_idx, i128::MIN);
+    assert!(
+        result.is_err(),
+        "Trade with i128::MIN must be rejected (overflow in negation)"
+    );
+
+    // State must be completely preserved
+    assert_eq!(env.vault_balance(), vault_before, "Vault must be unchanged");
+    assert_eq!(env.read_account_position(user_idx), user_pos_before, "User pos unchanged");
+    assert_eq!(env.read_account_position(lp_idx), lp_pos_before, "LP pos unchanged");
+}
+
+/// Spec §10.5: TradeNoCpi is a bilateral primitive — any two accounts
+/// can trade (user-user, user-LP, LP-LP). Account kind is not enforced.
+/// This is by design: both parties must sign, so bilateral consent is sufficient.
+#[test]
+fn test_trade_nocpi_user_bilateral_allowed_by_spec() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user1 = Keypair::new();
+    let user1_idx = env.init_user(&user1);
+    env.deposit(&user1, user1_idx, 5_000_000_000);
+
+    let user2 = Keypair::new();
+    let user2_idx = env.init_user(&user2);
+    env.deposit(&user2, user2_idx, 5_000_000_000);
+
+    // user1 trades with user2 (bilateral, both sign) — spec allows this
+    let result = env.try_trade(&user1, &user2, user2_idx, user1_idx, 1_000_000);
+    assert!(
+        result.is_ok(),
+        "Spec §10.5: bilateral user-user trade should succeed: {:?}",
+        result,
+    );
+
+    // Positions must be set (bilateral trade created positions)
+    assert_ne!(env.read_account_position(user1_idx), 0, "user1 should have position");
+    assert_ne!(env.read_account_position(user2_idx), 0, "user2 should have opposite position");
+
+    // Conservation: vault unchanged (no token flow in trade)
+    let vault = env.vault_balance();
+    assert!(vault > 0, "Vault must still hold deposits");
+}
+

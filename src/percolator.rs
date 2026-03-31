@@ -2854,7 +2854,9 @@ pub mod processor {
         let (a, b, abs_size) = if size_q > 0 {
             (user_idx, lp_idx, size_q)
         } else if size_q < 0 {
-            (lp_idx, user_idx, -size_q)
+            // checked_neg rejects i128::MIN (which has no positive counterpart)
+            let pos = size_q.checked_neg().ok_or(RiskError::Overflow)?;
+            (lp_idx, user_idx, pos)
         } else {
             return Err(RiskError::Overflow);
         };
