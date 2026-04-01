@@ -2318,10 +2318,10 @@ pub mod oracle {
 
         // Return the authority price if fresh, otherwise the external price
         if let Some(auth_price) = read_authority_price(config, now_unix_ts, config.max_staleness_secs) {
-            // When circuit breaker is configured, require the external oracle
-            // to have succeeded. Otherwise the caller can bypass the fresh
-            // external anchor by supplying a bad oracle account.
-            if config.min_oracle_price_cap_e2bps != 0 && external.is_err() {
+            // When the live circuit breaker is active, require the external
+            // oracle to have succeeded. Uses the active cap (not the immutable
+            // floor) so zero-floor markets with a live breaker are also protected.
+            if config.oracle_price_cap_e2bps != 0 && external.is_err() {
                 return external; // propagate the external oracle error
             }
             // Authority price is clamped against the (now-updated) external baseline
@@ -2386,9 +2386,10 @@ pub mod oracle {
 
     /// Get engine oracle price (unified: external oracle vs Hyperp mode).
     /// In Hyperp mode: updates index toward mark with rate limiting.
+    ///   Mark staleness enforced via last_mark_push_slot.
     /// In external mode: reads from Pyth/Chainlink/authority with circuit breaker.
     pub fn get_engine_oracle_price_e6(
-        engine_last_slot: u64,
+        _engine_last_slot: u64,
         now_slot: u64,
         now_unix_ts: i64,
         config: &mut super::state::MarketConfig,
@@ -2400,12 +2401,8 @@ pub mod oracle {
             if mark == 0 {
                 return Err(super::error::PercolatorError::OracleInvalid.into());
             }
-            // Hyperp stale-crank check: reject if engine.current_slot is too
-            // far behind now_slot. Prevents trades/withdrawals from using a
-            // stale smoothed index after a long crank gap.
-            // Use max_staleness_secs * 3 as slot proxy (1 sec ≈ 2.5 slots).
-            // Stale mark check: use last_mark_push_slot (dedicated field),
-            // not engine.current_slot (which advances on user activity).
+            // Hyperp stale mark check: use last_mark_push_slot (dedicated field).
+            // Rejects if the authority hasn't pushed a mark price recently.
             let last_push = config.last_mark_push_slot as u64;
             if last_push > 0 {
                 let max_stale_slots = if config.max_staleness_secs > u64::MAX / 3 {
