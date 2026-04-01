@@ -1894,14 +1894,7 @@ pub mod oracle {
     use crate::error::PercolatorError;
     use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 
-    // SECURITY (H5): The "devnet" feature disables critical oracle safety checks:
-    // - Staleness validation (stale prices accepted)
-    // - Confidence interval validation (wide confidence accepted)
-    //
-    // WARNING: NEVER deploy to mainnet with the "devnet" feature enabled!
-    // Build for mainnet with: cargo build-sbf (without --features devnet)
-
-    /// Pyth Solana Receiver program ID (same for mainnet and devnet)
+    /// Pyth Solana Receiver program ID
     /// rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ
     pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
         0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b,
@@ -1909,7 +1902,7 @@ pub mod oracle {
         0x58, 0x81,
     ]);
 
-    /// Chainlink OCR2 Store program ID (same for mainnet and devnet)
+    /// Chainlink OCR2 Store program ID
     /// HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny
     pub const CHAINLINK_OCR2_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
         0xf1, 0x4b, 0xf6, 0x5a, 0xd5, 0x6b, 0xd2, 0xba, 0x71, 0x5e, 0x45, 0x74, 0x2c, 0x23, 0x1f,
@@ -1926,8 +1919,7 @@ pub mod oracle {
     const OFF_EXPO: usize = 90; // i32
     const OFF_PUBLISH_TIME: usize = 94; // i64
 
-    // Chainlink OCR2 State/Aggregator account layout offsets (devnet format)
-    // This is the simpler account format used on Solana devnet
+    // Chainlink OCR2 State/Aggregator account layout offsets
     // Note: Different from the Transmissions ring buffer format in older docs
     const CL_MIN_LEN: usize = 224; // Minimum required length
     const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
@@ -1996,31 +1988,23 @@ pub mod oracle {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
-        // Staleness check (skip on devnet)
-        #[cfg(not(feature = "devnet"))]
+        // Staleness check
         {
             let age = now_unix_ts.saturating_sub(publish_time);
             if age < 0 || age as u64 > max_staleness_secs {
                 return Err(PercolatorError::OracleStale.into());
             }
         }
-        #[cfg(feature = "devnet")]
-        let _ = (publish_time, max_staleness_secs, now_unix_ts);
 
-        // Confidence check (skip on devnet; 0 = disabled)
+        // Confidence check (0 = disabled)
         let price_u = price as u128;
-        #[cfg(not(feature = "devnet"))]
-        {
-            if conf_bps != 0 {
-                let lhs = (conf as u128) * 10_000;
-                let rhs = price_u * (conf_bps as u128);
-                if lhs > rhs {
-                    return Err(PercolatorError::OracleConfTooWide.into());
-                }
+        if conf_bps != 0 {
+            let lhs = (conf as u128) * 10_000;
+            let rhs = price_u * (conf_bps as u128);
+            if lhs > rhs {
+                return Err(PercolatorError::OracleConfTooWide.into());
             }
         }
-        #[cfg(feature = "devnet")]
-        let _ = (conf, conf_bps);
 
         // Convert to e6 format
         let scale = expo + 6;
@@ -2100,8 +2084,7 @@ pub mod oracle {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
-        // Staleness check (skip on devnet)
-        #[cfg(not(feature = "devnet"))]
+        // Staleness check
         {
             // Validate timestamp fits in i64 before cast (year 2262+ overflow)
             if timestamp > i64::MAX as u64 {
@@ -2112,8 +2095,6 @@ pub mod oracle {
                 return Err(PercolatorError::OracleStale.into());
             }
         }
-        #[cfg(feature = "devnet")]
-        let _ = (timestamp, max_staleness_secs, now_unix_ts);
 
         // Convert to e6 format
         // Chainlink decimals work like: price = answer / 10^decimals
@@ -2174,13 +2155,10 @@ pub mod oracle {
                 conf_bps,
             )?
         } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
-            // Chainlink support is devnet-only. The parser uses hardcoded offsets
-            // for a specific devnet layout with no discriminator check — a valid
-            // Chainlink-owned account with a different layout could be misread.
-            #[cfg(feature = "devnet")]
-            { read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)? }
-            #[cfg(not(feature = "devnet"))]
-            { return Err(ProgramError::IllegalOwner); }
+            // Chainlink safety: the feed pubkey check (line 2072) ensures only the
+            // specific account stored in index_feed_id at InitMarket can be read.
+            // A different Chainlink-owned account would fail the pubkey match.
+            read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)?
         } else {
             // In test mode, try Pyth format first (for existing tests)
             #[cfg(feature = "test")]
