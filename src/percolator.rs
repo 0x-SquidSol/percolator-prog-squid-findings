@@ -4022,6 +4022,20 @@ pub mod processor {
                     engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
                     funding_rate,
                 ).map_err(map_risk_error)?;
+
+                // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
+                // Same pattern as TradeCpi — all fills contribute to EWMA.
+                config.mark_ewma_e6 = crate::verify::ewma_update(
+                    config.mark_ewma_e6, price,
+                    config.mark_ewma_halflife_slots,
+                    config.mark_ewma_last_slot, clock.slot,
+                );
+                config.mark_ewma_last_slot = clock.slot;
+                engine.funding_rate_bps_per_slot_last =
+                    compute_current_funding_rate(&config);
+
+                // Write updated config (mark_ewma changed)
+                state::write_config(&mut data, &config);
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
@@ -4798,9 +4812,14 @@ pub mod processor {
 
                 // Update oracle authority in config
                 let mut config = state::read_config(&data);
-                // Hyperp: reject zero-address — it would permanently freeze
-                // price discovery (no authority can push, no external oracle).
-                if oracle::is_hyperp_mode(&config) && new_authority == Pubkey::default() {
+                // Hyperp: reject zero-address unless trade flow has bootstrapped
+                // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
+                // there's no mark price source. With EWMA bootstrapped, the market
+                // can run admin-free on trade-derived mark.
+                if oracle::is_hyperp_mode(&config)
+                    && new_authority == Pubkey::default()
+                    && config.mark_ewma_e6 == 0
+                {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 config.oracle_authority = new_authority.to_bytes();
@@ -4926,9 +4945,14 @@ pub mod processor {
                     let push_clock = Clock::get()
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     config.last_mark_push_slot = push_clock.slot as u128;
-                    // Admin push directly sets mark_ewma (no EWMA blending).
-                    // Trades use EWMA blending; admin pushes are authoritative.
-                    config.mark_ewma_e6 = clamped;
+                    // Admin push feeds through EWMA like trades do.
+                    // Direct overwrite was removed — it would let a single push
+                    // reset the trade-derived EWMA, defeating smoothing.
+                    config.mark_ewma_e6 = crate::verify::ewma_update(
+                        config.mark_ewma_e6, clamped,
+                        config.mark_ewma_halflife_slots,
+                        config.mark_ewma_last_slot, push_clock.slot,
+                    );
                     config.mark_ewma_last_slot = push_clock.slot;
                 } else {
                     config.authority_timestamp = timestamp;
