@@ -34,7 +34,7 @@ fn test_resolved_market_blocks_new_activity() {
     // Resolve market
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "ResolveMarket should succeed");
-    println!("Market resolved");
+    assert!(env.is_market_resolved(), "Market must be resolved after ResolveMarket");
 
     // Try to create new user - should fail
     let new_user = Keypair::new();

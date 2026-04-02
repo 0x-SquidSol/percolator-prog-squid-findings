@@ -47,9 +47,15 @@ fn test_critical_update_admin_authorization() {
     // Old admin tries again - should now fail
     let result = env.try_update_admin(&admin, &admin.pubkey());
     assert!(result.is_err(), "Old admin should no longer have authority");
-    println!("UpdateAdmin by old admin: REJECTED (correct)");
 
-    println!("CRITICAL TEST PASSED: UpdateAdmin authorization enforced");
+    // New admin can exercise authority (proves transfer actually happened)
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    let result = env.try_update_admin(&new_admin, &new_admin.pubkey());
+    assert!(
+        result.is_ok(),
+        "New admin should be able to exercise authority: {:?}",
+        result
+    );
 }
 
 /// CRITICAL: UpdateConfig admin-only with all parameters
@@ -72,12 +78,21 @@ fn test_critical_update_config_authorization() {
     );
     println!("UpdateConfig by non-admin: REJECTED (correct)");
 
-    // Admin updates config - should succeed
+    // Capture config before admin update
+    let config_before = env.read_update_config_snapshot();
+
+    // Admin updates config - should succeed AND change state
     let result = env.try_update_config(&admin);
     assert!(result.is_ok(), "Admin should update config: {:?}", result);
-    println!("UpdateConfig by admin: ACCEPTED (correct)");
 
-    println!("CRITICAL TEST PASSED: UpdateConfig authorization enforced");
+    // Verify config actually changed (not just is_ok)
+    let config_after = env.read_update_config_snapshot();
+    // try_update_config uses different params than default, so snapshot should differ
+    // (if the helper sends the same defaults, this proves nothing — check helper)
+    assert_ne!(
+        config_before, config_after,
+        "Config must actually change after successful UpdateConfig"
+    );
 }
 
 /// CRITICAL: CloseSlab only by admin, requires zero vault/insurance
