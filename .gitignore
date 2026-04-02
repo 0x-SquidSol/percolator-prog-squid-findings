@@ -6,3 +6,4 @@
 # Security research (gitignored)
 /research/
 /research/**
+.claude/worktrees/
