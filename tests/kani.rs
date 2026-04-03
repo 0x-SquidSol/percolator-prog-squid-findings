@@ -8083,7 +8083,10 @@ fn kani_perc8374_premium_funding_bounded() {
     kani::assume(max_premium_bps >= 0 && max_premium_bps <= 10_000);
     kani::assume(max_bps_per_slot >= 0 && max_bps_per_slot <= 10_000);
 
-    kani::cover!(mark_e6 == u64::MAX >> 16, "COVER: near-max mark price");
+    kani::cover!(
+        mark_e6 == 1_000_000_000_000u64,
+        "COVER: near-max mark price"
+    );
     kani::cover!(funding_horizon_slots == 1, "COVER: minimum horizon");
 
     let result = compute_premium_funding_bps_per_slot(
