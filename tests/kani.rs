@@ -8200,8 +8200,8 @@ fn kani_perc8374_combined_rate_bounded() {
 }
 
 /// Proof: compute_combined_funding_rate sign-correctness on positive/negative premium.
-/// When premium > inv and weight > 0, combined > inv (pulled toward premium).
-/// When premium < inv and weight > 0, combined < inv (pulled toward premium).
+/// When premium > inv and weight > 0, combined >= inv (pulled toward premium).
+/// When premium < inv and weight > 0, combined <= inv (pulled toward premium).
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(2)]
