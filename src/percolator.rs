@@ -9914,8 +9914,8 @@ pub mod processor {
 
         // PERC-8400: Account for seed deposit in engine.
         // InitMarket requires MIN_INIT_MARKET_SEED tokens in the vault, but
-        // init_in_place sets engine.insurance_fund = 0. Read the actual vault
-        // balance and record it so the engine tracks the seed capital.
+        // init_in_place sets engine.vault/insurance = 0. Read the actual vault
+        // balance and split 50/50 between insurance fund and LP vault capital.
         {
             let vault_data = a_vault.try_borrow_data()?;
             let seed_amount =
@@ -9925,10 +9925,17 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let (units, dust) =
                     crate::units::base_to_units(seed_amount, config.unit_scale);
+                let insurance_half = (units as u128) / 2;
+                let vault_half = (units as u128) - insurance_half; // rounds up
                 let engine = zc::engine_mut(&mut data)?;
+                // Insurance half: tracked in both vault + insurance_fund.balance
                 engine
-                    .top_up_insurance_fund(units as u128)
+                    .top_up_insurance_fund(insurance_half)
                     .map_err(crate::error::map_risk_error)?;
+                // LP vault half: tracked in vault only (available as LP capital)
+                engine.vault = percolator::U128::new(
+                    engine.vault.get().saturating_add(vault_half),
+                );
                 if dust > 0 {
                     state::write_dust_base(&mut data, dust);
                 }
