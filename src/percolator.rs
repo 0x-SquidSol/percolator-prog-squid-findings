@@ -11924,6 +11924,25 @@ pub mod processor {
                 if funding_premium_weight_bps > 0 && funding_premium_dampening_e6 == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                // Bound funding_k_bps — extreme values cause intermediate
+                // overflow in compute_inventory_funding_bps_per_slot.
+                if funding_k_bps > 100_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Bound threshold risk/step BPS to 100%.
+                if thresh_risk_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if thresh_step_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Bound per-slot funding caps to a sane maximum (100 bps/slot).
+                if funding_max_bps_per_slot.abs() > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if funding_max_premium_bps.abs() > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 // Read existing config and update
                 let mut config = state::read_config(&data);
