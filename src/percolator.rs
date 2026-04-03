@@ -5612,7 +5612,9 @@ pub mod oracle {
         if max_change_e2bps == 0 || last_price == 0 {
             return raw_price;
         }
-        let max_delta = ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000) as u64;
+        let max_delta =
+            ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000).min(u64::MAX as u128)
+                as u64;
         let lower = last_price.saturating_sub(max_delta);
         let upper = last_price.saturating_add(max_delta);
         raw_price.clamp(lower, upper)
