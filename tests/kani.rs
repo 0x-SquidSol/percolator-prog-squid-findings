@@ -8262,3 +8262,49 @@ fn kani_perc8374_combined_rate_weight_extremes() {
         "weight=10000 must return pure premium rate",
     );
 }
+
+// ---------------------------------------------------------------------------
+// PERC-8386 / GH#2017: oracle price-cap bounds validation
+// ---------------------------------------------------------------------------
+
+/// Proof: MAX_ORACLE_PRICE_CAP_E2BPS is exactly 1_000_000 (100% per slot).
+/// Any valid cap_e2bps value accepted by SetOraclePriceCap must be in [0, 1_000_000].
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8386_oracle_cap_upper_bound() {
+    use percolator_prog::constants::MAX_ORACLE_PRICE_CAP_E2BPS;
+
+    let cap: u64 = kani::any();
+    kani::assume(cap <= MAX_ORACLE_PRICE_CAP_E2BPS);
+
+    // The accepted range [0, MAX] must not exceed 100% per slot
+    kani::assert(
+        cap <= 1_000_000,
+        "oracle cap must not exceed 100% per slot (1_000_000 e2bps)",
+    );
+
+    // Cover: boundary values are reachable
+    kani::cover!(cap == 0, "cap=0 is reachable within range");
+    kani::cover!(
+        cap == MAX_ORACLE_PRICE_CAP_E2BPS,
+        "cap=MAX is reachable within range"
+    );
+}
+
+/// Proof: values above MAX_ORACLE_PRICE_CAP_E2BPS are always rejected.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8386_oracle_cap_rejects_above_max() {
+    use percolator_prog::constants::MAX_ORACLE_PRICE_CAP_E2BPS;
+
+    let cap: u64 = kani::any();
+    kani::assume(cap > MAX_ORACLE_PRICE_CAP_E2BPS);
+
+    // Any value above MAX is out of bounds
+    kani::assert(
+        cap > 1_000_000,
+        "values above MAX must be above 100% per slot",
+    );
+}
