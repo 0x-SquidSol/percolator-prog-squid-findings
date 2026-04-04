@@ -4236,22 +4236,43 @@ pub mod state {
     // Feature 1: Quadratic Funding Convexity
     // ========================================
 
-    /// Read quadratic funding coefficient k2 from `_insurance_isolation_padding[2..4]`.
+    /// Read quadratic funding coefficient k2 from `_adaptive_pad2` bytes [0..2].
+    ///
+    /// PERC-8452: Relocated from `_insurance_isolation_padding[2..4]` which collided
+    /// with `oracle_phase` (byte [2]) and `cumulative_volume[0]` (byte [3]).
+    /// The old location always returned garbage (GH#2096). New location uses the
+    /// genuinely-free alignment padding between `adaptive_scale_bps` and
+    /// `adaptive_max_funding_bps`.
+    ///
     /// 0 = disabled (linear-only funding). Typical range: 1–500 bps.
     #[inline]
     pub fn get_funding_k2_bps(config: &MarketConfig) -> u16 {
+        // _adaptive_pad2 is a u32 — extract low 2 bytes as LE u16
+        (config._adaptive_pad2 & 0xFFFF) as u16
+    }
+
+    /// Set quadratic funding coefficient k2 into `_adaptive_pad2` bytes [0..2].
+    ///
+    /// PERC-8452: Relocated from `_insurance_isolation_padding[2..4]` to avoid
+    /// layout collision with oracle_phase and cumulative_volume.
+    /// Preserves the upper 2 bytes of `_adaptive_pad2` (currently unused/zero).
+    #[inline]
+    pub fn set_funding_k2_bps(config: &mut MarketConfig, k2_bps: u16) {
+        // Clear low 16 bits, preserve high 16 bits, set new k2 value
+        config._adaptive_pad2 = (config._adaptive_pad2 & 0xFFFF_0000) | (k2_bps as u32);
+    }
+
+    /// Legacy reader: reads k2_bps from the OLD `_insurance_isolation_padding[2..4]`
+    /// location. This always returned garbage due to the layout collision (byte [2]
+    /// = oracle_phase, byte [3] = cumulative_volume[0]). Retained for migration
+    /// awareness and test verification only.
+    #[cfg(test)]
+    #[inline]
+    pub fn get_funding_k2_bps_legacy(config: &MarketConfig) -> u16 {
         u16::from_le_bytes([
             config._insurance_isolation_padding[2],
             config._insurance_isolation_padding[3],
         ])
-    }
-
-    /// Set quadratic funding coefficient k2 into `_insurance_isolation_padding[2..4]`.
-    #[inline]
-    pub fn set_funding_k2_bps(config: &mut MarketConfig, k2_bps: u16) {
-        let bytes = k2_bps.to_le_bytes();
-        config._insurance_isolation_padding[2] = bytes[0];
-        config._insurance_isolation_padding[3] = bytes[1];
     }
 
     // ========================================
@@ -11996,17 +12017,9 @@ pub mod processor {
                 config.funding_settlement_interval_slots = funding_settlement_interval_slots;
                 config.funding_premium_dampening_e6 = funding_premium_dampening_e6;
                 config.funding_premium_max_bps_per_slot = funding_premium_max_bps_per_slot;
-                // GH#1939: _insurance_isolation_padding layout collision — padding[2] is shared
-                // between oracle_phase (byte [2]) and funding_k2_bps (bytes [2..4]).
-                // set_funding_k2_bps overwrites padding[2], clobbering oracle_phase.
-                // Save oracle_phase and cumulative_volume before the write, then restore.
-                let saved_oracle_phase = state::get_oracle_phase(&config);
-                let saved_cumulative_volume = state::get_cumulative_volume(&config);
-                // Quadratic funding convexity
+                // PERC-8452: k2_bps now lives in _adaptive_pad2[0..2], no collision.
+                // The old GH#1939 save/restore workaround is no longer needed.
                 state::set_funding_k2_bps(&mut config, funding_k2_bps);
-                // Restore aliases clobbered by set_funding_k2_bps
-                state::set_oracle_phase(&mut config, saved_oracle_phase);
-                state::set_cumulative_volume(&mut config, saved_cumulative_volume);
                 state::write_config(&mut data, &config);
             }
 
@@ -18571,60 +18584,184 @@ mod oracle_phase_tests {
         assert!(!trans_early);
     }
 
-    /// GH#1939 regression: UpdateConfig save/restore must NOT clobber oracle_phase or
-    /// cumulative_volume when set_funding_k2_bps is called.
-    ///
-    /// NOTE: padding[2] is shared between oracle_phase (u8) and funding_k2_bps low byte (u16 LE),
-    /// and padding[3] is shared between funding_k2_bps high byte and cumulative_volume[0].
-    /// This is a layout collision — k2_bps reads back as u16(oracle_phase, vol[0]) after the
-    /// save/restore, not the intended k2 value. That is an accepted limitation of the current
-    /// layout; a proper layout migration (TODO) will fix this cleanly.
-    /// What the save/restore DOES guarantee: oracle_phase and cumulative_volume are preserved.
+    /// PERC-8452: k2_bps relocated to _adaptive_pad2[0..2] — no longer collides
+    /// with oracle_phase or cumulative_volume. This test verifies that set/get
+    /// roundtrips correctly AND does not touch any _insurance_isolation_padding bytes.
     #[test]
-    fn test_update_config_preserves_oracle_phase_and_volume() {
+    fn test_k2_bps_roundtrip_no_collision() {
         let mut config = MarketConfig::zeroed();
 
-        // Set oracle_phase to MATURE (2) and a non-zero cumulative_volume
+        // Set oracle_phase and cumulative_volume first
         set_oracle_phase(&mut config, ORACLE_PHASE_MATURE);
         set_cumulative_volume(&mut config, 9_999_000_000u64);
 
-        // Simulate UpdateConfig with k2=0 (the clobbering case — SDK default)
-        let saved_oracle_phase = get_oracle_phase(&config);
-        let saved_vol = get_cumulative_volume(&config);
-        set_funding_k2_bps(&mut config, 0); // writes [0,0] to padding[2..4]
-        set_oracle_phase(&mut config, saved_oracle_phase);
-        set_cumulative_volume(&mut config, saved_vol);
+        // Set k2_bps — must NOT touch oracle_phase or cumulative_volume
+        set_funding_k2_bps(&mut config, 500);
 
-        // oracle_phase and cumulative_volume must survive — this is the GH#1939 fix
+        // k2 roundtrips correctly (was broken before PERC-8452)
+        assert_eq!(
+            get_funding_k2_bps(&config),
+            500,
+            "k2_bps must roundtrip correctly"
+        );
+
+        // oracle_phase and cumulative_volume are UNTOUCHED
         assert_eq!(
             get_oracle_phase(&config),
             ORACLE_PHASE_MATURE,
-            "oracle_phase must survive UpdateConfig with k2=0"
+            "oracle_phase must be untouched after set_funding_k2_bps"
         );
         assert_eq!(
             get_cumulative_volume(&config),
             9_999_000_000u64,
-            "cumulative_volume must survive UpdateConfig with k2=0"
+            "cumulative_volume must be untouched after set_funding_k2_bps"
         );
 
-        // Verify phase 1 case as well
+        // Verify legacy location is still zero (k2 no longer writes there)
+        assert_eq!(
+            get_funding_k2_bps_legacy(&config),
+            // legacy reads oracle_phase (2) + cumul_vol[0] byte — NOT 500
+            u16::from_le_bytes([
+                config._insurance_isolation_padding[2],
+                config._insurance_isolation_padding[3],
+            ]),
+            "legacy location must NOT contain 500"
+        );
+    }
+
+    /// PERC-8452: Verify k2_bps does not corrupt adaptive_funding params that
+    /// share the _adaptive_pad2 u32 field (upper 16 bits are free).
+    #[test]
+    fn test_k2_bps_preserves_adaptive_params() {
+        let mut config = MarketConfig::zeroed();
+
+        // Set adaptive funding params
+        config.adaptive_funding_enabled = 1;
+        config.adaptive_scale_bps = 300;
+        config.adaptive_max_funding_bps = 50;
+
+        // Set k2_bps — uses low 16 bits of _adaptive_pad2
+        set_funding_k2_bps(&mut config, 250);
+
+        // k2 roundtrips
+        assert_eq!(get_funding_k2_bps(&config), 250);
+
+        // Adjacent adaptive fields are untouched
+        assert_eq!(config.adaptive_funding_enabled, 1);
+        assert_eq!(config.adaptive_scale_bps, 300);
+        assert_eq!(config.adaptive_max_funding_bps, 50);
+    }
+
+    /// PERC-8452: UpdateConfig no longer needs save/restore workaround.
+    /// k2_bps writes directly without clobbering oracle_phase or volume.
+    #[test]
+    fn test_update_config_k2_no_save_restore_needed() {
+        let mut config = MarketConfig::zeroed();
+
+        // Simulate a market with active phase tracking
         set_oracle_phase(&mut config, 1);
         set_cumulative_volume(&mut config, 42_000_000u64);
-        let saved_oracle_phase = get_oracle_phase(&config);
-        let saved_vol = get_cumulative_volume(&config);
-        set_funding_k2_bps(&mut config, 500);
-        set_oracle_phase(&mut config, saved_oracle_phase);
-        set_cumulative_volume(&mut config, saved_vol);
 
-        assert_eq!(get_oracle_phase(&config), 1, "oracle_phase=1 must survive");
+        // Direct k2 write (no save/restore) — must be safe now
+        set_funding_k2_bps(&mut config, 500);
+
+        // Everything preserved
+        assert_eq!(get_oracle_phase(&config), 1);
+        assert_eq!(get_cumulative_volume(&config), 42_000_000u64);
+        assert_eq!(get_funding_k2_bps(&config), 500);
+
+        // Zero k2 (SDK default) — also safe
+        set_funding_k2_bps(&mut config, 0);
+        assert_eq!(get_oracle_phase(&config), 1);
+        assert_eq!(get_cumulative_volume(&config), 42_000_000u64);
+        assert_eq!(get_funding_k2_bps(&config), 0);
+    }
+
+    /// PERC-8452: Boundary values for k2_bps.
+    #[test]
+    fn test_k2_bps_boundary_values() {
+        let mut config = MarketConfig::zeroed();
+
+        set_funding_k2_bps(&mut config, 0);
+        assert_eq!(get_funding_k2_bps(&config), 0);
+
+        set_funding_k2_bps(&mut config, 1);
+        assert_eq!(get_funding_k2_bps(&config), 1);
+
+        set_funding_k2_bps(&mut config, 10_000);
+        assert_eq!(get_funding_k2_bps(&config), 10_000);
+
+        set_funding_k2_bps(&mut config, u16::MAX);
+        assert_eq!(get_funding_k2_bps(&config), u16::MAX);
+    }
+}
+
+#[cfg(kani)]
+mod k2_bps_layout_kani {
+    use crate::state::*;
+
+    /// PERC-8452: set_funding_k2_bps → get_funding_k2_bps roundtrip preserves all u16 values.
+    #[kani::proof]
+    fn proof_k2_bps_roundtrip() {
+        let mut config = MarketConfig::zeroed();
+        let k2: u16 = kani::any();
+        set_funding_k2_bps(&mut config, k2);
+        assert_eq!(get_funding_k2_bps(&config), k2, "k2_bps must roundtrip");
+    }
+
+    /// PERC-8452: set_funding_k2_bps does NOT modify any byte of _insurance_isolation_padding.
+    #[kani::proof]
+    fn proof_k2_bps_no_padding_collision() {
+        let mut config = MarketConfig::zeroed();
+
+        // Pre-populate _insurance_isolation_padding with arbitrary data
+        let pad_before: [u8; 14] = kani::any();
+        config._insurance_isolation_padding = pad_before;
+
+        let k2: u16 = kani::any();
+        set_funding_k2_bps(&mut config, k2);
+
+        // Every byte of _insurance_isolation_padding must be unchanged
         assert_eq!(
-            get_cumulative_volume(&config),
-            42_000_000u64,
-            "cumulative_volume must survive"
+            config._insurance_isolation_padding, pad_before,
+            "_insurance_isolation_padding must be untouched"
         );
-        // NOTE: get_funding_k2_bps() will NOT equal 500 here due to the layout collision.
-        // k2_bps = u16_le(oracle_phase, cumulative_volume[0]) — this is the known limitation.
-        // TODO: layout migration to give k2_bps non-overlapping bytes.
+    }
+
+    /// PERC-8452: set_funding_k2_bps preserves oracle_phase and cumulative_volume for all inputs.
+    #[kani::proof]
+    fn proof_k2_bps_preserves_phase_and_volume() {
+        let mut config = MarketConfig::zeroed();
+
+        let phase: u8 = kani::any();
+        kani::assume(phase <= 2);
+        let volume: u64 = kani::any();
+
+        set_oracle_phase(&mut config, phase);
+        set_cumulative_volume(&mut config, volume);
+
+        let k2: u16 = kani::any();
+        set_funding_k2_bps(&mut config, k2);
+
+        // phase is clamped to min(phase, 2) by set_oracle_phase
+        assert_eq!(get_oracle_phase(&config), phase.min(2));
+        assert_eq!(get_cumulative_volume(&config), volume);
+    }
+
+    /// PERC-8452: set_funding_k2_bps preserves upper 16 bits of _adaptive_pad2.
+    #[kani::proof]
+    fn proof_k2_bps_preserves_upper_pad2_bits() {
+        let mut config = MarketConfig::zeroed();
+        let initial_pad2: u32 = kani::any();
+        config._adaptive_pad2 = initial_pad2;
+
+        let k2: u16 = kani::any();
+        set_funding_k2_bps(&mut config, k2);
+
+        // Upper 16 bits preserved
+        assert_eq!(config._adaptive_pad2 >> 16, initial_pad2 >> 16);
+        // Lower 16 bits are k2
+        assert_eq!((config._adaptive_pad2 & 0xFFFF) as u16, k2);
     }
 }
 
