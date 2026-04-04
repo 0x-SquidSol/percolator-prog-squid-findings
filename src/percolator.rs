@@ -4630,8 +4630,11 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Engine handles K-pair PnL, loss settlement, insurance absorption,
-                    // profit conversion with haircut, fee debt sweep, and account close.
+                    // Best-effort touch to settle maintenance fees before force-close.
+                    // force_close_resolved does not run settle_maintenance_fee_internal.
+                    let _ = engine.touch_account_full(
+                        user_idx as usize, price, config.resolution_slot,
+                    );
                     engine.force_close_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -5765,8 +5768,10 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Engine handles K-pair PnL, loss settlement, insurance absorption,
-                // profit conversion with haircut, fee debt sweep, and account close.
+                // Best-effort touch to settle maintenance fees before force-close.
+                let _ = engine.touch_account_full(
+                    user_idx as usize, price, config.resolution_slot,
+                );
                 let amt_units = engine.force_close_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
@@ -5988,7 +5993,11 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                let (units, _) = crate::units::base_to_units(amount, config.unit_scale);
+                // Reject misaligned amounts — silent truncation could lose value
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+                if dust != 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
                 engine.convert_released_pnl(user_idx, units as u128, price, clock.slot,
                     compute_current_funding_rate(&config))
                     .map_err(map_risk_error)?;
@@ -6205,6 +6214,11 @@ pub mod processor {
                 );
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
+                // Best-effort touch to settle maintenance fees before force-close.
+                let frozen_slot = config.resolution_slot;
+                let _ = engine.touch_account_full(
+                    user_idx as usize, price, frozen_slot,
+                );
                 let amt_units = engine.force_close_resolved(user_idx)
                     .map_err(map_risk_error)?;
 
