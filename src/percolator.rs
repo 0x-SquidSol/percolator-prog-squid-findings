@@ -4281,6 +4281,9 @@ pub mod state {
 
     /// Read EWMV (exponentially weighted moving variance) from `_insurance_isolation_padding[4..8]`.
     /// Scaled by 1e12. 0 = no variance history.
+    /// SECURITY(H-1): shares bytes with cumulative_volume[3..11]. Mutually
+    /// exclusive with oracle-phase markets (enforced at UpdateRiskParams /
+    /// AdvanceOraclePhase).
     #[inline]
     pub fn get_ewmv_e12(config: &MarketConfig) -> u32 {
         u32::from_le_bytes([
@@ -12491,6 +12494,12 @@ pub mod processor {
                     }
                     // VRAM: Volatility-Regime Adaptive Margin params
                     if let Some(scale) = vol_margin_scale_bps {
+                        // SECURITY(H-1): VRAM fields share _insurance_isolation_padding
+                        // bytes with cumulative_volume and phase2_delta_slots. Reject
+                        // enabling VRAM on markets that use oracle phase transitions.
+                        if scale > 0 && state::get_oracle_phase(&config) > 0 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
                         state::set_vol_margin_scale_bps(&mut config, scale);
                     }
                     if let Some(alpha) = vol_alpha_e6 {
@@ -16263,6 +16272,13 @@ pub mod processor {
 
                 let mut config = state::read_config(&data);
                 let clock = Clock::get()?;
+
+                // SECURITY(H-1): Oracle phase transitions write cumulative_volume
+                // and phase2_delta_slots which overlap VRAM fields in
+                // _insurance_isolation_padding. Block on VRAM-enabled markets.
+                if state::get_vol_margin_scale_bps(&config) > 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 let old_phase = state::get_oracle_phase(&config);
 
