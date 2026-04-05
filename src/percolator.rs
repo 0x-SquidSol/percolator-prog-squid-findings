@@ -6651,6 +6651,7 @@ pub mod lp_vault {
             let total_epochs: u8 = kani::any();
             kani::assume(queued_lp > 0 && queued_lp <= 1_000_000_000_000);
             kani::assume(total_epochs > 0 && total_epochs <= 5);
+            kani::cover!(queued_lp > 1 && total_epochs > 1);
             let mut q = WithdrawQueue {
                 magic: WITHDRAW_QUEUE_MAGIC,
                 queued_lp_amount: queued_lp,
@@ -6808,6 +6809,7 @@ pub mod lp_vault {
         fn proof_loyalty_mult_never_exceeds_max_tier() {
             let delta: u64 = kani::any();
             kani::assume(delta <= 1_000_000);
+            kani::cover!(delta > 0);
             let mult = loyalty_multiplier_bps(delta);
             assert!(mult >= LOYALTY_MULT_BASE);
             assert!(mult <= LOYALTY_MULT_TIER2);
@@ -6887,6 +6889,7 @@ pub mod lp_collateral {
             kani::assume(vault_tvl > 0 && vault_tvl <= 1_000_000_000_000_000);
             kani::assume(total_supply > 0 && total_supply <= 1_000_000_000_000);
             kani::assume(ltv_bps > 0 && ltv_bps <= 10_000);
+            kani::cover!(lp_amount > 1 && vault_tvl > 1 && total_supply > 1);
 
             let value = lp_token_value(lp_amount, vault_tvl, total_supply, ltv_bps);
             let raw = (lp_amount as u128) * vault_tvl / (total_supply as u128);
@@ -6905,6 +6908,7 @@ pub mod lp_collateral {
             kani::assume(new_tvl_high <= old_tvl as u128);
             kani::assume(new_tvl_low <= new_tvl_high);
             kani::assume(threshold > 0 && threshold <= 10_000);
+            kani::cover!(old_tvl > 1 && new_tvl_low < new_tvl_high);
 
             let triggered_high = tvl_drawdown_exceeded(old_tvl, new_tvl_high, threshold);
             let triggered_low = tvl_drawdown_exceeded(old_tvl, new_tvl_low, threshold);
@@ -7378,6 +7382,7 @@ mod keeper_fund_kani {
         kani::assume(split_bps <= 10_000);
         // Only check deposits that won't overflow in multiply
         kani::assume(deposit <= u64::MAX / 10_000);
+        kani::cover!(deposit > 0 && split_bps > 0);
         let (lp, fund) = split_deposit(deposit, split_bps);
         assert!(lp + fund == deposit, "split must conserve deposit");
     }
@@ -7387,6 +7392,7 @@ mod keeper_fund_kani {
     fn proof_reward_bounded() {
         let balance: u64 = kani::any();
         let reward_per_crank: u64 = kani::any();
+        kani::cover!(balance > 0 && reward_per_crank > 0);
         let (new_bal, actual) = pay_crank_reward(balance, reward_per_crank);
         assert!(actual <= balance, "reward must not exceed balance");
         assert!(new_bal <= balance, "new balance must not increase");
@@ -7398,6 +7404,7 @@ mod keeper_fund_kani {
     fn proof_reward_monotone_decrease() {
         let balance: u64 = kani::any();
         let reward: u64 = kani::any();
+        kani::cover!(balance > 0 && reward > 0);
         let (new_bal, _) = pay_crank_reward(balance, reward);
         assert!(new_bal <= balance);
     }
@@ -7410,6 +7417,7 @@ mod keeper_fund_kani {
         let bps: u64 = kani::any();
         kani::assume(bps <= 10_000);
         kani::assume(fee <= u64::MAX / 10_000);
+        kani::cover!(balance > 0 && fee > 0 && bps > 0);
         let (new_bal, _) = topup_from_fees(balance, fee, bps);
         assert!(new_bal >= balance);
     }
@@ -7677,6 +7685,7 @@ mod creator_lock_kani {
         let current: u64 = kani::any();
         // Avoid saturating_add masking the invariant
         kani::assume(start <= u64::MAX - duration);
+        kani::cover!(duration > 0 && current > 0);
         if current < start + duration {
             assert!(!is_lock_expired(current, start, duration));
         }
@@ -7689,6 +7698,7 @@ mod creator_lock_kani {
         let total: u64 = kani::any();
         let locked: u64 = kani::any();
         let expired: bool = kani::any();
+        kani::cover!(total > 0 && locked > 0);
         let result = max_withdrawable(total, locked, expired);
         assert!(result <= total);
     }
@@ -7700,6 +7710,7 @@ mod creator_lock_kani {
         let total: u64 = kani::any();
         let locked: u64 = kani::any();
         kani::assume(locked >= total);
+        kani::cover!(total > 0 && locked > 0);
         let result = max_withdrawable(total, locked, false);
         assert!(result == 0);
     }
@@ -7714,6 +7725,7 @@ mod creator_lock_kani {
         let limit: u64 = kani::any();
         kani::assume(extracted_a <= extracted_b);
         kani::assume(limit <= 100_000); // reasonable upper bound
+        kani::cover!(deposited > 0 && limit > 0 && extracted_a < extracted_b);
         if check_extraction_exceeded(extracted_a, deposited, limit) {
             assert!(check_extraction_exceeded(extracted_b, deposited, limit));
         }
@@ -7725,6 +7737,7 @@ mod creator_lock_kani {
     fn proof_fee_redirect_conservation() {
         let fee: u64 = kani::any();
         let active: bool = kani::any();
+        kani::cover!(fee > 0 && active);
         let (a, b) = compute_fee_redirect(fee, active);
         assert!(a + b == fee);
     }
@@ -7959,6 +7972,7 @@ mod creator_history_kani {
         let a: u16 = kani::any();
         let b: u16 = kani::any();
         kani::assume(a <= b);
+        kani::cover!(a < b && b > 0);
         assert!(failure_multiplier_bps(a) <= failure_multiplier_bps(b));
     }
 
@@ -7967,6 +7981,7 @@ mod creator_history_kani {
     #[kani::unwind(1)]
     fn proof_discount_bounded() {
         let s: u16 = kani::any();
+        kani::cover!(s > 0);
         assert!(success_discount_bps(s) <= MAX_DISCOUNT_BPS);
     }
 
@@ -7978,6 +7993,7 @@ mod creator_history_kani {
         let successful: u16 = kani::any();
         let base: u64 = kani::any();
         kani::assume(base <= 1_000_000_000_000); // reasonable range
+        kani::cover!(base > 0 && (failed > 0 || successful > 0));
         let dep = compute_required_deposit(base, failed, successful);
         assert!(dep >= base / 2);
     }
@@ -7987,6 +8003,7 @@ mod creator_history_kani {
     #[kani::unwind(1)]
     fn nightly_proof_slash_conservation() {
         let deposit: u64 = kani::any();
+        kani::cover!(deposit > 0);
         let (slash, remainder) = compute_slash(deposit);
         assert!(slash + remainder == deposit);
     }
@@ -7999,6 +8016,7 @@ mod creator_history_kani {
         let oi_a: u64 = kani::any();
         let oi_b: u64 = kani::any();
         kani::assume(oi_a <= oi_b);
+        kani::cover!(deposit > 0 && oi_a < oi_b);
         if oi_threshold_met(deposit, oi_a) {
             assert!(oi_threshold_met(deposit, oi_b));
         }
@@ -8626,6 +8644,7 @@ mod shared_vault_kani {
         let max_bps: u16 = kani::any();
         kani::assume(total <= u128::MAX / 10_000);
         kani::assume(alloc <= u128::MAX / 10_000);
+        kani::cover!(total > 0 && alloc > 0 && max_bps > 0);
         if check_exposure_cap(total, alloc, max_bps) && total > 0 {
             // alloc * 10_000 <= total * max_bps
             assert!(alloc.saturating_mul(10_000) <= total.saturating_mul(max_bps as u128));
@@ -8637,6 +8656,7 @@ mod shared_vault_kani {
     fn nightly_sv_available_bounded() {
         let total: u128 = kani::any();
         let allocated: u128 = kani::any();
+        kani::cover!(total > 0 && allocated > 0 && allocated < total);
         let avail = available_for_allocation(total, allocated);
         assert!(avail <= total);
     }
@@ -8649,6 +8669,7 @@ mod shared_vault_kani {
         let available: u128 = kani::any();
         kani::assume(total_pending > 0);
         kani::assume(req as u128 <= total_pending);
+        kani::cover!(req > 0 && available > 0);
         let result = compute_proportional_withdrawal(req, total_pending, available);
         assert!(result <= req);
     }
@@ -8664,6 +8685,7 @@ mod shared_vault_kani {
         kani::assume(slot_a <= slot_b);
         kani::assume(slot_a >= genesis);
         kani::assume(slot_b >= genesis);
+        kani::cover!(slot_a < slot_b && duration > 1);
         assert!(
             epoch_from_slot(slot_a, genesis, duration)
                 <= epoch_from_slot(slot_b, genesis, duration)
@@ -8675,6 +8697,7 @@ mod shared_vault_kani {
     fn nightly_sv_queue_monotone() {
         let pending: u128 = kani::any();
         let amount: u64 = kani::any();
+        kani::cover!(amount > 0);
         let new_pending = queue_withdrawal(pending, amount);
         assert!(new_pending >= pending);
     }
@@ -8685,6 +8708,7 @@ mod shared_vault_kani {
         let total: u128 = kani::any();
         let max_bps: u16 = kani::any();
         kani::assume(max_bps <= 10_000);
+        kani::cover!(total > 0 && max_bps > 0);
         let max_alloc = max_single_market_allocation(total, max_bps);
         assert!(max_alloc <= total);
     }
@@ -8700,6 +8724,7 @@ mod shared_vault_kani {
         kani::assume(snapshot_pending > 0);
         kani::assume(lp_a == lp_b); // same LP amount → must get same payout
         kani::assume(lp_a as u128 <= snapshot_pending);
+        kani::cover!(lp_a > 0 && snapshot_capital > 0);
 
         let payout_a = compute_proportional_withdrawal(lp_a, snapshot_pending, snapshot_capital);
         // User B claims "after" A — but snapshot values are immutable, so
@@ -8722,6 +8747,7 @@ mod shared_vault_kani {
         let lp_user: u64 = kani::any();
         kani::assume(snapshot_pending > 0);
         kani::assume(lp_user as u128 <= snapshot_pending);
+        kani::cover!(lp_user > 0 && snapshot_capital > 0);
 
         let payout = compute_proportional_withdrawal(lp_user, snapshot_pending, snapshot_capital);
         // Individual payout must not exceed the user's proportional share of capital
@@ -9439,6 +9465,7 @@ pub mod processor {
             kani::assume(current_slot <= 1_000_000);
             kani::assume(last_oracle_slot <= current_slot);
             kani::assume(pos_abs <= 1_000_000_000_000);
+            kani::cover!(threshold > 0 && penalty_bps > 0 && pos_abs > 0);
 
             let mut c: crate::state::MarketConfig = bytemuck::Zeroable::zeroed();
             c.orphan_threshold_slots = threshold;
@@ -17930,6 +17957,7 @@ pub mod processor {
             kani::assume(duration > 0);
             kani::assume(start_slot <= u64::MAX / 2);
             kani::assume(current_slot >= start_slot.saturating_add(duration));
+            kani::cover!(duration > 0 && size != 0);
 
             let mut c = <state::MarketConfig as bytemuck::Zeroable>::zeroed();
             c.safety_valve_enabled = 1;
@@ -18705,6 +18733,7 @@ mod k2_bps_layout_kani {
     fn proof_k2_bps_roundtrip() {
         let mut config = MarketConfig::zeroed();
         let k2: u16 = kani::any();
+        kani::cover!(k2 > 0);
         set_funding_k2_bps(&mut config, k2);
         assert_eq!(get_funding_k2_bps(&config), k2, "k2_bps must roundtrip");
     }
@@ -18719,6 +18748,7 @@ mod k2_bps_layout_kani {
         config._insurance_isolation_padding = pad_before;
 
         let k2: u16 = kani::any();
+        kani::cover!(k2 > 0);
         set_funding_k2_bps(&mut config, k2);
 
         // Every byte of _insurance_isolation_padding must be unchanged
@@ -18736,6 +18766,7 @@ mod k2_bps_layout_kani {
         let phase: u8 = kani::any();
         kani::assume(phase <= 2);
         let volume: u64 = kani::any();
+        kani::cover!(phase > 0 && volume > 0);
 
         set_oracle_phase(&mut config, phase);
         set_cumulative_volume(&mut config, volume);
@@ -18756,6 +18787,7 @@ mod k2_bps_layout_kani {
         config._adaptive_pad2 = initial_pad2;
 
         let k2: u16 = kani::any();
+        kani::cover!(k2 > 0 && initial_pad2 > 0);
         set_funding_k2_bps(&mut config, k2);
 
         // Upper 16 bits preserved
@@ -18780,6 +18812,7 @@ mod oracle_phase_kani {
         let vol: u64 = kani::any();
         let delta: u32 = kani::any();
         let has_oracle: bool = kani::any();
+        kani::cover!(slot > created && vol > 0 && old_phase > 0);
 
         let (new_phase, _) =
             check_phase_transition(slot, created, old_phase, vol, delta, has_oracle);
@@ -18791,6 +18824,7 @@ mod oracle_phase_kani {
     #[kani::proof]
     fn proof_phase1_oi_cap_bounded() {
         let base_cap: u64 = kani::any();
+        kani::cover!(base_cap > 0);
         let cap = phase_oi_cap(0, base_cap);
         assert!(cap <= PHASE1_OI_CAP_E6);
     }
@@ -18799,6 +18833,7 @@ mod oracle_phase_kani {
     #[kani::proof]
     fn proof_phase2_leverage_bounded() {
         let base_lev: u64 = kani::any();
+        kani::cover!(base_lev > 0);
         let lev = phase_max_leverage_bps(1, base_lev);
         assert!(lev <= PHASE2_MAX_LEVERAGE_BPS);
     }
@@ -18812,6 +18847,7 @@ mod oracle_phase_kani {
         let vol: u64 = kani::any();
         let delta: u32 = kani::any();
         let has_oracle: bool = kani::any();
+        kani::cover!(slot > created && vol > 0);
 
         let (new_phase, transitioned) =
             check_phase_transition(slot, created, 2, vol, delta, has_oracle);
@@ -18824,6 +18860,7 @@ mod oracle_phase_kani {
     fn proof_cumulative_volume_monotone() {
         let old_vol: u64 = kani::any();
         let trade_notional: u64 = kani::any();
+        kani::cover!(old_vol > 0 && trade_notional > 0);
         let new_vol = old_vol.saturating_add(trade_notional);
         assert!(new_vol >= old_vol);
     }
@@ -18836,6 +18873,7 @@ mod oracle_phase_kani {
         kani::assume(created <= slot);
         kani::assume(slot - created < PHASE1_VOLUME_MIN_SLOTS);
         let vol: u64 = kani::any();
+        kani::cover!(slot > created && vol > 0);
 
         let (new_phase, transitioned) = check_phase_transition(slot, created, 0, vol, 0, false);
         assert_eq!(new_phase, 0);
@@ -18849,6 +18887,7 @@ mod oracle_phase_kani {
         kani::assume(phase <= 2);
         let base_oi: u64 = kani::any();
         let base_lev: u64 = kani::any();
+        kani::cover!(phase > 0 && base_oi > 0 && base_lev > 0);
 
         assert!(phase_oi_cap(phase, base_oi) <= base_oi);
         assert!(phase_max_leverage_bps(phase, base_lev) <= base_lev);
@@ -18859,6 +18898,7 @@ mod oracle_phase_kani {
     fn proof_legacy_market_no_auto_promote() {
         let current_slot: u64 = kani::any();
         kani::assume(current_slot > 0);
+        kani::cover!(current_slot > 1);
         let resolved = effective_created_slot(0, current_slot);
         // elapsed = current_slot - resolved = 0
         assert_eq!(resolved, current_slot);
