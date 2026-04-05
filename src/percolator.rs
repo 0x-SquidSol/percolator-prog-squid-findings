@@ -15259,8 +15259,12 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultSupplyMismatch.into());
                 }
 
-                let capital_units =
-                    (claimable as u128) * vault_state.total_capital / (lp_supply as u128);
+                // SECURITY(H-3): use checked_mul to prevent silent u128 wrapping
+                // in SBF builds (consistent with LpVaultDeposit/LpVaultWithdraw).
+                let capital_units = (claimable as u128)
+                    .checked_mul(vault_state.total_capital)
+                    .ok_or(PercolatorError::EngineOverflow)?
+                    / (lp_supply as u128);
 
                 if capital_units == 0 {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
