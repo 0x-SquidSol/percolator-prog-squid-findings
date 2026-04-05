@@ -3491,7 +3491,10 @@ pub mod processor {
                     mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
                     _ewma_padding: 0,
                     permissionless_resolve_stale_slots,
-                    last_good_oracle_slot: 0,
+                    // Init to clock.slot so permissionless resolution timer starts
+                    // from market creation, not slot 0 (prevents immediate resolution
+                    // if the oracle happens to be down during market creation).
+                    last_good_oracle_slot: clock.slot,
                     mark_min_fee,
                     force_close_delay_slots,
                 };
@@ -6186,9 +6189,8 @@ pub mod processor {
                 };
 
                 // Accrue engine to settlement price before entering resolved mode.
-                // Crystallizes all account states so force_close_resolved uses
-                // consistent post-accrual state.
-                {
+                // Hyperp already accrued above; non-Hyperp accrues here.
+                if !is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
                     engine.accrue_market_to(clock.slot, last_price)
                         .map_err(map_risk_error)?;
