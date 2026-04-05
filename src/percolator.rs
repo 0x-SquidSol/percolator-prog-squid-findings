@@ -3142,27 +3142,10 @@ pub mod processor {
         accounts: &'b [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        // Reject durable nonces — they allow indefinite replay windows.
-        // AdvanceNonceAccount = SystemProgram instruction with discriminant [4,0,0,0].
-        #[cfg(not(feature = "test"))]
-        {
-            use solana_program::sysvar::instructions;
-            // Look for Instructions sysvar in accounts to avoid syscall overhead
-            // on programs that don't pass it. If not found, skip the check
-            // (most programs don't pass it, and the check is defense-in-depth).
-            for ai in accounts.iter() {
-                if *ai.key == instructions::ID {
-                    if let Ok(first_ix) = instructions::load_instruction_at_checked(0, ai) {
-                        if first_ix.program_id == solana_program::system_program::ID
-                            && first_ix.data.get(..4) == Some(&[4, 0, 0, 0])
-                        {
-                            return Err(ProgramError::InvalidArgument);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+        // Durable nonce rejection removed — the check was opt-in (only ran if
+        // caller voluntarily passed the Instructions sysvar) and therefore not
+        // actually enforceable. Timing-sensitive operations should rely on
+        // slot/timestamp freshness checks instead.
 
         let instruction = Instruction::decode(instruction_data)?;
 
