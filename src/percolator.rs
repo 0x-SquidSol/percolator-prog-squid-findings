@@ -11935,6 +11935,10 @@ pub mod processor {
                     if !engine.insurance_fund.balance.is_zero() {
                         return Err(PercolatorError::EngineInsufficientBalance.into());
                     }
+                    // SECURITY(M-9): also check isolated_balance
+                    if !engine.insurance_fund.isolated_balance.is_zero() {
+                        return Err(PercolatorError::EngineInsufficientBalance.into());
+                    }
                     if engine.num_used_accounts != 0 {
                         return Err(PercolatorError::EngineAccountNotFound.into());
                     }
@@ -12323,8 +12327,11 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                // Get insurance balance and convert to base tokens
-                let insurance_units = engine.insurance_fund.balance.get();
+                // SECURITY(M-9): Account for both balance and isolated_balance.
+                // Without this, isolated_balance tokens remain tracked in engine
+                // but become permanently stranded after slab close.
+                let insurance_units = engine.insurance_fund.balance.get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get());
                 if insurance_units == 0 {
                     return Ok(()); // Nothing to withdraw
                 }
@@ -12338,8 +12345,9 @@ pub mod processor {
                 let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
-                // Zero out insurance fund
+                // Zero out both insurance fund balances
                 engine.insurance_fund.balance = percolator::U128::ZERO;
+                engine.insurance_fund.isolated_balance = percolator::U128::ZERO;
 
                 // Transfer from vault to admin
                 let seed1: &[u8] = b"vault";
