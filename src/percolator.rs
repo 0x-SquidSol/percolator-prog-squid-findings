@@ -3427,6 +3427,10 @@ pub mod processor {
                     if p.insurance_floor.get() > percolator::MAX_VAULT_TVL {
                         return Err(ProgramError::InvalidInstructionData);
                     }
+                    // new_account_fee must be payable: 0 <= fee <= MAX_VAULT_TVL
+                    if p.new_account_fee.get() > percolator::MAX_VAULT_TVL {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -4135,6 +4139,9 @@ pub mod processor {
                 check_idx(engine, lp_idx)?;
                 check_idx(engine, user_idx)?;
 
+                // TradeNoCpi: no matcher check. Both sides are bilateral signers,
+                // no CPI is invoked. Matcher config only matters for TradeCpi.
+
                 let u_owner = engine.accounts[user_idx as usize].owner;
 
                 // Owner authorization via verify helper (Kani-provable)
@@ -4288,11 +4295,11 @@ pub mod processor {
                     check_idx(engine, lp_idx)?;
                     check_idx(engine, user_idx)?;
 
-                    // TradeCpi: enforce LP account kind on lp_idx.
-                    // The LP's matcher program/context are used for CPI — a non-LP
-                    // account would have zero matcher fields, causing CPI to fail
-                    // or route to the wrong program.
-                    if !engine.accounts[lp_idx as usize].is_lp() {
+                    // TradeCpi: require lp_idx has matcher config (non-zero matcher_program).
+                    // The matcher program/context are used for CPI — zero fields would
+                    // cause CPI to fail or route to the wrong program.
+                    // This uses matcher config, not account kind, as the LP capability check.
+                    if engine.accounts[lp_idx as usize].matcher_program == [0u8; 32] {
                         return Err(PercolatorError::EngineAccountKindMismatch.into());
                     }
 
@@ -4672,7 +4679,7 @@ pub mod processor {
                     // loss settlement, and account close internally.
                     // Do NOT pre-touch: touch can fail on epoch-mismatch accounts
                     // that force_close_resolved was specifically designed to handle.
-                    engine.force_close_resolved_not_atomic(user_idx)
+                    engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                         .map_err(map_risk_error)?
                 } else {
                     engine
@@ -5805,7 +5812,7 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                let amt_units = engine.force_close_resolved_not_atomic(user_idx)
+                let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
                     .try_into()
@@ -6259,7 +6266,7 @@ pub mod processor {
                 );
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                let amt_units = engine.force_close_resolved_not_atomic(user_idx)
+                let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                     .map_err(map_risk_error)?;
 
                 let amt_units_u64: u64 = amt_units
