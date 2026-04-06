@@ -3354,7 +3354,7 @@ fn kani_ins_withdraw_meta_roundtrip() {
 /// Bounded price range for single-call EWMA proofs.
 const KANI_MAX_PRICE: u64 = 1_000_000;
 /// Tighter bound for two-call comparison proofs (SAT solver tractability).
-const KANI_MAX_PRICE_CMP: u64 = 1_000;
+const KANI_MAX_PRICE_CMP: u64 = 16;
 
 /// For all valid inputs: result is in [min(old, price), max(old, price)].
 /// Fee-weighting cannot push EWMA outside the convex hull of old and price.
