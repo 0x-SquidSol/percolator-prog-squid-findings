@@ -53,12 +53,32 @@ pub mod constants {
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
     // PERC-SetDexPool: +32 bytes for dex_pool field.
-    // Native (u128 align=16): 544; SBF (u128 align=8): 528
     #[cfg(target_arch = "bpf")]
-    const _: [(); 528] = [(); CONFIG_LEN];
-    #[cfg(not(target_arch = "bpf"))]
-    const _: [(); 544] = [(); CONFIG_LEN];
+    const _: [(); 528] = [(); CONFIG_LEN];      // BPF (legacy, u128 align=8)
+    #[cfg(target_arch = "sbf")]
+    const _SBF_CONFIG: [(); 544] = [(); CONFIG_LEN]; // SBF (Solana 2.x)
+    #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
+    const _: [(); 544] = [(); CONFIG_LEN];       // native (x86_64/aarch64)
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
+
+    // SBF layout pinning — verified by cargo build-sbf.
+    // If any of these fail, update layout.json + SDK constants.
+    pub const ACCOUNT_SIZE: usize = size_of::<percolator::Account>();
+    #[cfg(target_arch = "sbf")]
+    const _SBF_ENGINE_ALIGN: [(); 8] = [(); ENGINE_ALIGN];
+    #[cfg(target_arch = "sbf")]
+    const _SBF_ENGINE_OFF: [(); 648] = [(); ENGINE_OFF];
+    #[cfg(target_arch = "sbf")]
+    const _SBF_ACCOUNT_SIZE: [(); 320] = [(); ACCOUNT_SIZE];
+    #[cfg(target_arch = "sbf")]
+    const _SBF_CONFIG_LEN: [(); 544] = [(); CONFIG_LEN];
+    // Bitmap offset within RiskEngine (offset_of! requires nightly or Rust 1.77+)
+    pub const ENGINE_BITMAP_OFF: usize = core::mem::offset_of!(RiskEngine, used);
+    #[cfg(target_arch = "sbf")]
+    const _SBF_BITMAP_OFF: [(); 1016] = [(); ENGINE_BITMAP_OFF];
+    pub const ENGINE_LEN_CONST: usize = size_of::<RiskEngine>();
+    #[cfg(target_arch = "sbf")]
+    const _SBF_ENGINE_LEN: [(); 1320464] = [(); ENGINE_LEN_CONST];
 
     pub const fn align_up(x: usize, a: usize) -> usize {
         (x + (a - 1)) & !(a - 1)

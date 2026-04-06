@@ -266,10 +266,9 @@ fn emit_layout_json() {
     //   SBF    (u128 align=8):  empirically verified = 1008 (mainnet slab CCTegYZ..., 323312 bytes)
     // The native value is computed automatically; the SBF value is pinned below.
     let engine_bitmap_off_native = offset_of!(percolator::RiskEngine, used);
-    // SBF engine_bitmap_off: pinned to 1008 (verified empirically; update if RiskEngine fields change).
-    // To re-verify: cargo build-sbf && cargo test --test layout_canary slab_guard_accepts_all_known_sizes
-    // then check that the computed slab sizes match known on-chain sizes.
-    let engine_bitmap_off_sbf: usize = 1008;
+    // SBF engine_bitmap_off: 1016 (verified by cargo build-sbf compile-time assertion in src/percolator.rs).
+    // v12.1 added lifetime_force_realize_closes(u64) before the bitmap, shifting it from 1008 to 1016.
+    let engine_bitmap_off_sbf: usize = 1016;
 
     // SBF vs native differences:
     //
@@ -285,10 +284,8 @@ fn emit_layout_json() {
 
     // Account size: differs between native and SBF because Account has i128/u128 fields.
     //   Native (u128 align=16): 336  (v12.1 upstream)
-    //   SBF    (u128 align=8):  312  (pinned, verified by cargo build-sbf)
-    // The deployed binary uses the old core (pre-v12.1) which has account_size=312 on SBF.
-    // When the v12.1 binary is deployed, update this to the new SBF value.
-    let account_size_sbf: usize = 312; // pinned for current deployed binary (pre-v12.1 core)
+    //   SBF    (u128 align=8):  320  (verified by cargo build-sbf compile-time assertion)
+    let account_size_sbf: usize = 320;
 
     let json = format!(
         r#"{{
@@ -307,9 +304,11 @@ fn emit_layout_json() {
     "u128_align": {}
   }},
   "sbf": {{
-    "_comment": "On-chain (SBF target, u128_align=8) values — what the SDK must use. Manually pinned where native differs.",
+    "_comment": "On-chain (SBF target, u128_align=8) values — verified by cargo build-sbf compile-time assertions.",
     "config_len": {},
     "engine_off": {},
+    "engine_align": 8,
+    "engine_len": {},
     "account_size": {},
     "engine_bitmap_off": {}
   }}
@@ -328,6 +327,10 @@ fn emit_layout_json() {
         align_of::<u128>(),
         config_len_sbf,
         engine_off_sbf,
+        // SBF ENGINE_LEN: verified by cargo build-sbf compile-time assertion (1320464).
+        // Formula: SLAB_LEN - ENGINE_OFF = (engine_off_sbf + engine_len_sbf) - engine_off_sbf.
+        // Use the pinned value from _SBF_ENGINE_LEN assertion.
+        1320464usize,
         account_size_sbf,
         engine_bitmap_off_sbf,
     );
