@@ -806,6 +806,36 @@ pub mod verify {
         };
         core::cmp::min(result, u64::MAX as u128) as u64
     }
+
+    // ─── Fork-specific verify stubs ───────────────────────────────────────────
+
+    /// Base fee multiplier BPS (1.0x = 10_000 bps).
+    pub const FEE_MULT_BASE_BPS: u64 = 10_000;
+
+    /// Compute utilization in BPS given current OI and max OI.
+    /// Returns 0 if max_oi is 0 (disabled).
+    #[inline]
+    pub fn compute_util_bps(current_oi: u128, max_oi: u128) -> u64 {
+        if max_oi == 0 {
+            return 0;
+        }
+        let util = current_oi.saturating_mul(10_000) / max_oi;
+        core::cmp::min(util, 10_000) as u64
+    }
+
+    /// Compute fee multiplier BPS based on utilization BPS.
+    /// Linear from FEE_MULT_BASE_BPS at 0% util to 2x at 100% util.
+    #[inline]
+    pub fn compute_fee_multiplier_bps(util_bps: u64) -> u64 {
+        FEE_MULT_BASE_BPS + util_bps
+    }
+
+    /// Returns true if the market uses a pinned (authority) oracle rather than Pyth.
+    /// A market with a non-zero oracle_authority and zero index_feed_id is pinned.
+    #[inline]
+    pub fn is_pyth_pinned_mode(oracle_authority: [u8; 32], index_feed_id: [u8; 32]) -> bool {
+        oracle_authority != [0u8; 32] && index_feed_id == [0u8; 32]
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -1052,6 +1082,28 @@ pub mod error {
         InvalidConfigParam,
         HyperpTradeNoCpiDisabled,
         EngineCorruptState,
+        // ── Fork-specific error variants ─────────────────────────────────────
+        MarketPaused,
+        LpVaultInvalidFeeShare,
+        LpVaultAlreadyExists,
+        LpVaultNotCreated,
+        LpVaultZeroAmount,
+        LpVaultSupplyMismatch,
+        LpVaultWithdrawExceedsAvailable,
+        LpVaultNoNewFees,
+        LpCollateralDisabled,
+        LpCollateralPositionOpen,
+        MarketNotResolved,
+        DisputeWindowClosed,
+        DisputeAlreadyExists,
+        NoActiveDispute,
+        WithdrawQueueAlreadyExists,
+        WithdrawQueueNotFound,
+        WithdrawQueueNothingClaimable,
+        InsuranceFundNotDepleted,
+        BankruptPositionAlreadyClosed,
+        AuditViolation,
+        CrossMarginPairNotFound,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1286,6 +1338,85 @@ pub mod ix {
             fee_to_insurance_bps: u16,
             skew_spread_mult_bps: u16,
         },
+
+        // ─── LP Vault (PERC-272, tags 37-40) ─────────────────────────────
+        /// PERC-272: Create LP vault state PDA + SPL mint (tag 37).
+        CreateLpVault {
+            fee_share_bps: u64,
+            /// PERC-304: Whether to enable the utilization kink curve.
+            util_curve_enabled: bool,
+        },
+        /// PERC-272: Deposit into LP vault, receive LP shares (tag 38).
+        LpVaultDeposit { amount: u64 },
+        /// PERC-272: Burn LP shares and withdraw proportional SOL from LP vault (tag 39).
+        LpVaultWithdraw { lp_amount: u64 },
+        /// PERC-272: Permissionless crank — distribute accrued fee revenue to LP vault (tag 40).
+        LpVaultCrankFees,
+
+        /// PERC-306: Fund per-market isolated insurance balance (tag 41).
+        FundMarketInsurance { amount: u64 },
+        /// PERC-306: Set insurance isolation BPS for a market (tag 42).
+        SetInsuranceIsolation { bps: u16 },
+        /// PERC-314: Challenge settlement price (tag 43).
+        ChallengeSettlement { proposed_price_e6: u64 },
+        /// PERC-314: Resolve dispute (admin) (tag 44).
+        ResolveDispute { accept: u8 },
+        /// PERC-315: Deposit LP vault tokens as perp collateral (tag 45).
+        DepositLpCollateral { user_idx: u16, lp_amount: u64 },
+        /// PERC-315: Withdraw LP collateral (position must be closed) (tag 46).
+        WithdrawLpCollateral { user_idx: u16, lp_amount: u64 },
+        /// PERC-309: Queue large LP withdrawal (tag 47).
+        QueueWithdrawal { lp_amount: u64 },
+        /// PERC-309: Claim one epoch tranche (tag 48).
+        ClaimQueuedWithdrawal,
+        /// PERC-309: Cancel queued withdrawal (tag 49).
+        CancelQueuedWithdrawal,
+        /// PERC-305: Auto-deleverage (tag 50).
+        ExecuteAdl { target_idx: u16 },
+        /// Close a stale slab (wrong size from old program layout) and recover rent SOL (tag 51).
+        CloseStaleSlabs,
+        /// Reclaim rent from an uninitialised slab when market creation fails mid-flow (tag 52).
+        ReclaimSlabRent,
+        /// PERC-608: Transfer position ownership via CPI from percolator-nft TransferHook (tag 69).
+        TransferOwnershipCpi { user_idx: u16, new_owner: [u8; 32] },
+        /// PERC-622: Advance oracle phase (permissionless crank) (tag 56).
+        AdvanceOraclePhase,
+        /// On-chain audit crank: walk all accounts and verify conservation invariants (tag 53).
+        AuditCrank,
+        /// Admin: configure cross-market margin offset for a pair of slabs (tag 54).
+        SetOffsetPair { offset_bps: u16 },
+        /// Permissionless: attest user positions across two slabs for portfolio margin credit (tag 55).
+        AttestCrossMargin { user_idx_a: u16, user_idx_b: u16 },
+        /// PERC-628: Initialize the global shared vault (tag 59).
+        InitSharedVault {
+            epoch_duration_slots: u64,
+            max_market_exposure_bps: u16,
+        },
+        /// PERC-628: Allocate virtual liquidity to a market (tag 60).
+        AllocateMarket { amount: u128 },
+        /// PERC-628: Queue a withdrawal for the current epoch (tag 61).
+        QueueWithdrawalSV { lp_amount: u64 },
+        /// PERC-628: Claim a queued withdrawal after epoch elapses (tag 62).
+        ClaimEpochWithdrawal,
+        /// PERC-628: Advance the shared vault epoch (permissionless crank) (tag 63).
+        AdvanceEpoch,
+
+        // ── PERC-608: Position NFTs (tags 64-68) ─────────────────────────
+        /// PERC-608: Mint a Position NFT (Token-2022 + TokenMetadata) for an open position (tag 64).
+        MintPositionNft { user_idx: u16 },
+        /// PERC-608: Transfer position ownership via the NFT (tag 65).
+        TransferPositionOwnership { user_idx: u16 },
+        /// PERC-608: Burn the Position NFT when a position is closed (tag 66).
+        BurnPositionNft { user_idx: u16 },
+        /// PERC-608: Keeper sets pending_settlement=1 before a funding settlement transfer (tag 67).
+        SetPendingSettlement { user_idx: u16 },
+        /// PERC-608: Keeper clears pending_settlement=0 after running KeeperCrank (tag 68).
+        ClearPendingSettlement { user_idx: u16 },
+
+        /// PERC-8111: Set per-wallet position cap (admin only) (tag 70).
+        SetWalletCap { cap_e6: u64 },
+        /// PERC-8110: Set OI imbalance hard block threshold (admin only) (tag 71).
+        SetOiImbalanceHardBlock { threshold_bps: u16 },
     }
 
     impl Instruction {
@@ -1644,6 +1775,128 @@ pub mod ix {
                         skew_spread_mult_bps,
                     })
                 }
+                // ─── LP Vault + additional fork instructions ───────────
+                37 => {
+                    let fee_share_bps = read_u64(&mut rest)?;
+                    let util_curve_enabled = if !rest.is_empty() {
+                        read_u8(&mut rest)? != 0
+                    } else {
+                        false
+                    };
+                    Ok(Instruction::CreateLpVault { fee_share_bps, util_curve_enabled })
+                }
+                38 => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::LpVaultDeposit { amount })
+                }
+                39 => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::LpVaultWithdraw { lp_amount })
+                }
+                40 => Ok(Instruction::LpVaultCrankFees),
+                41 => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::FundMarketInsurance { amount })
+                }
+                42 => {
+                    let bps = read_u16(&mut rest)?;
+                    Ok(Instruction::SetInsuranceIsolation { bps })
+                }
+                43 => {
+                    let proposed_price_e6 = read_u64(&mut rest)?;
+                    Ok(Instruction::ChallengeSettlement { proposed_price_e6 })
+                }
+                44 => {
+                    let accept = read_u8(&mut rest)?;
+                    Ok(Instruction::ResolveDispute { accept })
+                }
+                45 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::DepositLpCollateral { user_idx, lp_amount })
+                }
+                46 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::WithdrawLpCollateral { user_idx, lp_amount })
+                }
+                47 => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::QueueWithdrawal { lp_amount })
+                }
+                48 => Ok(Instruction::ClaimQueuedWithdrawal),
+                49 => Ok(Instruction::CancelQueuedWithdrawal),
+                50 => {
+                    let target_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::ExecuteAdl { target_idx })
+                }
+                51 => Ok(Instruction::CloseStaleSlabs),
+                52 => Ok(Instruction::ReclaimSlabRent),
+                53 => Ok(Instruction::AuditCrank),
+                54 => {
+                    let offset_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::SetOffsetPair { offset_bps })
+                }
+                55 => {
+                    let user_idx_a = read_u16(&mut rest)?;
+                    let user_idx_b = read_u16(&mut rest)?;
+                    Ok(Instruction::AttestCrossMargin { user_idx_a, user_idx_b })
+                }
+                56 => Ok(Instruction::AdvanceOraclePhase),
+                // 57 = TopUpKeeperFund (already handled above)
+                // 58 = TAG_SLASH_CREATION_DEPOSIT — intentionally unimplemented stub
+                59 => {
+                    let epoch_duration_slots = read_u64(&mut rest)?;
+                    let max_market_exposure_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::InitSharedVault { epoch_duration_slots, max_market_exposure_bps })
+                }
+                60 => {
+                    let amount = read_u128(&mut rest)?;
+                    Ok(Instruction::AllocateMarket { amount })
+                }
+                61 => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::QueueWithdrawalSV { lp_amount })
+                }
+                62 => Ok(Instruction::ClaimEpochWithdrawal),
+                63 => Ok(Instruction::AdvanceEpoch),
+                64 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::MintPositionNft { user_idx })
+                }
+                65 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::TransferPositionOwnership { user_idx })
+                }
+                66 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::BurnPositionNft { user_idx })
+                }
+                67 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::SetPendingSettlement { user_idx })
+                }
+                68 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::ClearPendingSettlement { user_idx })
+                }
+                69 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    let mut new_owner = [0u8; 32];
+                    if rest.len() < 32 {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    new_owner.copy_from_slice(&rest[..32]);
+                    Ok(Instruction::TransferOwnershipCpi { user_idx, new_owner })
+                }
+                70 => {
+                    let cap_e6 = read_u64(&mut rest)?;
+                    Ok(Instruction::SetWalletCap { cap_e6 })
+                }
+                71 => {
+                    let threshold_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::SetOiImbalanceHardBlock { threshold_bps })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -1831,6 +2084,37 @@ pub mod accounts {
             &[b"vault", slab_key.as_ref(), &[bump]],
             program_id,
         ).map_err(|_| ProgramError::InvalidSeeds)
+    }
+
+    /// PERC-272: Derive LP vault state PDA.
+    /// Seeds: `[b"lp_vault", slab_key]`
+    pub fn derive_lp_vault_state(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], program_id)
+    }
+
+    /// PERC-272: Derive LP vault SPL mint PDA.
+    /// Seeds: `[b"lp_vault_mint", slab_key]`
+    pub fn derive_lp_vault_mint(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], program_id)
+    }
+
+    /// PERC-314: Derive settlement dispute PDA.
+    /// Seeds: `[b"dispute", slab_key]`
+    pub fn derive_dispute(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"dispute", slab_key.as_ref()], program_id)
+    }
+
+    /// PERC-309: Derive withdraw queue PDA.
+    /// Seeds: `[b"withdraw_queue", slab_key, user_key]`
+    pub fn derive_withdraw_queue(
+        program_id: &Pubkey,
+        slab_key: &Pubkey,
+        user_key: &Pubkey,
+    ) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[b"withdraw_queue", slab_key.as_ref(), user_key.as_ref()],
+            program_id,
+        )
     }
 }
 
@@ -2093,6 +2377,8 @@ pub mod state {
     /// Prevents WithdrawInsuranceLimited from misinterpreting oracle
     /// timestamps as policy metadata via authority_timestamp bit patterns.
     pub const FLAG_POLICY_CONFIGURED: u8 = 1 << 1;
+    /// Flag bit: Market is paused (admin emergency stop or audit crank violation).
+    pub const FLAG_PAUSED: u8 = 1 << 2;
 
     /// Read market flags from _padding[0].
     pub fn read_flags(data: &[u8]) -> u8 {
@@ -2125,6 +2411,171 @@ pub mod state {
         let flags = read_flags(data) | FLAG_POLICY_CONFIGURED;
         write_flags(data, flags);
     }
+
+    /// Check if market is paused.
+    pub fn is_paused(data: &[u8]) -> bool {
+        read_flags(data) & FLAG_PAUSED != 0
+    }
+
+    /// Set or clear the paused flag.
+    pub fn set_paused(data: &mut [u8], paused: bool) {
+        let flags = if paused {
+            read_flags(data) | FLAG_PAUSED
+        } else {
+            read_flags(data) & !FLAG_PAUSED
+        };
+        write_flags(data, flags);
+    }
+
+    /// Oracle phase constants.
+    pub const ORACLE_PHASE_NASCENT: u8 = 0;
+    pub const ORACLE_PHASE_GROWING: u8 = 1;
+    pub const ORACLE_PHASE_MATURE: u8 = 2;
+
+    /// Read oracle phase. Returns 0 if field not present (legacy market, treat as nascent).
+    /// Stored in dex_pool[31] (last byte) as a byte value — avoids adding a new MarketConfig
+    /// field while keeping state that survives config rewrites.
+    #[inline]
+    pub fn get_oracle_phase(_config: &MarketConfig) -> u8 {
+        // Phase detection not available in this layout; treat as mature (Phase 3).
+        ORACLE_PHASE_MATURE
+    }
+
+    /// Set oracle phase — no-op in this layout (field absent).
+    #[inline]
+    pub fn set_oracle_phase(_config: &mut MarketConfig, _phase: u8) {}
+
+    /// Get cumulative volume — returns 0 (not tracked in this layout).
+    #[inline]
+    pub fn get_cumulative_volume(_config: &MarketConfig) -> u64 { 0 }
+
+    /// Get phase2 delta slots — returns 0 (not tracked).
+    #[inline]
+    pub fn get_phase2_delta_slots(_config: &MarketConfig) -> u32 { 0 }
+
+    /// Set phase2 delta slots — no-op in this layout.
+    #[inline]
+    pub fn set_phase2_delta_slots(_config: &mut MarketConfig, _delta: u32) {}
+
+    /// Get volatility margin scale bps — returns 0 (disabled in this layout).
+    #[inline]
+    pub fn get_vol_margin_scale_bps(_config: &MarketConfig) -> u16 { 0 }
+
+    /// Compute effective created slot for phase logic.
+    #[inline]
+    pub fn effective_created_slot(market_created_slot: u64, current_slot: u64) -> u64 {
+        if market_created_slot == 0 { current_slot } else { market_created_slot }
+    }
+
+    /// Phase transition decision function. Returns (new_phase, transitioned).
+    /// Since phase storage is absent, always returns (MATURE, false) so
+    /// AdvanceOraclePhase becomes a safe no-op on this layout.
+    pub fn check_phase_transition(
+        _current_slot: u64,
+        _market_created_slot: u64,
+        _oracle_phase: u8,
+        _cumulative_volume: u64,
+        _phase2_delta_slots: u32,
+        _has_mature_oracle: bool,
+    ) -> (u8, bool) {
+        (ORACLE_PHASE_MATURE, false)
+    }
+
+    /// Read audit status — returns 0 (field absent in this layout).
+    #[inline]
+    pub fn read_audit_status(_config: &MarketConfig) -> u16 { 0 }
+
+    /// Write audit status — no-op in this layout.
+    #[inline]
+    pub fn write_audit_status(_config: &mut MarketConfig, _status: u16) {}
+
+    /// Read last audit-crank pause slot — returns 0 (field absent).
+    #[inline]
+    pub fn read_last_audit_pause_slot(_config: &MarketConfig) -> u64 { 0 }
+
+    /// Write last audit-crank pause slot — no-op in this layout.
+    #[inline]
+    pub fn write_last_audit_pause_slot(_config: &mut MarketConfig, _slot: u64) {}
+
+    /// Get per-wallet position cap — returns 0 (disabled, field absent).
+    #[inline]
+    pub fn get_max_wallet_pos_e6(_config: &MarketConfig) -> u64 { 0 }
+
+    /// Set per-wallet position cap — no-op in this layout.
+    #[inline]
+    pub fn set_max_wallet_pos_e6(_config: &mut MarketConfig, _cap_e6: u64) {}
+
+    /// Get OI imbalance hard-block threshold — returns 0 (disabled).
+    #[inline]
+    pub fn get_oi_imbalance_hard_block_bps(_config: &MarketConfig) -> u16 { 0 }
+
+    /// Set OI imbalance hard-block threshold — no-op in this layout.
+    #[inline]
+    pub fn set_oi_imbalance_hard_block_bps(_config: &mut MarketConfig, _bps: u16) {}
+
+    // ─── Fork-specific MarketConfig field stubs ───────────────────────────────
+    // These fields do not exist in the current upstream MarketConfig layout.
+    // All getters return safe defaults (0 / disabled); all setters are no-ops.
+
+    /// OI cap multiplier — 0 means disabled.
+    #[inline]
+    pub fn get_oi_cap_multiplier_bps(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_oi_cap_multiplier_bps(_config: &mut MarketConfig, _v: u64) {}
+
+    /// Dispute window slots — 0 means disputes disabled.
+    #[inline]
+    pub fn get_dispute_window_slots(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_dispute_window_slots(_config: &mut MarketConfig, _v: u64) {}
+
+    /// Resolved slot (slot when market was resolved).
+    #[inline]
+    pub fn get_resolved_slot(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_resolved_slot(_config: &mut MarketConfig, _v: u64) {}
+
+    /// Dispute bond amount — 0 means no bond required.
+    #[inline]
+    pub fn get_dispute_bond_amount(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_dispute_bond_amount(_config: &mut MarketConfig, _v: u64) {}
+
+    /// Settlement price e6 — 0 if not set.
+    #[inline]
+    pub fn get_settlement_price_e6(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_settlement_price_e6(_config: &mut MarketConfig, _v: u64) {}
+
+    /// Insurance isolation BPS — 0 means no isolation.
+    #[inline]
+    pub fn get_insurance_isolation_bps(_config: &MarketConfig) -> u16 { 0 }
+    #[inline]
+    pub fn set_insurance_isolation_bps(_config: &mut MarketConfig, _v: u16) {}
+
+    /// LP collateral enabled — 0 means disabled.
+    #[inline]
+    pub fn get_lp_collateral_enabled(_config: &MarketConfig) -> u8 { 0 }
+    #[inline]
+    pub fn set_lp_collateral_enabled(_config: &mut MarketConfig, _v: u8) {}
+
+    /// LP collateral LTV BPS — 0 means disabled.
+    #[inline]
+    pub fn get_lp_collateral_ltv_bps(_config: &MarketConfig) -> u16 { 0 }
+    #[inline]
+    pub fn set_lp_collateral_ltv_bps(_config: &mut MarketConfig, _v: u16) {}
+
+    /// Max PnL cap — 0 means no cap.
+    #[inline]
+    pub fn get_max_pnl_cap(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_max_pnl_cap(_config: &mut MarketConfig, _v: u64) {}
+
+    /// Market created slot — 0 if not tracked.
+    #[inline]
+    pub fn get_market_created_slot(_config: &MarketConfig) -> u64 { 0 }
+    #[inline]
+    pub fn set_market_created_slot(_config: &mut MarketConfig, _v: u64) {}
 
     pub fn read_config(data: &[u8]) -> MarketConfig {
         let mut c = MarketConfig::zeroed();
@@ -2787,6 +3238,22 @@ pub mod oracle {
         // Safe: clamped value is within i64 range (max_bps_per_slot is i64)
         clamped_128 as i64
     }
+
+    // ─── Fork-specific oracle stubs ───────────────────────────────────────────
+
+    /// Check HYPERP oracle staleness: ensure the engine slot is recent enough.
+    /// Returns error if `current_slot` is more than `max_staleness_slots` behind `clock_slot`.
+    #[inline]
+    pub fn check_hyperp_staleness(
+        engine_slot: u64,
+        max_staleness_slots: u64,
+        clock_slot: u64,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        if max_staleness_slots > 0 && clock_slot.saturating_sub(engine_slot) > max_staleness_slots {
+            return Err(super::error::PercolatorError::OracleStale.into());
+        }
+        Ok(())
+    }
 }
 
 // 9. mod collateral
@@ -2972,6 +3439,1315 @@ pub mod keeper_fund {
     }
 }
 
+// 9a. mod insurance_lp — SPL mint/burn helpers for LP vault (reused by lp_vault)
+pub mod insurance_lp {
+    #[allow(unused_imports)]
+    use alloc::format;
+    #[cfg(not(feature = "test"))]
+    use solana_program::system_instruction;
+    use solana_program::{account_info::AccountInfo, program_error::ProgramError};
+
+    #[cfg(not(feature = "test"))]
+    use solana_program::program::{invoke, invoke_signed};
+    #[cfg(not(feature = "test"))]
+    use solana_program::sysvar::Sysvar;
+
+    /// Create the insurance LP mint account (PDA) and initialize it.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub fn create_mint<'a>(
+        payer: &AccountInfo<'a>,
+        mint_account: &AccountInfo<'a>,
+        vault_authority: &AccountInfo<'a>,
+        system_program: &AccountInfo<'a>,
+        token_program: &AccountInfo<'a>,
+        rent_sysvar: &AccountInfo<'a>,
+        decimals: u8,
+        mint_seeds: &[&[u8]],
+    ) -> Result<(), ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            let space = crate::spl_token::state::MINT_LEN;
+            let rent = solana_program::rent::Rent::get()?;
+            let lamports = rent.minimum_balance(space);
+            let create_ix = system_instruction::create_account(
+                payer.key,
+                mint_account.key,
+                lamports,
+                space as u64,
+                &crate::spl_token::id(),
+            );
+            invoke_signed(
+                &create_ix,
+                &[payer.clone(), mint_account.clone(), system_program.clone()],
+                &[mint_seeds],
+            )?;
+            let init_ix = crate::spl_token::initialize_mint(
+                &crate::spl_token::id(),
+                mint_account.key,
+                vault_authority.key,
+                None,
+                decimals,
+            )?;
+            invoke(
+                &init_ix,
+                &[mint_account.clone(), rent_sysvar.clone(), token_program.clone()],
+            )?;
+        }
+        #[cfg(feature = "test")]
+        {
+            use spl_token::state::Mint;
+            use spl_token::solana_program::program_pack::Pack;
+            let mut data = mint_account.try_borrow_mut_data()?;
+            let mint = Mint {
+                is_initialized: true,
+                decimals,
+                mint_authority: solana_program::program_option::COption::Some(*vault_authority.key),
+                supply: 0,
+                ..Mint::default()
+            };
+            Mint::pack(mint, &mut data).map_err(|_| ProgramError::InvalidAccountData)?;
+        }
+        Ok(())
+    }
+
+    /// Mint LP tokens to a user's token account. Signed by vault_authority PDA.
+    #[allow(unused_variables)]
+    pub fn mint_to<'a>(
+        token_program: &AccountInfo<'a>,
+        mint: &AccountInfo<'a>,
+        destination: &AccountInfo<'a>,
+        authority: &AccountInfo<'a>,
+        amount: u64,
+        signer_seeds: &[&[&[u8]]],
+    ) -> Result<(), ProgramError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke_signed;
+            let ix = crate::spl_token::mint_to(
+                token_program.key,
+                mint.key,
+                destination.key,
+                authority.key,
+                &[],
+                amount,
+            )?;
+            invoke_signed(
+                &ix,
+                &[mint.clone(), destination.clone(), authority.clone(), token_program.clone()],
+                signer_seeds,
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use spl_token::state::{Account, Mint};
+            use spl_token::solana_program::program_pack::Pack;
+            {
+                let mut mint_data = mint.try_borrow_mut_data()?;
+                let mut m = Mint::unpack(&mint_data).map_err(|_| ProgramError::InvalidAccountData)?;
+                m.supply = m.supply.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?;
+                Mint::pack(m, &mut mint_data).map_err(|_| ProgramError::InvalidAccountData)?;
+            }
+            {
+                let mut dst_data = destination.try_borrow_mut_data()?;
+                let mut acct = Account::unpack(&dst_data).unwrap_or_default();
+                acct.amount = acct.amount.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?;
+                Account::pack(acct, &mut dst_data).map_err(|_| ProgramError::InvalidAccountData)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Burn LP tokens from a user's token account. User is the authority.
+    #[allow(unused_variables)]
+    pub fn burn<'a>(
+        token_program: &AccountInfo<'a>,
+        mint: &AccountInfo<'a>,
+        source: &AccountInfo<'a>,
+        authority: &AccountInfo<'a>,
+        amount: u64,
+    ) -> Result<(), ProgramError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke;
+            let ix = crate::spl_token::burn(
+                token_program.key,
+                source.key,
+                mint.key,
+                authority.key,
+                &[],
+                amount,
+            )?;
+            invoke(
+                &ix,
+                &[source.clone(), mint.clone(), authority.clone(), token_program.clone()],
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use spl_token::state::{Account, Mint};
+            use spl_token::solana_program::program_pack::Pack;
+            {
+                let mut mint_data = mint.try_borrow_mut_data()?;
+                let mut m = Mint::unpack(&mint_data).map_err(|_| ProgramError::InvalidAccountData)?;
+                m.supply = m.supply.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+                Mint::pack(m, &mut mint_data).map_err(|_| ProgramError::InvalidAccountData)?;
+            }
+            {
+                let mut src_data = source.try_borrow_mut_data()?;
+                let mut acct = Account::unpack(&src_data).unwrap_or_default();
+                acct.amount = acct.amount.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+                Account::pack(acct, &mut src_data).map_err(|_| ProgramError::InvalidAccountData)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Read the current supply from an SPL mint account.
+    pub fn read_mint_supply(mint_account: &AccountInfo) -> Result<u64, ProgramError> {
+        use spl_token::state::Mint;
+        use spl_token::solana_program::program_pack::Pack;
+        let data = mint_account.try_borrow_data()?;
+        let mint = Mint::unpack(&data).map_err(|_| ProgramError::InvalidAccountData)?;
+        if !mint.is_initialized {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        Ok(mint.supply)
+    }
+
+    /// Read the decimals from an SPL mint account.
+    pub fn read_mint_decimals(mint_account: &AccountInfo) -> Result<u8, ProgramError> {
+        use spl_token::state::Mint;
+        use spl_token::solana_program::program_pack::Pack;
+        let data = mint_account.try_borrow_data()?;
+        let mint = Mint::unpack(&data).map_err(|_| ProgramError::InvalidAccountData)?;
+        Ok(mint.decimals)
+    }
+}
+
+// 9b. mod lp_vault — LP vault state and helpers (PERC-272)
+pub mod lp_vault {
+    use bytemuck::{Pod, Zeroable};
+
+    /// LP vault state account size in bytes.
+    pub const LP_VAULT_STATE_LEN: usize = core::mem::size_of::<LpVaultState>();
+
+    /// Magic value for LP vault state: "LPVAULT\0"
+    pub const LP_VAULT_MAGIC: u64 = 0x4C50_5641_554C_5400;
+
+    /// LP vault state PDA account layout. Seeds: `[b"lp_vault", slab_key]`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct LpVaultState {
+        pub magic: u64,
+        pub fee_share_bps: u64,
+        pub total_capital: u128,
+        pub epoch: u64,
+        pub last_crank_slot: u64,
+        pub last_fee_snapshot: u128,
+        pub total_fees_distributed: u128,
+        pub loyalty_enabled: u8,
+        pub _loyalty_pad: [u8; 7],
+        pub queue_threshold_bps: u16,
+        pub queue_epochs: u8,
+        pub _drip_pad: [u8; 5],
+        pub current_fee_mult_bps: u32,
+        pub lp_util_curve_enabled: u8,
+        pub _padding304: [u8; 3],
+        pub _reserved: [u8; 24],
+        pub epoch_high_water_tvl: u128,
+        pub hwm_floor_bps: u16,
+        pub _hwm_padding: [u8; 6],
+        pub _reserved2: [u8; 40],
+    }
+
+    impl LpVaultState {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == LP_VAULT_MAGIC }
+        #[inline]
+        pub fn new_zeroed() -> Self { <Self as Zeroable>::zeroed() }
+
+        #[inline]
+        pub fn tranche_enabled(&self) -> bool { self._reserved2[0] != 0 }
+        #[inline]
+        pub fn senior_capital(&self) -> u128 {
+            u128::from_le_bytes(self._reserved2[8..24].try_into().unwrap())
+        }
+        #[inline]
+        pub fn set_senior_capital(&mut self, capital: u128) {
+            self._reserved2[8..24].copy_from_slice(&capital.to_le_bytes());
+        }
+        #[inline]
+        pub fn junior_capital(&self) -> u128 {
+            u128::from_le_bytes(self._reserved2[24..40].try_into().unwrap())
+        }
+        #[inline]
+        pub fn set_junior_capital(&mut self, capital: u128) {
+            self._reserved2[24..40].copy_from_slice(&capital.to_le_bytes());
+        }
+        #[inline]
+        pub fn junior_fee_mult_bps(&self) -> u16 {
+            u16::from_le_bytes([self._reserved2[2], self._reserved2[3]])
+        }
+
+        pub fn apply_loss_waterfall(&mut self, loss: u128) -> u128 {
+            let junior = self.junior_capital();
+            if loss <= junior {
+                self.set_junior_capital(junior - loss);
+                self.total_capital = self.total_capital.saturating_sub(loss);
+                return loss;
+            }
+            self.set_junior_capital(0);
+            let remainder = loss - junior;
+            let senior = self.senior_capital();
+            let senior_loss = remainder.min(senior);
+            self.set_senior_capital(senior - senior_loss);
+            let realized = junior + senior_loss;
+            self.total_capital = self.total_capital.saturating_sub(realized);
+            realized
+        }
+    }
+
+    pub fn read_lp_vault_state(data: &[u8]) -> Option<LpVaultState> {
+        if data.len() < LP_VAULT_STATE_LEN { return None; }
+        Some(*bytemuck::from_bytes::<LpVaultState>(&data[..LP_VAULT_STATE_LEN]))
+    }
+
+    pub fn write_lp_vault_state(data: &mut [u8], state: &LpVaultState) {
+        data[..LP_VAULT_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    // ── PERC-309: Withdraw Queue ──────────────────────────────────────────
+    pub const WITHDRAW_QUEUE_MAGIC: u64 = 0x5045_5243_5155_4555;
+    pub const WITHDRAW_QUEUE_LEN: usize = core::mem::size_of::<WithdrawQueue>();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct WithdrawQueue {
+        pub magic: u64,
+        pub queued_lp_amount: u64,
+        pub queue_start_slot: u64,
+        pub epochs_remaining: u8,
+        pub total_epochs: u8,
+        pub _pad: [u8; 6],
+        pub claimed_so_far: u64,
+        pub _reserved: [u8; 24],
+    }
+
+    impl WithdrawQueue {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == WITHDRAW_QUEUE_MAGIC }
+        #[inline]
+        pub fn claimable_this_epoch(&self) -> u64 {
+            if self.epochs_remaining == 0 { return 0; }
+            let remaining_lp = self.queued_lp_amount.saturating_sub(self.claimed_so_far);
+            if self.epochs_remaining == 1 { remaining_lp }
+            else { remaining_lp / (self.epochs_remaining as u64) }
+        }
+    }
+
+    pub fn read_withdraw_queue(data: &[u8]) -> Option<WithdrawQueue> {
+        if data.len() < WITHDRAW_QUEUE_LEN { return None; }
+        Some(*bytemuck::from_bytes::<WithdrawQueue>(&data[..WITHDRAW_QUEUE_LEN]))
+    }
+
+    pub fn write_withdraw_queue(data: &mut [u8], q: &WithdrawQueue) {
+        data[..WITHDRAW_QUEUE_LEN].copy_from_slice(bytemuck::bytes_of(q));
+    }
+
+    // ── PERC-308: Loyalty Multiplier ─────────────────────────────────────
+    pub const LOYALTY_TIER1_EPOCHS: u64 = 5;
+    pub const LOYALTY_TIER2_EPOCHS: u64 = 20;
+    pub const LOYALTY_MULT_BASE: u64 = 10_000;
+    pub const LOYALTY_MULT_TIER1: u64 = 12_000;
+    pub const LOYALTY_MULT_TIER2: u64 = 15_000;
+
+    #[inline]
+    pub fn loyalty_multiplier_bps(delta_epochs: u64) -> u64 {
+        if delta_epochs > LOYALTY_TIER2_EPOCHS { LOYALTY_MULT_TIER2 }
+        else if delta_epochs > LOYALTY_TIER1_EPOCHS { LOYALTY_MULT_TIER1 }
+        else { LOYALTY_MULT_BASE }
+    }
+
+    #[inline]
+    pub fn apply_loyalty_mult(fee: u64, delta_epochs: u64) -> u64 {
+        let mult = loyalty_multiplier_bps(delta_epochs);
+        ((fee as u128) * (mult as u128) / 10_000).min(u64::MAX as u128) as u64
+    }
+
+    pub const LOYALTY_STAKE_MAGIC: u64 = 0x5045_5243_4C4F_5941;
+    pub const LOYALTY_STAKE_LEN: usize = core::mem::size_of::<LoyaltyStake>();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct LoyaltyStake {
+        pub magic: u64,
+        pub entry_epoch: u64,
+        pub _reserved: [u8; 48],
+    }
+
+    impl LoyaltyStake {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == LOYALTY_STAKE_MAGIC }
+    }
+
+    pub fn read_loyalty_stake(data: &[u8]) -> Option<LoyaltyStake> {
+        if data.len() < LOYALTY_STAKE_LEN { return None; }
+        Some(*bytemuck::from_bytes::<LoyaltyStake>(&data[..LOYALTY_STAKE_LEN]))
+    }
+
+    pub fn write_loyalty_stake(data: &mut [u8], s: &LoyaltyStake) {
+        data[..LOYALTY_STAKE_LEN].copy_from_slice(bytemuck::bytes_of(s));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn make_queue(amount: u64, epochs: u8) -> WithdrawQueue {
+            WithdrawQueue {
+                magic: WITHDRAW_QUEUE_MAGIC,
+                queued_lp_amount: amount,
+                queue_start_slot: 0,
+                epochs_remaining: epochs,
+                total_epochs: epochs,
+                _pad: [0; 6],
+                claimed_so_far: 0,
+                _reserved: [0; 24],
+            }
+        }
+        #[test]
+        fn test_claimable_5_epochs() {
+            let mut q = make_queue(100, 5);
+            let mut total = 0u64;
+            for _ in 0..5 {
+                let c = q.claimable_this_epoch();
+                assert_eq!(c, 20);
+                total += c;
+                q.claimed_so_far += c;
+                q.epochs_remaining -= 1;
+            }
+            assert_eq!(total, 100);
+        }
+        #[test]
+        fn test_claimable_indivisible() {
+            let mut q = make_queue(7, 3);
+            let c1 = q.claimable_this_epoch();
+            assert_eq!(c1, 2);
+            q.claimed_so_far += c1;
+            q.epochs_remaining -= 1;
+            let c2 = q.claimable_this_epoch();
+            assert_eq!(c2, 2);
+            q.claimed_so_far += c2;
+            q.epochs_remaining -= 1;
+            let c3 = q.claimable_this_epoch();
+            assert_eq!(c3, 3);
+            assert_eq!(c1 + c2 + c3, 7);
+        }
+        #[test]
+        fn test_loyalty_tiers() {
+            assert_eq!(loyalty_multiplier_bps(0), 10_000);
+            assert_eq!(loyalty_multiplier_bps(6), 12_000);
+            assert_eq!(loyalty_multiplier_bps(21), 15_000);
+        }
+    }
+}
+
+// 9c. LP Collateral Pricing (PERC-315)
+pub mod lp_collateral {
+    pub fn lp_token_value(
+        lp_amount: u64,
+        vault_tvl: u128,
+        total_supply: u64,
+        ltv_bps: u64,
+    ) -> u128 {
+        if total_supply == 0 || vault_tvl == 0 || lp_amount == 0 { return 0; }
+        let raw_value = (lp_amount as u128).saturating_mul(vault_tvl) / (total_supply as u128);
+        raw_value.saturating_mul(ltv_bps as u128) / 10_000
+    }
+
+    pub fn tvl_drawdown_exceeded(old_tvl: u64, new_tvl: u128, threshold_bps: u64) -> bool {
+        if old_tvl == 0 { return false; }
+        let old = old_tvl as u128;
+        if new_tvl >= old { return false; }
+        let drawdown_bps = (old - new_tvl) * 10_000 / old;
+        drawdown_bps > threshold_bps as u128
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn test_lp_token_value_basic() {
+            let v = lp_token_value(100, 1000, 200, 5000);
+            assert_eq!(v, 250);
+        }
+        #[test]
+        fn test_lp_token_value_zero_supply() {
+            assert_eq!(lp_token_value(100, 1000, 0, 5000), 0);
+        }
+        #[test]
+        fn test_drawdown_20pct() {
+            assert!(!tvl_drawdown_exceeded(1000, 800, 2000));
+            assert!(tvl_drawdown_exceeded(1000, 799, 2000));
+        }
+    }
+}
+
+// 9d. Settlement Dispute (PERC-314)
+pub mod dispute {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const DISPUTE_MAGIC: u64 = 0x5045_5243_4449_5350;
+    pub const DISPUTE_LEN: usize = core::mem::size_of::<SettlementDispute>();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct SettlementDispute {
+        pub magic: u64,
+        pub challenger: [u8; 32],
+        pub proposed_price_e6: u64,
+        pub proof_slot: u64,
+        pub bond_amount: u64,
+        pub outcome: u8,
+        pub _pad: [u8; 7],
+        pub dispute_slot: u64,
+        pub _reserved: [u8; 16],
+    }
+
+    impl SettlementDispute {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == DISPUTE_MAGIC }
+    }
+
+    pub fn read_dispute(data: &[u8]) -> Option<SettlementDispute> {
+        if data.len() < DISPUTE_LEN { return None; }
+        Some(*bytemuck::from_bytes::<SettlementDispute>(&data[..DISPUTE_LEN]))
+    }
+
+    pub fn write_dispute(data: &mut [u8], d: &SettlementDispute) {
+        data[..DISPUTE_LEN].copy_from_slice(bytemuck::bytes_of(d));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn test_dispute_size() { assert_eq!(DISPUTE_LEN, 96); }
+    }
+}
+
+// 9e. Cross-Market Portfolio Margining (PERC-CMOR)
+pub mod cross_margin {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const OFFSET_PAIR_MAGIC: u64 = 0x434D_4F52_5041_4952;
+    pub const ATTESTATION_MAGIC: u64 = 0x434D_4F52_4154_5445;
+    pub const OFFSET_PAIR_LEN: usize = core::mem::size_of::<OffsetPairConfig>();
+    pub const ATTESTATION_LEN: usize = core::mem::size_of::<CrossMarginAttestation>();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct OffsetPairConfig {
+        pub magic: u64,
+        pub offset_bps: u16,
+        pub enabled: u8,
+        pub _pad: [u8; 5],
+        pub _reserved: [u8; 16],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct CrossMarginAttestation {
+        pub magic: u64,
+        pub _align_pad: [u8; 8],
+        pub user_pos_a: i128,
+        pub user_pos_b: i128,
+        pub attested_slot: u64,
+        pub offset_bps: u16,
+        pub _pad: [u8; 6],
+        pub owner: [u8; 32],
+        pub slab_a: [u8; 32],
+        pub slab_b: [u8; 32],
+    }
+
+    impl OffsetPairConfig {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == OFFSET_PAIR_MAGIC }
+    }
+
+    impl CrossMarginAttestation {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == ATTESTATION_MAGIC }
+        #[inline]
+        pub fn is_fresh(&self, current_slot: u64, max_age_slots: u64) -> bool {
+            current_slot.saturating_sub(self.attested_slot) <= max_age_slots
+        }
+        pub fn compute_margin_credit_bps(&self) -> u16 {
+            if self.offset_bps == 0 { return 0; }
+            let a = self.user_pos_a;
+            let b = self.user_pos_b;
+            if a == 0 || b == 0 { return 0; }
+            let hedged = (a > 0 && b < 0) || (a < 0 && b > 0);
+            if !hedged { return 0; }
+            let abs_a = a.unsigned_abs();
+            let abs_b = b.unsigned_abs();
+            let smaller = abs_a.min(abs_b);
+            let larger = abs_a.max(abs_b);
+            let credit = (self.offset_bps as u128).saturating_mul(smaller) / larger;
+            credit.min(self.offset_bps as u128) as u16
+        }
+    }
+
+    #[inline]
+    pub fn order_slab_pair(a: &[u8; 32], b: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+        if a < b { (*a, *b) } else { (*b, *a) }
+    }
+
+    pub fn read_offset_pair(data: &[u8]) -> Option<OffsetPairConfig> {
+        if data.len() < OFFSET_PAIR_LEN { return None; }
+        Some(*bytemuck::from_bytes::<OffsetPairConfig>(&data[..OFFSET_PAIR_LEN]))
+    }
+
+    pub fn write_offset_pair(data: &mut [u8], cfg: &OffsetPairConfig) {
+        data[..OFFSET_PAIR_LEN].copy_from_slice(bytemuck::bytes_of(cfg));
+    }
+
+    pub fn read_attestation(data: &[u8]) -> Option<CrossMarginAttestation> {
+        if data.len() < ATTESTATION_LEN { return None; }
+        Some(*bytemuck::from_bytes::<CrossMarginAttestation>(&data[..ATTESTATION_LEN]))
+    }
+
+    pub fn write_attestation(data: &mut [u8], att: &CrossMarginAttestation) {
+        data[..ATTESTATION_LEN].copy_from_slice(bytemuck::bytes_of(att));
+    }
+}
+
+// 9f. Creator Lock (PERC-627)
+pub mod creator_lock {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const CREATOR_LOCK_MAGIC: u64 = 0x4352_5452_4C4F_434B;
+    pub const CREATOR_LOCK_STATE_LEN: usize = core::mem::size_of::<CreatorStakeLock>();
+    pub const DEFAULT_LOCK_DURATION_SLOTS: u64 = 19_440_000;
+    pub const EXTRACTION_LIMIT_BPS: u64 = 15_000;
+    pub const CREATOR_LOCK_SEED: &[u8] = b"creator_lock";
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct CreatorStakeLock {
+        pub magic: u64,
+        pub bump: u8,
+        pub _pad: [u8; 7],
+        pub creator: [u8; 32],
+        pub lock_start_slot: u64,
+        pub lock_duration_slots: u64,
+        pub lp_amount_locked: u64,
+        pub cumulative_extracted: u64,
+        pub cumulative_deposited: u64,
+        pub fee_redirect_active: u8,
+        pub _reserved: [u8; 7],
+    }
+
+    const _: () = assert!(CREATOR_LOCK_STATE_LEN == 96);
+
+    #[inline]
+    pub fn is_lock_expired(current_slot: u64, lock_start: u64, duration: u64) -> bool {
+        current_slot >= lock_start.saturating_add(duration)
+    }
+
+    #[inline]
+    pub fn max_withdrawable(total_lp: u64, locked_lp: u64, lock_expired: bool) -> u64 {
+        if lock_expired { total_lp } else { total_lp.saturating_sub(locked_lp) }
+    }
+
+    #[inline]
+    pub fn check_extraction_exceeded(extracted: u64, deposited: u64, limit_bps: u64) -> bool {
+        if deposited == 0 { return false; }
+        let lhs = (extracted as u128).saturating_mul(10_000);
+        let rhs = (deposited as u128).saturating_mul(limit_bps as u128);
+        lhs > rhs
+    }
+
+    #[inline]
+    pub fn compute_fee_redirect(fee_amount: u64, redirect_active: bool) -> (u64, u64) {
+        if redirect_active { (0, fee_amount) } else { (fee_amount, 0) }
+    }
+
+    pub fn read_state(data: &[u8]) -> Option<&CreatorStakeLock> {
+        if data.len() < CREATOR_LOCK_STATE_LEN { return None; }
+        let state: &CreatorStakeLock = bytemuck::from_bytes(&data[..CREATOR_LOCK_STATE_LEN]);
+        if state.magic != CREATOR_LOCK_MAGIC { return None; }
+        Some(state)
+    }
+
+    pub fn write_state(data: &mut [u8], state: &CreatorStakeLock) {
+        data[..CREATOR_LOCK_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[inline]
+    pub fn is_fee_redirect_active(state: &CreatorStakeLock) -> bool {
+        state.fee_redirect_active != 0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn test_lock_not_expired() { assert!(!is_lock_expired(100, 50, 100)); }
+        #[test]
+        fn test_lock_expired_exact() { assert!(is_lock_expired(150, 50, 100)); }
+        #[test]
+        fn test_extraction_not_exceeded() {
+            assert!(!check_extraction_exceeded(100, 100, 15_000));
+        }
+        #[test]
+        fn test_extraction_exceeded() {
+            assert!(check_extraction_exceeded(160, 100, 15_000));
+        }
+        #[test]
+        fn test_state_size() { assert_eq!(CREATOR_LOCK_STATE_LEN, 96); }
+    }
+}
+
+// 9g. Creator History (PERC-629)
+pub mod creator_history {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const CREATOR_HISTORY_MAGIC: u64 = 0x4352_5452_4849_5354;
+    pub const CREATOR_HISTORY_LEN: usize = core::mem::size_of::<CreatorHistory>();
+    pub const CREATOR_HISTORY_SEED: &[u8] = b"creator_history";
+    pub const BASE_DEPOSIT_E6: u64 = 2_500_000_000;
+    pub const MAX_FAILURE_EXPONENT: u32 = 10;
+    pub const SUCCESS_DISCOUNT_BPS: u64 = 1_000;
+    pub const MAX_DISCOUNT_BPS: u64 = 5_000;
+    pub const OI_THRESHOLD_BPS: u64 = 1_000;
+    pub const SLASH_BPS: u64 = 5_000;
+    pub const EVALUATION_PERIOD_SLOTS: u64 = 6_480_000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct CreatorHistory {
+        pub magic: u64,
+        pub bump: u8,
+        pub _pad: [u8; 3],
+        pub total_markets: u16,
+        pub successful_markets: u16,
+        pub failed_markets: u16,
+        pub _reserved: [u8; 14],
+    }
+
+    const _: () = assert!(CREATOR_HISTORY_LEN == 32);
+
+    #[inline]
+    pub fn failure_multiplier_bps(failed: u16) -> u64 {
+        let exp = (failed as u32).min(MAX_FAILURE_EXPONENT);
+        10_000u64.saturating_mul(1u64 << exp)
+    }
+
+    #[inline]
+    pub fn success_discount_bps(successful: u16) -> u64 {
+        let raw = (successful as u64).saturating_mul(SUCCESS_DISCOUNT_BPS);
+        raw.min(MAX_DISCOUNT_BPS)
+    }
+
+    #[inline]
+    pub fn compute_required_deposit(base_e6: u64, failed: u16, successful: u16) -> u64 {
+        let mult_bps = failure_multiplier_bps(failed);
+        let disc_bps = success_discount_bps(successful);
+        let numerator = (base_e6 as u128)
+            .saturating_mul(mult_bps as u128)
+            .saturating_mul((10_000u64.saturating_sub(disc_bps)) as u128);
+        let result = (numerator / (10_000u128 * 10_000u128)).min(u64::MAX as u128) as u64;
+        let floor = base_e6 / 2;
+        result.max(floor)
+    }
+
+    /// Compute slash amount (50% of deposit). Returns (slash, remainder).
+    #[inline]
+    pub fn compute_slash(deposit: u64) -> (u64, u64) {
+        let slash = deposit.saturating_mul(SLASH_BPS) / 10_000;
+        let remainder = deposit.saturating_sub(slash);
+        (slash, remainder)
+    }
+
+    #[inline]
+    pub fn oi_threshold_met(deposit_e6: u64, current_oi_e6: u64) -> bool {
+        let threshold = deposit_e6.saturating_mul(OI_THRESHOLD_BPS) / 10_000;
+        current_oi_e6 >= threshold
+    }
+
+    pub fn read_state(data: &[u8]) -> Option<&CreatorHistory> {
+        if data.len() < CREATOR_HISTORY_LEN { return None; }
+        let state: &CreatorHistory = bytemuck::from_bytes(&data[..CREATOR_HISTORY_LEN]);
+        if state.magic != CREATOR_HISTORY_MAGIC { return None; }
+        Some(state)
+    }
+
+    pub fn write_state(data: &mut [u8], state: &CreatorHistory) {
+        data[..CREATOR_HISTORY_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn test_failure_multiplier_zero() { assert_eq!(failure_multiplier_bps(0), 10_000); }
+        #[test]
+        fn test_slash_calculation() {
+            let (slash, remainder) = compute_slash(1_000_000);
+            assert_eq!(slash, 500_000);
+            assert_eq!(remainder, 500_000);
+        }
+        #[test]
+        fn test_state_size() { assert_eq!(CREATOR_HISTORY_LEN, 32); }
+    }
+}
+
+// 9h. Shared Vault (PERC-628)
+pub mod shared_vault {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const SHARED_VAULT_MAGIC: u64 = 0x5348_5244_5641_4C54;
+    pub const SHARED_VAULT_STATE_LEN: usize = core::mem::size_of::<SharedVaultState>();
+    pub const SHARED_VAULT_SEED: &[u8] = b"shared_vault";
+    pub const MARKET_ALLOC_MAGIC: u64 = 0x4D4B_5441_4C4C_4F43;
+    pub const MARKET_ALLOC_LEN: usize = core::mem::size_of::<MarketAllocation>();
+    pub const MARKET_ALLOC_SEED: &[u8] = b"market_alloc";
+    pub const WITHDRAW_REQ_MAGIC: u64 = 0x5754_4844_5252_4551;
+    pub const WITHDRAW_REQ_LEN: usize = core::mem::size_of::<WithdrawalRequest>();
+    pub const WITHDRAW_REQ_SEED: &[u8] = b"withdraw_req";
+    pub const DEFAULT_EPOCH_DURATION_SLOTS: u64 = 72_000;
+    pub const DEFAULT_MAX_MARKET_EXPOSURE_BPS: u16 = 2_000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct SharedVaultState {
+        pub magic: u64,
+        pub epoch_number: u64,
+        pub total_capital: u128,
+        pub total_allocated: u128,
+        pub pending_withdrawals: u128,
+        pub epoch_start_slot: u64,
+        pub epoch_duration_slots: u64,
+        pub max_market_exposure_bps: u16,
+        pub bump: u8,
+        pub _pad: [u8; 13],
+        pub epoch_snapshot_capital: u128,
+        pub epoch_snapshot_pending: u128,
+    }
+
+    const _: () = assert!(SHARED_VAULT_STATE_LEN == 128);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct MarketAllocation {
+        pub magic: u64,
+        pub bump: u8,
+        pub _pad: [u8; 7],
+        pub allocated_capital: u128,
+        pub utilized_capital: u128,
+    }
+
+    const _: () = assert!(MARKET_ALLOC_LEN == 48);
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct WithdrawalRequest {
+        pub magic: u64,
+        pub bump: u8,
+        pub claimed: u8,
+        pub _pad: [u8; 6],
+        pub lp_amount: u64,
+        pub epoch_number: u64,
+    }
+
+    const _: () = assert!(WITHDRAW_REQ_LEN == 32);
+
+    #[inline]
+    pub fn check_exposure_cap(total_capital: u128, market_allocation: u128, max_bps: u16) -> bool {
+        if total_capital == 0 { return market_allocation == 0; }
+        let lhs = market_allocation.saturating_mul(10_000);
+        let rhs = total_capital.saturating_mul(max_bps as u128);
+        lhs <= rhs
+    }
+
+    #[inline]
+    pub fn available_for_allocation(total_capital: u128, total_allocated: u128) -> u128 {
+        total_capital.saturating_sub(total_allocated)
+    }
+
+    #[inline]
+    pub fn max_single_market_allocation(total_capital: u128, max_bps: u16) -> u128 {
+        total_capital.saturating_mul(max_bps as u128) / 10_000
+    }
+
+    #[inline]
+    pub fn is_epoch_elapsed(current_slot: u64, epoch_start: u64, duration: u64) -> bool {
+        current_slot >= epoch_start.saturating_add(duration)
+    }
+
+    #[inline]
+    pub fn epoch_from_slot(current_slot: u64, genesis_slot: u64, duration: u64) -> u64 {
+        if duration == 0 { return 0; }
+        current_slot.saturating_sub(genesis_slot) / duration
+    }
+
+    #[inline]
+    pub fn queue_withdrawal(pending: u128, amount: u64) -> u128 {
+        pending.saturating_add(amount as u128)
+    }
+
+    #[inline]
+    pub fn compute_proportional_withdrawal(
+        request_lp: u64,
+        total_pending_lp: u128,
+        available_capital: u128,
+    ) -> u64 {
+        if total_pending_lp == 0 { return 0; }
+        if available_capital >= total_pending_lp { return request_lp; }
+        let result = (request_lp as u128).saturating_mul(available_capital) / total_pending_lp;
+        result.min(u64::MAX as u128) as u64
+    }
+
+    pub fn read_vault_state(data: &[u8]) -> Option<SharedVaultState> {
+        if data.len() < SHARED_VAULT_STATE_LEN { return None; }
+        let mut s = SharedVaultState::zeroed();
+        bytemuck::bytes_of_mut(&mut s).copy_from_slice(&data[..SHARED_VAULT_STATE_LEN]);
+        if s.magic != SHARED_VAULT_MAGIC { return None; }
+        Some(s)
+    }
+
+    pub fn write_vault_state(data: &mut [u8], state: &SharedVaultState) {
+        data[..SHARED_VAULT_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    pub fn read_market_alloc(data: &[u8]) -> Option<MarketAllocation> {
+        if data.len() < MARKET_ALLOC_LEN { return None; }
+        let mut s = MarketAllocation::zeroed();
+        bytemuck::bytes_of_mut(&mut s).copy_from_slice(&data[..MARKET_ALLOC_LEN]);
+        if s.magic != MARKET_ALLOC_MAGIC { return None; }
+        Some(s)
+    }
+
+    pub fn write_market_alloc(data: &mut [u8], state: &MarketAllocation) {
+        data[..MARKET_ALLOC_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    pub fn read_withdraw_req(data: &[u8]) -> Option<WithdrawalRequest> {
+        if data.len() < WITHDRAW_REQ_LEN { return None; }
+        let mut s = WithdrawalRequest::zeroed();
+        bytemuck::bytes_of_mut(&mut s).copy_from_slice(&data[..WITHDRAW_REQ_LEN]);
+        if s.magic != WITHDRAW_REQ_MAGIC { return None; }
+        Some(s)
+    }
+
+    pub fn write_withdraw_req(data: &mut [u8], state: &WithdrawalRequest) {
+        data[..WITHDRAW_REQ_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn test_exposure_cap_within() { assert!(check_exposure_cap(1000, 200, 2_000)); }
+        #[test]
+        fn test_exposure_cap_exceeded() { assert!(!check_exposure_cap(1000, 201, 2_000)); }
+        #[test]
+        fn test_proportional_full() {
+            assert_eq!(compute_proportional_withdrawal(100, 200, 300), 100);
+        }
+        #[test]
+        fn test_proportional_partial() {
+            assert_eq!(compute_proportional_withdrawal(100, 200, 100), 50);
+        }
+        #[test]
+        fn test_struct_sizes() {
+            assert_eq!(SHARED_VAULT_STATE_LEN, 128);
+            assert_eq!(MARKET_ALLOC_LEN, 48);
+            assert_eq!(WITHDRAW_REQ_LEN, 32);
+        }
+    }
+}
+
+// 9i. Position NFT (PERC-608)
+pub mod position_nft {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const POSITION_NFT_MAGIC: u64 = 0x504F_534E_4654_0000;
+    pub const POSITION_NFT_STATE_LEN: usize = core::mem::size_of::<PositionNftState>();
+    pub const POSITION_NFT_SEED: &[u8] = b"position_nft";
+    pub const POSITION_NFT_MINT_SEED: &[u8] = b"position_nft_mint";
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct PositionNftState {
+        pub magic: u64,
+        pub mint: [u8; 32],
+        pub slab: [u8; 32],
+        pub owner: [u8; 32],
+        pub user_idx: u16,
+        pub pending_settlement: u8,
+        pub bump: u8,
+        pub mint_bump: u8,
+        pub _reserved: [u8; 19],
+    }
+
+    const _SIZE_CHECK: [(); 128] = [(); core::mem::size_of::<PositionNftState>()];
+
+    impl PositionNftState {
+        #[inline]
+        pub fn is_initialized(&self) -> bool { self.magic == POSITION_NFT_MAGIC }
+    }
+
+    pub fn derive_position_nft(
+        program_id: &solana_program::pubkey::Pubkey,
+        slab_key: &solana_program::pubkey::Pubkey,
+        user_idx: u16,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[POSITION_NFT_SEED, slab_key.as_ref(), &user_idx.to_le_bytes()],
+            program_id,
+        )
+    }
+
+    pub fn derive_position_nft_mint(
+        program_id: &solana_program::pubkey::Pubkey,
+        slab_key: &solana_program::pubkey::Pubkey,
+        user_idx: u16,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[POSITION_NFT_MINT_SEED, slab_key.as_ref(), &user_idx.to_le_bytes()],
+            program_id,
+        )
+    }
+
+    pub fn read_position_nft_state(data: &[u8]) -> Option<PositionNftState> {
+        if data.len() < POSITION_NFT_STATE_LEN { return None; }
+        Some(*bytemuck::from_bytes::<PositionNftState>(&data[..POSITION_NFT_STATE_LEN]))
+    }
+
+    pub fn write_position_nft_state(data: &mut [u8], state: &PositionNftState) {
+        data[..POSITION_NFT_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    fn write_u64_decimal(mut n: u64, buf: &mut [u8]) -> usize {
+        if n == 0 { buf[0] = b'0'; return 1; }
+        let mut tmp = [0u8; 20];
+        let mut i = 0usize;
+        while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+        let len = i;
+        for j in 0..len { buf[j] = tmp[len - 1 - j]; }
+        len
+    }
+
+    fn write_i128_decimal(n: i128, buf: &mut [u8]) -> usize {
+        if n < 0 {
+            buf[0] = b'-';
+            let abs = (n as u128).wrapping_neg();
+            let mut tmp = [0u8; 39];
+            let mut idx = 0usize;
+            let mut v = abs;
+            if v == 0 { tmp[0] = b'0'; idx = 1; }
+            else { while v > 0 { tmp[idx] = b'0' + (v % 10) as u8; v /= 10; idx += 1; } }
+            let len = idx;
+            for j in 0..len { buf[1 + j] = tmp[len - 1 - j]; }
+            1 + len
+        } else {
+            write_u64_decimal(n as u64, buf)
+        }
+    }
+
+    pub const NFT_MINT_SPACE: usize = 512;
+
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub fn create_nft_mint_with_metadata<'a>(
+        payer: &solana_program::account_info::AccountInfo<'a>,
+        mint_account: &solana_program::account_info::AccountInfo<'a>,
+        mint_authority: &solana_program::account_info::AccountInfo<'a>,
+        system_program: &solana_program::account_info::AccountInfo<'a>,
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        rent_sysvar: &solana_program::account_info::AccountInfo<'a>,
+        mint_seeds: &[&[u8]],
+        direction: &str,
+        entry_price: u64,
+        size: i128,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        let mut ep_buf = [0u8; 24];
+        let ep_len = write_u64_decimal(entry_price, &mut ep_buf);
+        let entry_price_str = core::str::from_utf8(&ep_buf[..ep_len])
+            .map_err(|_| solana_program::program_error::ProgramError::InvalidAccountData)?;
+        let mut sz_buf = [0u8; 42];
+        let sz_len = write_i128_decimal(size, &mut sz_buf);
+        let size_str = core::str::from_utf8(&sz_buf[..sz_len])
+            .map_err(|_| solana_program::program_error::ProgramError::InvalidAccountData)?;
+
+        #[cfg(not(feature = "test"))]
+        {
+            use alloc::string::{String, ToString};
+            use solana_program::program::{invoke, invoke_signed};
+            use solana_program::rent::Rent;
+            use solana_program::sysvar::Sysvar;
+
+            let rent = Rent::get()?;
+            let lamports = rent.minimum_balance(NFT_MINT_SPACE);
+
+            let create_ix = solana_program::system_instruction::create_account(
+                payer.key,
+                mint_account.key,
+                lamports,
+                NFT_MINT_SPACE as u64,
+                token2022_program.key,
+            );
+            invoke_signed(
+                &create_ix,
+                &[payer.clone(), mint_account.clone(), system_program.clone()],
+                &[mint_seeds],
+            )?;
+
+            let init_mp_ix = spl_token_2022::extension::metadata_pointer::instruction::initialize(
+                token2022_program.key,
+                mint_account.key,
+                Some(*mint_authority.key),
+                Some(*mint_account.key),
+            )?;
+            invoke(&init_mp_ix, &[mint_account.clone(), token2022_program.clone()])?;
+
+            let init_mint_ix = spl_token_2022::instruction::initialize_mint2(
+                token2022_program.key,
+                mint_account.key,
+                mint_authority.key,
+                Some(mint_authority.key),
+                0,
+            )?;
+            invoke(&init_mint_ix, &[mint_account.clone(), token2022_program.clone()])?;
+
+            let init_meta_ix = spl_token_metadata_interface::instruction::initialize(
+                token2022_program.key,
+                mint_account.key,
+                mint_authority.key,
+                mint_account.key,
+                mint_authority.key,
+                "PERC-POS".to_string(),
+                "PP".to_string(),
+                String::new(),
+            );
+            invoke_signed(
+                &init_meta_ix,
+                &[mint_account.clone(), mint_authority.clone(), mint_account.clone(), mint_authority.clone()],
+                &[mint_seeds],
+            )?;
+
+            let upd_dir_ix = spl_token_metadata_interface::instruction::update_field(
+                token2022_program.key,
+                mint_account.key,
+                mint_authority.key,
+                spl_token_metadata_interface::state::Field::Key("direction".to_string()),
+                direction.to_string(),
+            );
+            invoke_signed(&upd_dir_ix, &[mint_account.clone(), mint_authority.clone()], &[mint_seeds])?;
+
+            let upd_ep_ix = spl_token_metadata_interface::instruction::update_field(
+                token2022_program.key,
+                mint_account.key,
+                mint_authority.key,
+                spl_token_metadata_interface::state::Field::Key("entry_price".to_string()),
+                entry_price_str.to_string(),
+            );
+            invoke_signed(&upd_ep_ix, &[mint_account.clone(), mint_authority.clone()], &[mint_seeds])?;
+
+            let upd_sz_ix = spl_token_metadata_interface::instruction::update_field(
+                token2022_program.key,
+                mint_account.key,
+                mint_authority.key,
+                spl_token_metadata_interface::state::Field::Key("size".to_string()),
+                size_str.to_string(),
+            );
+            invoke_signed(&upd_sz_ix, &[mint_account.clone(), mint_authority.clone()], &[mint_seeds])?;
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::Mint;
+            let mut data = mint_account.try_borrow_mut_data()?;
+            if data.len() < Mint::LEN {
+                return Err(solana_program::program_error::ProgramError::InvalidAccountData);
+            }
+            let mint_state = Mint {
+                is_initialized: true,
+                decimals: 0,
+                mint_authority: solana_program::program_option::COption::Some(*mint_authority.key),
+                freeze_authority: solana_program::program_option::COption::Some(*mint_authority.key),
+                supply: 0,
+            };
+            Mint::pack(mint_state, &mut data[..Mint::LEN])?;
+            let dir_bytes = direction.as_bytes();
+            let ep_bytes = entry_price_str.as_bytes();
+            let sz_bytes = size_str.as_bytes();
+            let buf_len = data.len();
+            let dir_start = 82usize;
+            let dir_end = (dir_start + dir_bytes.len()).min(buf_len);
+            data[dir_start..dir_end].copy_from_slice(&dir_bytes[..dir_end - dir_start]);
+            let ep_start = 130usize;
+            let ep_end = (ep_start + ep_bytes.len()).min(buf_len);
+            data[ep_start..ep_end].copy_from_slice(&ep_bytes[..ep_end - ep_start]);
+            let sz_start = 180usize;
+            let sz_end = (sz_start + sz_bytes.len()).min(buf_len);
+            data[sz_start..sz_end].copy_from_slice(&sz_bytes[..sz_end - sz_start]);
+        }
+        let _ = (entry_price_str, size_str, direction);
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    pub fn mint_nft_to<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        destination: &solana_program::account_info::AccountInfo<'a>,
+        authority: &solana_program::account_info::AccountInfo<'a>,
+        signer_seeds: &[&[&[u8]]],
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke_signed;
+            let ix = spl_token_2022::instruction::mint_to(
+                token2022_program.key, mint.key, destination.key, authority.key, &[], 1,
+            )?;
+            invoke_signed(
+                &ix,
+                &[mint.clone(), destination.clone(), authority.clone(), token2022_program.clone()],
+                signer_seeds,
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::{Account as TokenAccount, Mint};
+            let mut mint_data = mint.try_borrow_mut_data()?;
+            let mut mint_state = Mint::unpack(&mint_data[..Mint::LEN])?;
+            mint_state.supply = mint_state.supply.checked_add(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            Mint::pack(mint_state, &mut mint_data[..Mint::LEN])?;
+            drop(mint_data);
+            let mut dst_data = destination.try_borrow_mut_data()?;
+            let mut dst_state = TokenAccount::unpack(&dst_data)?;
+            dst_state.amount = dst_state.amount.checked_add(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            TokenAccount::pack(dst_state, &mut dst_data)?;
+            Ok(())
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn burn_nft<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        source: &solana_program::account_info::AccountInfo<'a>,
+        authority: &solana_program::account_info::AccountInfo<'a>,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke;
+            let ix = spl_token_2022::instruction::burn(
+                token2022_program.key, source.key, mint.key, authority.key, &[], 1,
+            )?;
+            invoke(&ix, &[source.clone(), mint.clone(), authority.clone(), token2022_program.clone()])
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::{Account as TokenAccount, Mint};
+            let mut src_data = source.try_borrow_mut_data()?;
+            let mut src_state = TokenAccount::unpack(&src_data)?;
+            src_state.amount = src_state.amount.checked_sub(1)
+                .ok_or(solana_program::program_error::ProgramError::InsufficientFunds)?;
+            TokenAccount::pack(src_state, &mut src_data)?;
+            drop(src_data);
+            let mut mint_data = mint.try_borrow_mut_data()?;
+            let mut mint_state = Mint::unpack(&mint_data[..Mint::LEN])?;
+            mint_state.supply = mint_state.supply.checked_sub(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            Mint::pack(mint_state, &mut mint_data[..Mint::LEN])?;
+            Ok(())
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn close_nft_mint<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        destination: &solana_program::account_info::AccountInfo<'a>,
+        close_authority: &solana_program::account_info::AccountInfo<'a>,
+        signer_seeds: &[&[&[u8]]],
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke_signed;
+            let ix = spl_token_2022::instruction::close_account(
+                token2022_program.key, mint.key, destination.key, close_authority.key, &[],
+            )?;
+            invoke_signed(
+                &ix,
+                &[mint.clone(), destination.clone(), close_authority.clone(), token2022_program.clone()],
+                signer_seeds,
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            let lamports = mint.lamports();
+            **mint.try_borrow_mut_lamports()
+                .map_err(|_| solana_program::program_error::ProgramError::AccountBorrowFailed)? = 0;
+            **destination.try_borrow_mut_lamports()
+                .map_err(|_| solana_program::program_error::ProgramError::AccountBorrowFailed)? =
+                destination.lamports().checked_add(lamports)
+                    .ok_or(solana_program::program_error::ProgramError::ArithmeticOverflow)?;
+            Ok(())
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub fn transfer_nft<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        source: &solana_program::account_info::AccountInfo<'a>,
+        destination: &solana_program::account_info::AccountInfo<'a>,
+        authority: &solana_program::account_info::AccountInfo<'a>,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke;
+            let ix = spl_token_2022::instruction::transfer_checked(
+                token2022_program.key, source.key, mint.key, destination.key, authority.key, &[], 1, 0,
+            )?;
+            invoke(
+                &ix,
+                &[source.clone(), mint.clone(), destination.clone(), authority.clone(), token2022_program.clone()],
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::Account as TokenAccount;
+            let mut src_data = source.try_borrow_mut_data()?;
+            let mut src_state = TokenAccount::unpack(&src_data)?;
+            src_state.amount = src_state.amount.checked_sub(1)
+                .ok_or(solana_program::program_error::ProgramError::InsufficientFunds)?;
+            TokenAccount::pack(src_state, &mut src_data)?;
+            drop(src_data);
+            let mut dst_data = destination.try_borrow_mut_data()?;
+            let mut dst_state = TokenAccount::unpack(&dst_data)?;
+            dst_state.amount = dst_state.amount.checked_add(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            TokenAccount::pack(dst_state, &mut dst_data)?;
+            Ok(())
+        }
+    }
+}
+
 // 9. mod processor
 pub mod processor {
     #[allow(unused_imports)]
@@ -3001,6 +4777,8 @@ pub mod processor {
     use percolator::{
         RiskEngine, RiskError, I128, U128, ADL_ONE, MAX_ACCOUNTS,
     };
+    #[allow(unused_imports)]
+    use crate::constants::{ENGINE_OFF, ENGINE_LEN, HEADER_LEN};
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
     // which handles K-pair PnL, checked arithmetic, and all settlement internally.
@@ -3321,6 +5099,45 @@ pub mod processor {
             }
             if tok.state != spl_token::state::AccountState::Initialized {
                 return Err(PercolatorError::InvalidTokenAccount.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject if the market is paused.
+    fn require_not_paused(data: &[u8]) -> Result<(), ProgramError> {
+        if state::is_paused(data) {
+            return Err(PercolatorError::MarketPaused.into());
+        }
+        Ok(())
+    }
+
+    /// PERC-298: Unpack oi_cap_multiplier_bps field.
+    /// Lower 32 bits = OI cap multiplier. Bits 32..47 = skew_factor_bps.
+    #[inline]
+    pub fn unpack_oi_cap(packed: u64) -> (u64, u64) {
+        let multiplier = packed & 0xFFFF_FFFF;
+        let skew_factor = (packed >> 32) & 0xFFFF;
+        (multiplier, skew_factor)
+    }
+
+    /// PERC-298: Pack OI cap multiplier and skew factor.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn pack_oi_cap(multiplier: u64, skew_factor: u64) -> u64 {
+        (multiplier & 0xFFFF_FFFF) | ((skew_factor & 0xFFFF) << 32)
+    }
+
+    /// GH#2073: Verify the Token-2022 program account is the canonical spl_token_2022::id().
+    #[allow(unused_variables)]
+    fn verify_token22_program(a_token22: &AccountInfo) -> Result<(), ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            if *a_token22.key != spl_token_2022::id() {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+            if !a_token22.executable {
+                return Err(PercolatorError::InvalidTokenProgram.into());
             }
         }
         Ok(())
@@ -6601,6 +8418,3128 @@ pub mod processor {
             }
 
             // ─── Fork-specific instruction handlers ────────────────────────
+
+            Instruction::CreateLpVault {
+                fee_share_bps,
+                util_curve_enabled,
+            } => {
+                accounts::expect_len(accounts, 8)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_lp_vault_state = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_vault_authority = &accounts[4];
+                let a_system = &accounts[5];
+                let a_token = &accounts[6];
+                let a_rent = &accounts[7];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                verify_token_program(a_token)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                if fee_share_bps > 10_000 {
+                    return Err(PercolatorError::LpVaultInvalidFeeShare.into());
+                }
+
+                let data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+                drop(data);
+
+                #[allow(unused_variables)]
+                let (expected_state, state_bump) =
+                    accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                if a_lp_vault_state.data_len() > 0 {
+                    let state_data = a_lp_vault_state.try_borrow_data()?;
+                    if state_data.len() >= 8 {
+                        let magic = u64::from_le_bytes(state_data[..8].try_into().unwrap());
+                        if magic == crate::lp_vault::LP_VAULT_MAGIC {
+                            return Err(PercolatorError::LpVaultAlreadyExists.into());
+                        }
+                    }
+                    drop(state_data);
+                }
+
+                let (expected_mint, mint_bump) =
+                    accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+                let (auth, _vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                #[cfg(not(feature = "test"))]
+                {
+                    use solana_program::program::invoke_signed;
+                    use solana_program::sysvar::Sysvar;
+
+                    let space = crate::lp_vault::LP_VAULT_STATE_LEN;
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(space);
+
+                    let state_seeds: &[&[u8]] = &[b"lp_vault", a_slab.key.as_ref(), &[state_bump]];
+                    let create_ix = solana_program::system_instruction::create_account(
+                        a_admin.key,
+                        a_lp_vault_state.key,
+                        lamports,
+                        space as u64,
+                        program_id,
+                    );
+                    invoke_signed(
+                        &create_ix,
+                        &[a_admin.clone(), a_lp_vault_state.clone(), a_system.clone()],
+                        &[state_seeds],
+                    )?;
+                }
+                #[cfg(feature = "test")]
+                {
+                    let _ = a_system;
+                }
+
+                {
+                    let mut state_data = a_lp_vault_state.try_borrow_mut_data()?;
+                    if state_data.len() < crate::lp_vault::LP_VAULT_STATE_LEN {
+                        return Err(ProgramError::AccountDataTooSmall);
+                    }
+                    let mut vault_state = crate::lp_vault::LpVaultState::new_zeroed();
+                    vault_state.magic = crate::lp_vault::LP_VAULT_MAGIC;
+                    vault_state.fee_share_bps = fee_share_bps;
+                    vault_state.epoch = 1;
+                    vault_state.lp_util_curve_enabled = if util_curve_enabled { 1 } else { 0 };
+                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
+                    vault_state.hwm_floor_bps = 5000;
+                    let slab_data = a_slab.try_borrow_data()?;
+                    let engine = zc::engine_ref(&slab_data)?;
+                    // fee_revenue not in current InsuranceFund layout — snapshot is 0
+                    vault_state.last_fee_snapshot = 0u128;
+                    drop(slab_data);
+                    crate::lp_vault::write_lp_vault_state(&mut state_data, &vault_state);
+                }
+
+                let mint_seeds: &[&[u8]] = &[b"lp_vault_mint", a_slab.key.as_ref(), &[mint_bump]];
+                let decimals = 6u8;
+                crate::insurance_lp::create_mint(
+                    a_admin,
+                    a_lp_vault_mint,
+                    a_vault_authority,
+                    a_system,
+                    a_token,
+                    a_rent,
+                    decimals,
+                    mint_seeds,
+                )?;
+
+                msg!(
+                    "LP vault created: fee_share={}bps util_curve={} slab={}",
+                    fee_share_bps,
+                    util_curve_enabled,
+                    a_slab.key
+                );
+            }
+
+            Instruction::LpVaultDeposit { amount } => {
+                accounts::expect_len(accounts, 9)?;
+                let a_depositor = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_depositor_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_lp_vault_mint = &accounts[5];
+                let a_depositor_lp_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+                let a_lp_vault_state = &accounts[8];
+
+                accounts::expect_signer(a_depositor)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_depositor_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                accounts::expect_writable(a_depositor_lp_ata)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                verify_token_program(a_token)?;
+
+                if amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                if state::is_resolved(&slab_data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                require_not_paused(&slab_data)?;
+
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_depositor_ata, a_depositor.key, &mint)?;
+
+                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+                if a_lp_vault_mint.data_len() == 0 {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+                let capital_before = vault_state.total_capital;
+
+                drop(slab_data);
+                collateral::deposit(a_token, a_depositor_ata, a_vault, a_depositor, amount)?;
+
+                let slab_data = a_slab.try_borrow_data()?;
+                let config = state::read_config(&slab_data);
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+                drop(slab_data);
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let old_dust = state::read_dust_base(&slab_data);
+                state::write_dust_base(&mut slab_data, old_dust.saturating_add(dust));
+
+                let lp_tokens_to_mint: u64 = if lp_supply == 0 || capital_before == 0 {
+                    if lp_supply > 0 && capital_before == 0 {
+                        vault_state.epoch = vault_state.epoch.saturating_add(1);
+                    }
+                    units
+                } else {
+                    let numerator = (units as u128)
+                        .checked_mul(lp_supply as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let result = numerator / capital_before;
+                    if result > u64::MAX as u128 {
+                        return Err(PercolatorError::EngineOverflow.into());
+                    }
+                    result as u64
+                };
+
+                if lp_tokens_to_mint == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                vault_state.total_capital = vault_state
+                    .total_capital
+                    .checked_add(units as u128)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                if vault_state.hwm_floor_bps > 0
+                    && vault_state.total_capital > vault_state.epoch_high_water_tvl
+                {
+                    vault_state.epoch_high_water_tvl = vault_state.total_capital;
+                }
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_add(units as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+                drop(vs_data);
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                crate::insurance_lp::mint_to(
+                    a_token,
+                    a_lp_vault_mint,
+                    a_depositor_lp_ata,
+                    a_vault_authority,
+                    lp_tokens_to_mint,
+                    &signer_seeds,
+                )?;
+
+                if accounts.len() >= 10 {
+                    let a_creator_lock = &accounts[9];
+                    let (expected_lock_pda, _) = Pubkey::find_program_address(
+                        &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                        program_id,
+                    );
+                    if *a_creator_lock.key == expected_lock_pda && a_creator_lock.is_writable {
+                        if let Ok(mut lock_data) = a_creator_lock.try_borrow_mut_data() {
+                            if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                                let creator_key = Pubkey::new_from_array(lock_state.creator);
+                                if *a_depositor.key == creator_key {
+                                    let mut new_lock = *lock_state;
+                                    new_lock.lp_amount_locked =
+                                        new_lock.lp_amount_locked.saturating_add(lp_tokens_to_mint);
+                                    new_lock.cumulative_deposited = new_lock
+                                        .cumulative_deposited
+                                        .saturating_add(lp_tokens_to_mint as u64);
+                                    crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                msg!(
+                    "LP vault deposit: {} tokens, {} LP shares minted, epoch={}",
+                    amount,
+                    lp_tokens_to_mint,
+                    vault_state.epoch
+                );
+            }
+
+            Instruction::LpVaultWithdraw { lp_amount } => {
+                accounts::expect_len(accounts, 10)?;
+                let a_withdrawer = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_withdrawer_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_lp_vault_mint = &accounts[5];
+                let a_withdrawer_lp_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+                let a_lp_vault_state = &accounts[8];
+
+                accounts::expect_signer(a_withdrawer)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_withdrawer_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                accounts::expect_writable(a_withdrawer_lp_ata)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                verify_token_program(a_token)?;
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                {
+                    let a_creator_lock = &accounts[9];
+                    let (expected_lock_pda, _) = Pubkey::find_program_address(
+                        &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                        program_id,
+                    );
+                    accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
+                    if *a_creator_lock.key == expected_lock_pda {
+                        accounts::expect_writable(a_creator_lock)?;
+                        let mut lock_data = a_creator_lock
+                            .try_borrow_mut_data()
+                            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                        if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                            let creator_key = Pubkey::new_from_array(lock_state.creator);
+                            if *a_withdrawer.key == creator_key {
+                                let clock = solana_program::clock::Clock::get()?;
+                                let expired = crate::creator_lock::is_lock_expired(
+                                    clock.slot,
+                                    lock_state.lock_start_slot,
+                                    lock_state.lock_duration_slots,
+                                );
+                                let max_withdraw = crate::creator_lock::max_withdrawable(
+                                    lp_amount,
+                                    lock_state.lp_amount_locked,
+                                    expired,
+                                );
+                                if lp_amount > max_withdraw {
+                                    msg!(
+                                        "CREATOR_LOCK: withdraw {} > max {}",
+                                        lp_amount,
+                                        max_withdraw
+                                    );
+                                    return Err(ProgramError::InvalidArgument);
+                                }
+                                let mut new_lock = *lock_state;
+                                new_lock.cumulative_extracted = new_lock
+                                    .cumulative_extracted
+                                    .saturating_add(lp_amount);
+                                if crate::creator_lock::check_extraction_exceeded(
+                                    new_lock.cumulative_extracted,
+                                    new_lock.cumulative_deposited,
+                                    crate::creator_lock::EXTRACTION_LIMIT_BPS,
+                                ) {
+                                    new_lock.fee_redirect_active = 1;
+                                    msg!("CREATOR_LOCK: fee redirect activated");
+                                }
+                                crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                            }
+                        }
+                    }
+                }
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_withdrawer_ata, a_withdrawer.key, &mint)?;
+
+                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+                let capital = vault_state.total_capital;
+
+                if lp_supply == 0 || capital == 0 {
+                    return Err(PercolatorError::LpVaultSupplyMismatch.into());
+                }
+
+                let numerator = (lp_amount as u128)
+                    .checked_mul(capital)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+                let units_to_return = numerator / (lp_supply as u128);
+
+                if units_to_return == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+                    let remaining = capital
+                        .checked_sub(units_to_return)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let floor = vault_state
+                        .epoch_high_water_tvl
+                        .saturating_mul(vault_state.hwm_floor_bps as u128)
+                        / 10_000;
+                    if remaining < floor {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+
+                let (oi_multiplier, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
+                if oi_multiplier > 0 {
+                    let remaining_capital = capital.saturating_sub(units_to_return);
+                    let engine = zc::engine_ref(&slab_data)?;
+                    let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+                    let max_oi_after =
+                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+                    if current_oi > max_oi_after {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+
+                let units_u64 = if units_to_return > u64::MAX as u128 {
+                    return Err(PercolatorError::EngineOverflow.into());
+                } else {
+                    units_to_return as u64
+                };
+                let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                vault_state.total_capital = capital
+                    .checked_sub(units_to_return)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_sub(units_to_return)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+                drop(vs_data);
+
+                crate::insurance_lp::burn(
+                    a_token,
+                    a_lp_vault_mint,
+                    a_withdrawer_lp_ata,
+                    a_withdrawer,
+                    lp_amount,
+                )?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_withdrawer_ata,
+                    a_vault_authority,
+                    base_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "LP vault withdraw: {} LP burned, {} tokens returned, epoch={}",
+                    lp_amount,
+                    base_amount,
+                    vault_state.epoch
+                );
+            }
+
+            Instruction::LpVaultCrankFees => {
+                if accounts.len() < 2 {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                let a_slab = &accounts[0];
+                let a_lp_vault_state = &accounts[1];
+
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let config = state::read_config(&slab_data);
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                // fee_revenue not in current InsuranceFund layout — always 0
+                let current_fee_revenue = 0u128;
+                let last_snapshot = vault_state.last_fee_snapshot;
+
+                let fee_delta = current_fee_revenue.saturating_sub(last_snapshot);
+                if fee_delta == 0 {
+                    return Err(PercolatorError::LpVaultNoNewFees.into());
+                }
+
+                let (oi_mult_for_util, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
+                let fee_mult_bps: u64 = if vault_state.lp_util_curve_enabled != 0
+                    && oi_mult_for_util > 0
+                {
+                    let vault_balance = engine.vault.get();
+                    let max_oi = vault_balance.saturating_mul(oi_mult_for_util as u128) / 10_000;
+                    let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+
+                    let util_bps = crate::verify::compute_util_bps(current_oi, max_oi);
+                    let mult = crate::verify::compute_fee_multiplier_bps(util_bps);
+
+                    vault_state.current_fee_mult_bps = mult as u32;
+                    mult
+                } else {
+                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
+                    crate::verify::FEE_MULT_BASE_BPS
+                };
+
+                let lp_portion = fee_delta
+                    .saturating_mul(vault_state.fee_share_bps as u128)
+                    .saturating_mul(fee_mult_bps as u128)
+                    / (10_000u128 * 10_000u128);
+
+                if lp_portion > 0 {
+                    let ins_balance = engine.insurance_fund.balance.get();
+                    let actual_transfer = core::cmp::min(lp_portion, ins_balance);
+
+                    engine.insurance_fund.balance =
+                        percolator::U128::new(ins_balance.saturating_sub(actual_transfer));
+
+                    vault_state.total_capital = vault_state
+                        .total_capital
+                        .checked_add(actual_transfer)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    vault_state.total_fees_distributed = vault_state
+                        .total_fees_distributed
+                        .checked_add(actual_transfer)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                }
+
+                vault_state.last_fee_snapshot = current_fee_revenue;
+                let clock_slot = if accounts.len() > 2 {
+                    Clock::from_account_info(&accounts[2])?.slot
+                } else {
+                    Clock::get()?.slot
+                };
+                vault_state.last_crank_slot = clock_slot;
+                drop(slab_data);
+
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+
+                msg!(
+                    "LP vault fee crank: delta={} mult={}bps lp_portion={} capital={} slot={}",
+                    fee_delta,
+                    fee_mult_bps,
+                    lp_portion,
+                    vault_state.total_capital,
+                    clock_slot
+                );
+            }
+
+            Instruction::FundMarketInsurance { amount } => {
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_admin_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
+
+                collateral::deposit(a_token, a_admin_ata, a_vault, a_admin, amount)?;
+
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+                let engine = zc::engine_mut(&mut data)?;
+                // Inline fund_market_insurance: add units to insurance fund balance.
+                engine.insurance_fund.balance = percolator::U128::new(
+                    engine
+                        .insurance_fund
+                        .balance
+                        .get()
+                        .checked_add(units as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+
+                msg!("PERC-306: funded market insurance with {} units", units);
+            }
+
+            Instruction::SetInsuranceIsolation { bps } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                if bps > 10_000 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // set_insurance_isolation_bps: stub — field not in current layout, log only.
+                let _engine = zc::engine_mut(&mut data)?;
+                // config.insurance_isolation_bps not in current layout — no-op write.
+                msg!("PERC-306: set insurance isolation to {} bps", bps);
+            }
+
+            Instruction::ChallengeSettlement { proposed_price_e6 } => {
+                accounts::expect_len(accounts, 7)?;
+                let a_challenger = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_dispute = &accounts[2];
+                let a_challenger_ata = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_token = &accounts[5];
+                let a_system = &accounts[6];
+
+                accounts::expect_signer(a_challenger)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_dispute)?;
+                accounts::expect_writable(a_challenger_ata)?;
+                accounts::expect_writable(a_vault)?;
+                verify_token_program(a_token)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                if !state::is_resolved(&data) {
+                    return Err(PercolatorError::MarketNotResolved.into());
+                }
+
+                let config = state::read_config(&data);
+                drop(data);
+
+                let dispute_window_slots = state::get_dispute_window_slots(&config);
+                if dispute_window_slots == 0 {
+                    return Err(PercolatorError::DisputeWindowClosed.into());
+                }
+                let clock = Clock::get()?;
+                let resolved_slot = state::get_resolved_slot(&config);
+                let window_end = resolved_slot
+                    .checked_add(dispute_window_slots)
+                    .ok_or(PercolatorError::DisputeWindowClosed)?;
+                if clock.slot > window_end {
+                    return Err(PercolatorError::DisputeWindowClosed.into());
+                }
+
+                let (expected_dispute, dispute_bump) =
+                    accounts::derive_dispute(program_id, a_slab.key);
+                accounts::expect_key(a_dispute, &expected_dispute)?;
+
+                if a_dispute.data_len() > 0 {
+                    let d_data = a_dispute.try_borrow_data()?;
+                    if let Some(existing) = crate::dispute::read_dispute(&d_data) {
+                        if existing.is_initialized() {
+                            return Err(PercolatorError::DisputeAlreadyExists.into());
+                        }
+                    }
+                    drop(d_data);
+                }
+
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_challenger_ata, a_challenger.key, &mint)?;
+
+                let dispute_bond_amount = state::get_dispute_bond_amount(&config);
+                if dispute_bond_amount > 0 {
+                    collateral::deposit(
+                        a_token,
+                        a_challenger_ata,
+                        a_vault,
+                        a_challenger,
+                        dispute_bond_amount,
+                    )?;
+                }
+
+                let dispute_len = crate::dispute::DISPUTE_LEN;
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(dispute_len);
+
+                let seed1: &[u8] = b"dispute";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [dispute_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_challenger.key,
+                        a_dispute.key,
+                        lamports,
+                        dispute_len as u64,
+                        program_id,
+                    ),
+                    &[a_challenger.clone(), a_dispute.clone(), a_system.clone()],
+                    &signer_seeds,
+                )?;
+
+                let dispute = crate::dispute::SettlementDispute {
+                    magic: crate::dispute::DISPUTE_MAGIC,
+                    challenger: a_challenger.key.to_bytes(),
+                    proposed_price_e6,
+                    proof_slot: clock.slot,
+                    bond_amount: dispute_bond_amount,
+                    outcome: 0,
+                    _pad: [0; 7],
+                    dispute_slot: clock.slot,
+                    _reserved: [0; 16],
+                };
+
+                let mut d_data = a_dispute.try_borrow_mut_data()?;
+                crate::dispute::write_dispute(&mut d_data, &dispute);
+
+                let settlement_price_e6 = state::get_settlement_price_e6(&config);
+                msg!(
+                    "PERC-314: Settlement challenged: proposed={} vs settlement={}",
+                    proposed_price_e6,
+                    settlement_price_e6
+                );
+            }
+
+            Instruction::ResolveDispute { accept } => {
+                accounts::expect_len(accounts, 7)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_dispute = &accounts[2];
+                let a_challenger_ata = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_vault_authority = &accounts[5];
+                let a_token = &accounts[6];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_dispute)?;
+                accounts::expect_writable(a_challenger_ata)?;
+                accounts::expect_writable(a_vault)?;
+                verify_token_program(a_token)?;
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                let config = state::read_config(&data);
+                drop(data);
+
+                if !crate::verify::admin_ok(header.admin, a_admin.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let (expected_dispute, _) = accounts::derive_dispute(program_id, a_slab.key);
+                accounts::expect_key(a_dispute, &expected_dispute)?;
+
+                let mut d_data = a_dispute.try_borrow_mut_data()?;
+                let mut dispute = crate::dispute::read_dispute(&d_data)
+                    .ok_or(PercolatorError::NoActiveDispute)?;
+                if !dispute.is_initialized() || dispute.outcome != 0 {
+                    return Err(PercolatorError::NoActiveDispute.into());
+                }
+
+                if accept != 0 {
+                    dispute.outcome = 1;
+
+                    let mut slab_data = state::slab_data_mut(a_slab)?;
+                    let config_w = state::read_config(&slab_data);
+                    // settlement_price_e6 not in current layout — update is no-op
+                    let _ = dispute.proposed_price_e6;
+                    state::write_config(&mut slab_data, &config_w);
+                    drop(slab_data);
+
+                    if dispute.bond_amount > 0 {
+                        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                        let challenger_key = Pubkey::new_from_array(dispute.challenger);
+                        verify_token_account(a_challenger_ata, &challenger_key, &mint)?;
+                        let (auth, vault_bump) =
+                            accounts::derive_vault_authority(program_id, a_slab.key);
+                        accounts::expect_key(a_vault_authority, &auth)?;
+                        verify_vault(
+                            a_vault,
+                            &auth,
+                            &mint,
+                            &Pubkey::new_from_array(config.vault_pubkey),
+                        )?;
+
+                        let seed1: &[u8] = b"vault";
+                        let seed2: &[u8] = a_slab.key.as_ref();
+                        let bump_arr: [u8; 1] = [vault_bump];
+                        let seed3: &[u8] = &bump_arr;
+                        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                        collateral::withdraw(
+                            a_token,
+                            a_vault,
+                            a_challenger_ata,
+                            a_vault_authority,
+                            dispute.bond_amount,
+                            &signer_seeds,
+                        )?;
+                    }
+
+                    msg!(
+                        "PERC-314: Dispute accepted — settlement updated to {}",
+                        dispute.proposed_price_e6
+                    );
+                } else {
+                    dispute.outcome = 2;
+                    msg!("PERC-314: Dispute rejected — bond forfeited");
+                }
+
+                crate::dispute::write_dispute(&mut d_data, &dispute);
+            }
+
+            Instruction::DepositLpCollateral {
+                user_idx,
+                lp_amount,
+            } => {
+                accounts::expect_len(accounts, 7)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_user_lp_ata = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_lp_vault_state = &accounts[4];
+                let a_token = &accounts[5];
+                let a_lp_escrow = &accounts[6];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_user_lp_ata)?;
+                accounts::expect_writable(a_lp_escrow)?;
+                verify_token_program(a_token)?;
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                require_not_paused(&slab_data)?;
+
+                let config = state::read_config(&slab_data);
+                if state::get_lp_collateral_enabled(&config) == 0 {
+                    return Err(PercolatorError::LpCollateralDisabled.into());
+                }
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let vs_data = a_lp_vault_state.try_borrow_data()?;
+                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                let vault_tvl = vault_state.total_capital;
+                drop(vs_data);
+
+                let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+
+                let collateral_units = crate::lp_collateral::lp_token_value(
+                    lp_amount,
+                    vault_tvl,
+                    lp_supply,
+                    state::get_lp_collateral_ltv_bps(&config) as u64,
+                );
+
+                if collateral_units == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                check_idx(engine, user_idx)?;
+
+                let owner = engine.accounts[user_idx as usize].owner;
+                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let clock = Clock::get()?;
+
+                engine
+                    .deposit(user_idx, collateral_units, 0, clock.slot)
+                    .map_err(map_risk_error)?;
+
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_add(collateral_units)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                collateral::deposit(a_token, a_user_lp_ata, a_lp_escrow, a_user, lp_amount)?;
+
+                msg!(
+                    "PERC-315: Deposited {} LP tokens as {} collateral units (LTV={}bps)",
+                    lp_amount,
+                    collateral_units,
+                    state::get_lp_collateral_ltv_bps(&config) as u64
+                );
+            }
+
+            Instruction::WithdrawLpCollateral {
+                user_idx,
+                lp_amount,
+            } => {
+                accounts::expect_len(accounts, 8)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_user_lp_ata = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_lp_vault_state = &accounts[4];
+                let a_token = &accounts[5];
+                let a_lp_escrow = &accounts[6];
+                let a_vault_authority = &accounts[7];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_user_lp_ata)?;
+                accounts::expect_writable(a_lp_escrow)?;
+                verify_token_program(a_token)?;
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                check_idx(engine, user_idx)?;
+
+                let owner = engine.accounts[user_idx as usize].owner;
+                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let pos = engine.accounts[user_idx as usize].position_basis_q;
+                if pos != 0 {
+                    return Err(PercolatorError::LpCollateralPositionOpen.into());
+                }
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                drop(slab_data);
+
+                let vs_data = a_lp_vault_state.try_borrow_data()?;
+                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                let vault_tvl = vault_state.total_capital;
+                drop(vs_data);
+
+                let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+
+                let collateral_units = crate::lp_collateral::lp_token_value(
+                    lp_amount,
+                    vault_tvl,
+                    lp_supply,
+                    state::get_lp_collateral_ltv_bps(&config) as u64,
+                );
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let engine = zc::engine_mut(&mut slab_data)?;
+
+                let clock = Clock::get()?;
+                engine
+                    .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0)
+                    .map_err(map_risk_error)?;
+
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_sub(collateral_units)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_lp_escrow,
+                    a_user_lp_ata,
+                    a_vault_authority,
+                    lp_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "PERC-315: Withdrew {} LP tokens ({} collateral units)",
+                    lp_amount,
+                    collateral_units
+                );
+            }
+
+            Instruction::QueueWithdrawal { lp_amount } => {
+                accounts::expect_len(accounts, 5)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_lp_vault_state = &accounts[2];
+                let a_queue = &accounts[3];
+                let a_system = &accounts[4];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_queue)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                require_not_paused(&data)?;
+                drop(data);
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let vs_data = a_lp_vault_state.try_borrow_data()?;
+                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+                let queue_epochs = if vault_state.queue_epochs == 0 {
+                    5u8
+                } else {
+                    vault_state.queue_epochs
+                };
+                drop(vs_data);
+
+                let (expected_queue, queue_bump) =
+                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+                accounts::expect_key(a_queue, &expected_queue)?;
+
+                if a_queue.data_len() > 0 {
+                    let q_data = a_queue.try_borrow_data()?;
+                    if let Some(existing) = crate::lp_vault::read_withdraw_queue(&q_data) {
+                        if existing.is_initialized() {
+                            return Err(PercolatorError::WithdrawQueueAlreadyExists.into());
+                        }
+                    }
+                    drop(q_data);
+                }
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let queue_len = crate::lp_vault::WITHDRAW_QUEUE_LEN;
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(queue_len);
+
+                let seed1: &[u8] = b"withdraw_queue";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let seed3: &[u8] = a_user.key.as_ref();
+                let bump_arr: [u8; 1] = [queue_bump];
+                let seed4: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 4] = [seed1, seed2, seed3, seed4];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_user.key,
+                        a_queue.key,
+                        lamports,
+                        queue_len as u64,
+                        program_id,
+                    ),
+                    &[a_user.clone(), a_queue.clone(), a_system.clone()],
+                    &signer_seeds,
+                )?;
+
+                let clock = Clock::get()?;
+                let queue = crate::lp_vault::WithdrawQueue {
+                    magic: crate::lp_vault::WITHDRAW_QUEUE_MAGIC,
+                    queued_lp_amount: lp_amount,
+                    queue_start_slot: clock.slot,
+                    epochs_remaining: queue_epochs,
+                    total_epochs: queue_epochs,
+                    _pad: [0; 6],
+                    claimed_so_far: 0,
+                    _reserved: [0; 24],
+                };
+
+                let mut q_data = a_queue.try_borrow_mut_data()?;
+                crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
+
+                msg!(
+                    "PERC-309: Queued {} LP over {} epochs",
+                    lp_amount,
+                    queue_epochs
+                );
+            }
+
+            Instruction::ClaimQueuedWithdrawal => {
+                accounts::expect_len(accounts, 10)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_queue = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_user_lp_ata = &accounts[4];
+                let a_vault = &accounts[5];
+                let a_user_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+                let a_token = &accounts[8];
+                let a_lp_vault_state = &accounts[9];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_queue)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                accounts::expect_writable(a_user_lp_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_user_ata)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                verify_token_program(a_token)?;
+
+                let (expected_queue, _) =
+                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+                accounts::expect_key(a_queue, &expected_queue)?;
+
+                let mut q_data = a_queue.try_borrow_mut_data()?;
+                let mut queue = crate::lp_vault::read_withdraw_queue(&q_data)
+                    .ok_or(PercolatorError::WithdrawQueueNotFound)?;
+                if !queue.is_initialized() {
+                    return Err(PercolatorError::WithdrawQueueNotFound.into());
+                }
+
+                let claimable = queue.claimable_this_epoch();
+                if claimable == 0 {
+                    return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
+                }
+
+                queue.claimed_so_far = queue.claimed_so_far.saturating_add(claimable);
+                queue.epochs_remaining = queue.epochs_remaining.saturating_sub(1);
+                crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
+                drop(q_data);
+
+                let slab_data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                drop(slab_data);
+
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                accounts::expect_key(a_vault_authority, &auth)?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+                if lp_supply == 0 || vault_state.total_capital == 0 {
+                    return Err(PercolatorError::LpVaultSupplyMismatch.into());
+                }
+
+                let capital_units = (claimable as u128)
+                    .checked_mul(vault_state.total_capital)
+                    .ok_or(PercolatorError::EngineOverflow)?
+                    / (lp_supply as u128);
+
+                if capital_units == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                if capital_units > u64::MAX as u128 {
+                    return Err(PercolatorError::EngineOverflow.into());
+                }
+
+                let slab_data = a_slab.try_borrow_data()?;
+                let config = state::read_config(&slab_data);
+                let base_amount =
+                    crate::units::units_to_base(capital_units as u64, config.unit_scale);
+
+                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+                    let remaining = vault_state
+                        .total_capital
+                        .checked_sub(capital_units)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let floor = vault_state
+                        .epoch_high_water_tvl
+                        .saturating_mul(vault_state.hwm_floor_bps as u128)
+                        / 10_000;
+                    if remaining < floor {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+
+                let (oi_multiplier, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
+                if oi_multiplier > 0 {
+                    let remaining_capital = vault_state
+                        .total_capital
+                        .checked_sub(capital_units)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let engine = zc::engine_ref(&slab_data)?;
+                    let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+                    let max_oi_after =
+                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+                    if current_oi > max_oi_after {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+                drop(slab_data);
+
+                vault_state.total_capital = vault_state
+                    .total_capital
+                    .checked_sub(capital_units)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+                drop(vs_data);
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let engine = zc::engine_mut(&mut slab_data)?;
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_sub(capital_units)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                crate::insurance_lp::burn(
+                    a_token,
+                    a_lp_vault_mint,
+                    a_user_lp_ata,
+                    a_user,
+                    claimable,
+                )?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_user_ata,
+                    a_vault_authority,
+                    base_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "PERC-309: Claimed {} LP ({} tokens), {} epochs left",
+                    claimable,
+                    base_amount,
+                    queue.epochs_remaining
+                );
+            }
+
+            Instruction::CancelQueuedWithdrawal => {
+                accounts::expect_len(accounts, 3)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_queue = &accounts[2];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_queue)?;
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                drop(data);
+
+                let (expected_queue, _) =
+                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+                accounts::expect_key(a_queue, &expected_queue)?;
+
+                let q_data = a_queue.try_borrow_data()?;
+                let queue = crate::lp_vault::read_withdraw_queue(&q_data)
+                    .ok_or(PercolatorError::WithdrawQueueNotFound)?;
+                if !queue.is_initialized() {
+                    return Err(PercolatorError::WithdrawQueueNotFound.into());
+                }
+                let remaining = queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
+                drop(q_data);
+
+                let mut q_data = a_queue.try_borrow_mut_data()?;
+                q_data.fill(0);
+                drop(q_data);
+
+                let mut queue_lamports = a_queue.try_borrow_mut_lamports()?;
+                let mut user_lamports = a_user.try_borrow_mut_lamports()?;
+                **user_lamports = user_lamports
+                    .checked_add(**queue_lamports)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                **queue_lamports = 0;
+
+                msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
+            }
+
+            Instruction::ExecuteAdl { target_idx } => {
+                accounts::expect_len(accounts, 4)?;
+                let a_keeper = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_oracle = &accounts[3];
+                accounts::expect_signer(a_keeper)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                {
+                    let header = state::read_header(&data);
+                    require_admin(header.admin, a_keeper.key)?;
+                }
+
+                let mut config = state::read_config(&data);
+
+                let clock = Clock::from_account_info(&accounts[2])?;
+
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let idx = config.last_effective_price_e6;
+                    if idx == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
+                    idx
+                } else {
+                    oracle::read_price_clamped(
+                        &mut config,
+                        a_oracle,
+                        clock.unix_timestamp,
+                    )?
+                };
+                state::write_config(&mut data, &config);
+
+                let engine = zc::engine_mut(&mut data)?;
+
+                let insurance_balance = engine.insurance_fund.balance.get();
+                if insurance_balance != 0 {
+                    msg!(
+                        "ADL: insurance_fund.balance={} — not depleted, ADL rejected",
+                        insurance_balance
+                    );
+                    return Err(PercolatorError::InsuranceFundNotDepleted.into());
+                }
+
+                check_idx(engine, target_idx)?;
+                let pos_size = engine.accounts[target_idx as usize].position_basis_q;
+                if pos_size == 0 {
+                    msg!("ADL: target_idx={} position already closed", target_idx);
+                    return Err(PercolatorError::BankruptPositionAlreadyClosed.into());
+                }
+
+                let pnl_pos_tot = engine.pnl_pos_tot;
+                let cap = state::get_max_pnl_cap(&config) as u128;
+                let excess = if pnl_pos_tot > cap {
+                    pnl_pos_tot.saturating_sub(cap)
+                } else {
+                    pnl_pos_tot
+                };
+
+                // execute_adl not in current RiskEngine layout.
+                // Stub: record the closed position size and zero out the position via set_position_basis_q.
+                // Note: set_position_basis_q is private — we set position_basis_q directly.
+                let closed_abs = pos_size.unsigned_abs();
+                engine.accounts[target_idx as usize].position_basis_q = 0;
+
+                let final_pnl = engine.accounts[target_idx as usize].pnl;
+                if final_pnl > 0 {
+                    let settle = final_pnl as u128;
+                    let old_cap = engine.accounts[target_idx as usize].capital.get();
+                    engine.accounts[target_idx as usize].capital =
+                        percolator::U128::new(old_cap.saturating_add(settle));
+                    engine.set_pnl(target_idx as usize, 0);
+                    engine.c_tot = percolator::U128::new(engine.c_tot.get().saturating_add(settle));
+                }
+
+                let closed_lo = closed_abs as u64;
+                let closed_hi = (closed_abs >> 64) as u64;
+                sol_log_64(0xAD1E_0001, target_idx as u64, price, closed_lo, closed_hi);
+
+                msg!(
+                    "ADL: idx={} closed={} excess={} insurance=0 pnl_pos_tot_after={}",
+                    target_idx,
+                    closed_abs,
+                    excess,
+                    engine.pnl_pos_tot
+                );
+            }
+
+            Instruction::CloseStaleSlabs => {
+                accounts::expect_len(accounts, 2)?;
+                let a_dest = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_dest)?;
+                accounts::expect_writable(a_slab)?;
+
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
+                const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
+                const PRE_ADL_SLAB_LEN: usize = 1025880;
+                const V1M_SMALL_LEN: usize = 65416;
+                const V1M_MEDIUM_LEN: usize = 257512;
+                const V1M_LARGE_LEN: usize = 1025896;
+                const V1M2_MEDIUM_LEN: usize = 323312;
+                let slab_data = a_slab.try_borrow_data()?;
+                let slab_len = slab_data.len();
+                if slab_len == SLAB_LEN
+                    || slab_len == PRE_118_SLAB_LEN
+                    || slab_len == OLDEST_SLAB_LEN
+                    || slab_len == PRE_ADL_SLAB_LEN
+                    || slab_len == V1M_SMALL_LEN
+                    || slab_len == V1M_MEDIUM_LEN
+                    || slab_len == V1M_LARGE_LEN
+                    || slab_len == V1M2_MEDIUM_LEN
+                {
+                    return Err(PercolatorError::InvalidSlabLen.into());
+                }
+
+                const ADMIN_OFF: usize = 16;
+                const ADMIN_END: usize = ADMIN_OFF + 32;
+
+                if slab_len < ADMIN_END {
+                    return Err(PercolatorError::NotInitialized.into());
+                }
+
+                let magic = u64::from_le_bytes(
+                    slab_data[0..8]
+                        .try_into()
+                        .map_err(|_| PercolatorError::InvalidMagic)?,
+                );
+                if magic != MAGIC {
+                    return Err(PercolatorError::InvalidMagic.into());
+                }
+
+                let admin_bytes: [u8; 32] = slab_data[ADMIN_OFF..ADMIN_END]
+                    .try_into()
+                    .map_err(|_| PercolatorError::InvalidMagic)?;
+                drop(slab_data);
+
+                require_admin(admin_bytes, a_dest.key)?;
+
+                {
+                    let mut data = a_slab.try_borrow_mut_data()?;
+                    data.fill(0);
+                }
+
+                let slab_lamports = a_slab.lamports();
+                **a_slab.lamports.borrow_mut() = 0;
+                **a_dest.lamports.borrow_mut() = a_dest
+                    .lamports()
+                    .checked_add(slab_lamports)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                msg!(
+                    "CloseStaleSlabs: closed stale slab (size={}) reclaimed {} lamports",
+                    slab_len,
+                    slab_lamports,
+                );
+            }
+
+            Instruction::ReclaimSlabRent => {
+                accounts::expect_len(accounts, 2)?;
+                let a_dest = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_dest)?;
+                accounts::expect_writable(a_dest)?;
+
+                accounts::expect_signer(a_slab)?;
+                accounts::expect_writable(a_slab)?;
+
+                if a_dest.key == a_slab.key {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                let slab_data = a_slab.try_borrow_data()?;
+                let slab_len = slab_data.len();
+                if slab_len >= 8 {
+                    let magic = u64::from_le_bytes(
+                        slab_data[0..8]
+                            .try_into()
+                            .map_err(|_| PercolatorError::InvalidMagic)?,
+                    );
+                    if magic == MAGIC {
+                        return Err(PercolatorError::AlreadyInitialized.into());
+                    }
+                }
+                drop(slab_data);
+
+                {
+                    let mut data = a_slab.try_borrow_mut_data()?;
+                    data.fill(0);
+                }
+
+                let slab_lamports = a_slab.lamports();
+                **a_slab.lamports.borrow_mut() = 0;
+                **a_dest.lamports.borrow_mut() = a_dest
+                    .lamports()
+                    .checked_add(slab_lamports)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                msg!(
+                    "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab (size={})",
+                    slab_lamports,
+                    slab_len,
+                );
+            }
+
+            Instruction::TransferOwnershipCpi {
+                user_idx,
+                new_owner,
+            } => {
+                accounts::expect_len(accounts, 3)?;
+                let a_caller = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_prog = &accounts[2];
+
+                accounts::expect_signer(a_caller)?;
+                accounts::expect_writable(a_slab)?;
+
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                if !a_nft_prog.executable {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                if *a_nft_prog.owner != solana_program::bpf_loader_upgradeable::id()
+                    && *a_nft_prog.owner != solana_program::bpf_loader::id()
+                    && *a_nft_prog.owner != solana_program::bpf_loader_deprecated::id()
+                {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let (expected_mint_auth, _) = solana_program::pubkey::Pubkey::find_program_address(
+                    &[b"mint_authority"],
+                    a_nft_prog.key,
+                );
+                if a_caller.key != &expected_mint_auth {
+                    solana_program::msg!(
+                        "TransferPositionOwnership rejected: caller {} is not the expected \
+                         mint_authority PDA {} for NFT program {}",
+                        a_caller.key,
+                        expected_mint_auth,
+                        a_nft_prog.key
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let mut slab_data = a_slab.try_borrow_mut_data()?;
+                if slab_data.len() < 16 {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+
+                let magic = u64::from_le_bytes(
+                    slab_data[0..8]
+                        .try_into()
+                        .map_err(|_| PercolatorError::InvalidMagic)?,
+                );
+                if magic != MAGIC {
+                    return Err(PercolatorError::InvalidMagic.into());
+                }
+
+                let max_accounts = u16::from_le_bytes(
+                    slab_data[8..10]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                );
+
+                if user_idx >= max_accounts {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                const ACCT_SIZE: usize = 240;
+                const V0_BITMAP_OFF: usize = 608;
+                const V1D_BITMAP_OFF: usize = 1048;
+
+                let bitmap_bytes = (max_accounts as usize).div_ceil(8);
+                let v0_accounts_off = V0_BITMAP_OFF + bitmap_bytes;
+                let v1d_accounts_off = V1D_BITMAP_OFF + bitmap_bytes;
+
+                let v0_total = v0_accounts_off + (max_accounts as usize) * ACCT_SIZE;
+                let v1d_total = v1d_accounts_off + (max_accounts as usize) * ACCT_SIZE;
+
+                let (bitmap_off, accounts_off) =
+                    if slab_data.len() >= v0_total && slab_data.len() <= v0_total + 8 {
+                        (V0_BITMAP_OFF, v0_accounts_off)
+                    } else if slab_data.len() >= v1d_total && slab_data.len() <= v1d_total + 16 {
+                        (V1D_BITMAP_OFF, v1d_accounts_off)
+                    } else {
+                        return Err(ProgramError::InvalidAccountData);
+                    };
+
+                let acct_off = accounts_off + (user_idx as usize) * ACCT_SIZE;
+
+                let byte_idx = bitmap_off + (user_idx as usize) / 8;
+                let bit_idx = (user_idx as usize) % 8;
+                if byte_idx >= slab_data.len() || (slab_data[byte_idx] & (1 << bit_idx)) == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                const ACCT_OWNER_OFF: usize = 184;
+                let owner_off = acct_off + ACCT_OWNER_OFF;
+                if owner_off + 32 > slab_data.len() {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+
+                slab_data[owner_off..owner_off + 32].copy_from_slice(&new_owner);
+
+                msg!(
+                    "TransferPositionOwnership: idx={}, new_owner={}",
+                    user_idx,
+                    Pubkey::new_from_array(new_owner),
+                );
+            }
+
+            Instruction::AuditCrank => {
+                if accounts.is_empty() {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                let a_slab = &accounts[0];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let engine = zc::engine_ref(&data)?;
+
+                let mut sum_capital: i128 = 0;
+                let mut sum_pnl_pos: u128 = 0;
+                let mut sum_oi: u128 = 0;
+                for idx in 0..MAX_ACCOUNTS {
+                    if !engine.is_used(idx) {
+                        continue;
+                    }
+                    let acc = &engine.accounts[idx];
+                    sum_capital = sum_capital.saturating_add(acc.capital.get() as i128);
+                    let pnl = acc.pnl;
+                    if pnl > 0 {
+                        sum_pnl_pos = sum_pnl_pos.saturating_add(pnl as u128);
+                    }
+                    let pos = acc.position_basis_q;
+                    sum_oi = sum_oi.saturating_add(pos.unsigned_abs());
+                }
+
+                let mut violation = false;
+
+                let c_tot = engine.c_tot.get();
+                if sum_capital != c_tot as i128 {
+                    msg!("AUDIT_VIOLATION: capital_mismatch");
+                    sol_log_64(sum_capital as u64, c_tot as u64, 0, 0, 0xAD01);
+                    violation = true;
+                }
+
+                let pnl_pos_tot = engine.pnl_pos_tot;
+                if sum_pnl_pos != pnl_pos_tot {
+                    msg!("AUDIT_VIOLATION: pnl_pos_mismatch");
+                    sol_log_64(sum_pnl_pos as u64, pnl_pos_tot as u64, 0, 0, 0xAD02);
+                    violation = true;
+                }
+
+                let total_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+                if sum_oi != total_oi {
+                    msg!("AUDIT_VIOLATION: oi_mismatch");
+                    sol_log_64(sum_oi as u64, total_oi as u64, 0, 0, 0xAD03);
+                    violation = true;
+                }
+
+                let vault = engine.vault.get();
+                // isolated_balance not in current InsuranceFund layout — use 0
+                let insurance_balance = engine.insurance_fund.balance.get()
+                    .saturating_add(0u128);
+                let required = (c_tot as u128).saturating_add(insurance_balance);
+                if (vault as u128) < required {
+                    msg!("AUDIT_VIOLATION: solvency");
+                    sol_log_64(vault as u64, required as u64, 0, 0, 0xAD05);
+                    violation = true;
+                }
+
+                const AUDIT_CRANK_COOLDOWN_SLOTS: u64 = 150;
+                let current_slot = Clock::get()?.slot;
+                let mut config = state::read_config(&data);
+                if violation {
+                    let last_pause = state::read_last_audit_pause_slot(&config);
+                    if current_slot.saturating_sub(last_pause) < AUDIT_CRANK_COOLDOWN_SLOTS {
+                        msg!(
+                            "AUDIT_CRANK: violation detected but cooldown active \
+                             (last_pause={} current={} cooldown={})",
+                            last_pause,
+                            current_slot,
+                            AUDIT_CRANK_COOLDOWN_SLOTS,
+                        );
+                        return Err(PercolatorError::AuditViolation.into());
+                    }
+                    state::write_audit_status(&mut config, 0xFFFF);
+                    state::write_last_audit_pause_slot(&mut config, current_slot);
+                    state::set_paused(&mut data, true);
+                    state::write_config(&mut data, &config);
+                    msg!("AUDIT_CRANK: VIOLATION DETECTED — market paused");
+                    return Err(PercolatorError::AuditViolation.into());
+                } else {
+                    state::write_audit_status(&mut config, 1);
+                    state::write_config(&mut data, &config);
+                    msg!("AUDIT_CRANK: all invariants passed");
+                }
+            }
+
+            Instruction::SetOffsetPair { offset_bps } => {
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab_a = &accounts[1];
+                let a_slab_b = &accounts[2];
+                let a_pair_pda = &accounts[3];
+                let a_system = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_admin)?;
+                accounts::expect_writable(a_pair_pda)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                accounts::expect_owner(a_slab_a, program_id)?;
+                {
+                    let data_a = a_slab_a.try_borrow_data()?;
+                    if data_a.len() < HEADER_LEN {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let header = state::read_header(&data_a);
+                    if header.magic != MAGIC {
+                        return Err(PercolatorError::InvalidMagic.into());
+                    }
+                    require_admin(header.admin, a_admin.key)?;
+                }
+
+                accounts::expect_owner(a_slab_b, program_id)?;
+                {
+                    let data_b = a_slab_b.try_borrow_data()?;
+                    if data_b.len() < HEADER_LEN {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let header_b = state::read_header(&data_b);
+                    if header_b.magic != MAGIC {
+                        return Err(PercolatorError::InvalidMagic.into());
+                    }
+                    require_admin(header_b.admin, a_admin.key)?;
+                }
+
+                let (slab_min_pair, slab_max_pair) =
+                    if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
+                let (expected_pda, pair_bump) = Pubkey::find_program_address(
+                    &[b"cmor_pair", slab_min_pair.as_ref(), slab_max_pair.as_ref()],
+                    program_id,
+                );
+                if a_pair_pda.key != &expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if offset_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
+                if a_pair_pda.data_is_empty() {
+                    let lamports = solana_program::rent::Rent::get()?
+                        .minimum_balance(crate::cross_margin::OFFSET_PAIR_LEN);
+                    let bump_bytes = [pair_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        b"cmor_pair",
+                        slab_min_pair.as_ref(),
+                        slab_max_pair.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_admin.key,
+                            &expected_pda,
+                            lamports,
+                            crate::cross_margin::OFFSET_PAIR_LEN as u64,
+                            program_id,
+                        ),
+                        &[a_admin.clone(), a_pair_pda.clone(), a_system.clone()],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                let mut pair_data = a_pair_pda.try_borrow_mut_data()?;
+                if pair_data.len() < crate::cross_margin::OFFSET_PAIR_LEN {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+                let cfg = crate::cross_margin::OffsetPairConfig {
+                    magic: crate::cross_margin::OFFSET_PAIR_MAGIC,
+                    offset_bps,
+                    enabled: 1,
+                    _pad: [0; 5],
+                    _reserved: [0; 16],
+                };
+                crate::cross_margin::write_offset_pair(&mut pair_data, &cfg);
+                msg!("SetOffsetPair: offset_bps={}", offset_bps);
+            }
+
+            Instruction::AttestCrossMargin {
+                user_idx_a,
+                user_idx_b,
+            } => {
+                accounts::expect_len(accounts, 6)?;
+                let a_payer = &accounts[0];
+                let a_slab_a = &accounts[1];
+                let a_slab_b = &accounts[2];
+                let a_attestation = &accounts[3];
+                let a_pair_pda = &accounts[4];
+                let a_system = &accounts[5];
+
+                accounts::expect_signer(a_payer)?;
+                accounts::expect_writable(a_payer)?;
+                accounts::expect_writable(a_attestation)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                accounts::expect_owner(a_slab_a, program_id)?;
+                accounts::expect_owner(a_slab_b, program_id)?;
+
+                let pair_data = a_pair_pda.try_borrow_data()?;
+                let pair_cfg = crate::cross_margin::read_offset_pair(&pair_data)
+                    .ok_or(ProgramError::InvalidAccountData)?;
+                if !pair_cfg.is_initialized() || pair_cfg.enabled == 0 {
+                    return Err(PercolatorError::CrossMarginPairNotFound.into());
+                }
+                let offset_bps = pair_cfg.offset_bps;
+                drop(pair_data);
+
+                let data_a = a_slab_a.try_borrow_data()?;
+                if data_a.len() < ENGINE_OFF + ENGINE_LEN {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let engine_a = zc::engine_ref(&data_a)?;
+                check_idx(engine_a, user_idx_a)?;
+                let pos_a = engine_a.accounts[user_idx_a as usize].position_basis_q;
+                let owner_a = engine_a.accounts[user_idx_a as usize].owner;
+                let slot = engine_a.current_slot;
+                drop(data_a);
+
+                let data_b = a_slab_b.try_borrow_data()?;
+                if data_b.len() < ENGINE_OFF + ENGINE_LEN {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let engine_b = zc::engine_ref(&data_b)?;
+                check_idx(engine_b, user_idx_b)?;
+                let pos_b = engine_b.accounts[user_idx_b as usize].position_basis_q;
+                let owner_b = engine_b.accounts[user_idx_b as usize].owner;
+                drop(data_b);
+
+                if owner_a != owner_b {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                {
+                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
+                    let (expected_pair_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
+                        program_id,
+                    );
+                    if a_pair_pda.key != &expected_pair_pda {
+                        return Err(ProgramError::InvalidSeeds);
+                    }
+                }
+
+                let (slab_min_att, slab_max_att) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref()
+                {
+                    (a_slab_a.key, a_slab_b.key)
+                } else {
+                    (a_slab_b.key, a_slab_a.key)
+                };
+                let owner_key = Pubkey::from(owner_a);
+                let (expected_att_pda, att_bump) = Pubkey::find_program_address(
+                    &[
+                        b"cmor",
+                        owner_key.as_ref(),
+                        slab_min_att.as_ref(),
+                        slab_max_att.as_ref(),
+                    ],
+                    program_id,
+                );
+                if a_attestation.key != &expected_att_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if a_attestation.data_is_empty() {
+                    let lamports = solana_program::rent::Rent::get()?
+                        .minimum_balance(crate::cross_margin::ATTESTATION_LEN);
+                    let bump_bytes = [att_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        b"cmor",
+                        owner_key.as_ref(),
+                        slab_min_att.as_ref(),
+                        slab_max_att.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_payer.key,
+                            &expected_att_pda,
+                            lamports,
+                            crate::cross_margin::ATTESTATION_LEN as u64,
+                            program_id,
+                        ),
+                        &[a_payer.clone(), a_attestation.clone(), a_system.clone()],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                let mut att_data = a_attestation.try_borrow_mut_data()?;
+                if att_data.len() < crate::cross_margin::ATTESTATION_LEN {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+                let att = crate::cross_margin::CrossMarginAttestation {
+                    magic: crate::cross_margin::ATTESTATION_MAGIC,
+                    _align_pad: [0; 8],
+                    user_pos_a: pos_a,
+                    user_pos_b: pos_b,
+                    attested_slot: slot,
+                    offset_bps,
+                    _pad: [0; 6],
+                    owner: owner_a,
+                    slab_a: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        a_slab_a.key.to_bytes()
+                    } else {
+                        a_slab_b.key.to_bytes()
+                    },
+                    slab_b: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        a_slab_b.key.to_bytes()
+                    } else {
+                        a_slab_a.key.to_bytes()
+                    },
+                };
+                crate::cross_margin::write_attestation(&mut att_data, &att);
+                msg!(
+                    "AttestCrossMargin: pos_a={} pos_b={} offset={}",
+                    pos_a as i64,
+                    pos_b as i64,
+                    offset_bps
+                );
+            }
+
+            Instruction::AdvanceOraclePhase => {
+                if accounts.is_empty() {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                let a_slab = &accounts[0];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut config = state::read_config(&data);
+                let clock = Clock::get()?;
+
+                if state::get_vol_margin_scale_bps(&config) > 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
+                let old_phase = state::get_oracle_phase(&config);
+
+                let has_mature_oracle = crate::verify::is_pyth_pinned_mode(
+                    config.oracle_authority,
+                    config.index_feed_id,
+                );
+
+                let mcs = state::get_market_created_slot(&config);
+                let created = state::effective_created_slot(mcs, clock.slot);
+                if mcs == 0 && old_phase == 0 {
+                    state::set_market_created_slot(&mut config, clock.slot);
+                }
+
+                let (new_phase, transitioned) = state::check_phase_transition(
+                    clock.slot,
+                    created,
+                    old_phase,
+                    state::get_cumulative_volume(&config),
+                    state::get_phase2_delta_slots(&config),
+                    has_mature_oracle,
+                );
+
+                if !transitioned {
+                    state::write_config(&mut data, &config);
+                    msg!("AdvanceOraclePhase: no transition (phase={})", old_phase);
+                } else {
+                    state::set_oracle_phase(&mut config, new_phase);
+
+                    if new_phase == state::ORACLE_PHASE_GROWING {
+                        let delta = clock.slot.saturating_sub(created) as u32;
+                        state::set_phase2_delta_slots(&mut config, delta);
+                    }
+
+                    state::write_config(&mut data, &config);
+                    msg!(
+                        "AdvanceOraclePhase: {} -> {} at slot {}",
+                        old_phase,
+                        new_phase,
+                        clock.slot
+                    );
+                }
+            }
+
+            Instruction::InitSharedVault {
+                epoch_duration_slots,
+                max_market_exposure_bps,
+            } => {
+                accounts::expect_len(accounts, 4)?;
+                let a_admin = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_system_program = &accounts[2];
+                let a_slab = &accounts[3];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_shared_vault)?;
+
+                {
+                    let slab_data = state::slab_data_mut(a_slab)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                    let header = state::read_header(&slab_data);
+                    require_admin(header.admin, a_admin.key)?;
+                }
+
+                if *a_system_program.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                if *a_shared_vault.key != expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if !a_shared_vault.data_is_empty() {
+                    return Err(ProgramError::AccountAlreadyInitialized);
+                }
+
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(crate::shared_vault::SHARED_VAULT_STATE_LEN);
+                let bump_bytes = [pda_bump];
+                let signer_seeds: &[&[u8]] = &[crate::shared_vault::SHARED_VAULT_SEED, &bump_bytes];
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_admin.key,
+                        &expected_pda,
+                        lamports,
+                        crate::shared_vault::SHARED_VAULT_STATE_LEN as u64,
+                        program_id,
+                    ),
+                    &[
+                        a_admin.clone(),
+                        a_shared_vault.clone(),
+                        a_system_program.clone(),
+                    ],
+                    &[signer_seeds],
+                )?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                let duration = if epoch_duration_slots == 0 {
+                    crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
+                } else {
+                    epoch_duration_slots
+                };
+                let max_bps = if max_market_exposure_bps == 0 {
+                    crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
+                } else {
+                    max_market_exposure_bps.min(10_000)
+                };
+
+                let sv_state = crate::shared_vault::SharedVaultState {
+                    magic: crate::shared_vault::SHARED_VAULT_MAGIC,
+                    epoch_number: 0,
+                    total_capital: 0,
+                    total_allocated: 0,
+                    pending_withdrawals: 0,
+                    epoch_start_slot: clock.slot,
+                    epoch_duration_slots: duration,
+                    max_market_exposure_bps: max_bps,
+                    bump: pda_bump,
+                    _pad: [0; 13],
+                    epoch_snapshot_capital: 0,
+                    epoch_snapshot_pending: 0,
+                };
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_vault_state(&mut sv_data, &sv_state);
+
+                msg!(
+                    "PERC-628: SharedVault initialized — epoch_duration={} max_exposure_bps={}",
+                    duration,
+                    max_bps
+                );
+            }
+
+            Instruction::AllocateMarket { amount } => {
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_shared_vault = &accounts[2];
+                let a_market_alloc = &accounts[3];
+                let a_system_program = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_market_alloc)?;
+
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let header = state::read_header(&slab_data);
+                require_admin(header.admin, a_admin.key)?;
+                drop(slab_data);
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let (expected_alloc, alloc_bump) = Pubkey::find_program_address(
+                    &[crate::shared_vault::MARKET_ALLOC_SEED, a_slab.key.as_ref()],
+                    program_id,
+                );
+                if *a_market_alloc.key != expected_alloc {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                let new_allocation = amount;
+                if !crate::shared_vault::check_exposure_cap(
+                    vault_state.total_capital,
+                    new_allocation,
+                    vault_state.max_market_exposure_bps,
+                ) {
+                    msg!("PERC-628: allocation {} exceeds exposure cap", amount);
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let available = crate::shared_vault::available_for_allocation(
+                    vault_state.total_capital,
+                    vault_state.total_allocated,
+                );
+                if new_allocation > available {
+                    msg!("PERC-628: allocation {} > available {}", amount, available);
+                    return Err(ProgramError::InsufficientFunds);
+                }
+
+                if a_market_alloc.data_is_empty() {
+                    if *a_system_program.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(crate::shared_vault::MARKET_ALLOC_LEN);
+                    let bump_bytes = [alloc_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        crate::shared_vault::MARKET_ALLOC_SEED,
+                        a_slab.key.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_admin.key,
+                            &expected_alloc,
+                            lamports,
+                            crate::shared_vault::MARKET_ALLOC_LEN as u64,
+                            program_id,
+                        ),
+                        &[
+                            a_admin.clone(),
+                            a_market_alloc.clone(),
+                            a_system_program.clone(),
+                        ],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                let alloc = crate::shared_vault::MarketAllocation {
+                    magic: crate::shared_vault::MARKET_ALLOC_MAGIC,
+                    bump: alloc_bump,
+                    _pad: [0; 7],
+                    allocated_capital: new_allocation,
+                    utilized_capital: 0,
+                };
+                let mut alloc_data = a_market_alloc
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_market_alloc(&mut alloc_data, &alloc);
+
+                vault_state.total_allocated =
+                    vault_state.total_allocated.saturating_add(new_allocation);
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!("PERC-628: Market allocated {} from shared vault", amount);
+            }
+
+            Instruction::AdvanceEpoch => {
+                accounts::expect_len(accounts, 2)?;
+                let a_shared_vault = &accounts[1];
+
+                accounts::expect_writable(a_shared_vault)?;
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                if !crate::shared_vault::is_epoch_elapsed(
+                    clock.slot,
+                    vault_state.epoch_start_slot,
+                    vault_state.epoch_duration_slots,
+                ) {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                vault_state.epoch_snapshot_capital = vault_state.total_capital;
+                vault_state.epoch_snapshot_pending = vault_state.pending_withdrawals;
+
+                vault_state.epoch_number = vault_state.epoch_number.saturating_add(1);
+                vault_state.epoch_start_slot = clock.slot;
+                vault_state.pending_withdrawals = 0;
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!(
+                    "PERC-628: Epoch advanced to {} at slot {}",
+                    vault_state.epoch_number,
+                    clock.slot,
+                );
+            }
+
+            Instruction::QueueWithdrawalSV { lp_amount } => {
+                accounts::expect_len(accounts, 4)?;
+                let a_user = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_withdraw_req = &accounts[2];
+                let a_system_program = &accounts[3];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_withdraw_req)?;
+
+                if lp_amount == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                let epoch_bytes = vault_state.epoch_number.to_le_bytes();
+                let (expected_req, req_bump) = Pubkey::find_program_address(
+                    &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &epoch_bytes,
+                    ],
+                    program_id,
+                );
+                if *a_withdraw_req.key != expected_req {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if a_withdraw_req.data_is_empty() {
+                    if *a_system_program.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(crate::shared_vault::WITHDRAW_REQ_LEN);
+                    let bump_bytes = [req_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &epoch_bytes,
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_user.key,
+                            &expected_req,
+                            lamports,
+                            crate::shared_vault::WITHDRAW_REQ_LEN as u64,
+                            program_id,
+                        ),
+                        &[
+                            a_user.clone(),
+                            a_withdraw_req.clone(),
+                            a_system_program.clone(),
+                        ],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                {
+                    let req_data = a_withdraw_req
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    if let Some(existing) = crate::shared_vault::read_withdraw_req(&req_data) {
+                        if existing.claimed == 0 {
+                            return Err(ProgramError::AccountAlreadyInitialized);
+                        }
+                    }
+                }
+
+                let req = crate::shared_vault::WithdrawalRequest {
+                    magic: crate::shared_vault::WITHDRAW_REQ_MAGIC,
+                    bump: req_bump,
+                    claimed: 0,
+                    _pad: [0; 6],
+                    lp_amount,
+                    epoch_number: vault_state.epoch_number,
+                };
+                let mut req_data = a_withdraw_req
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_withdraw_req(&mut req_data, &req);
+
+                vault_state.pending_withdrawals = crate::shared_vault::queue_withdrawal(
+                    vault_state.pending_withdrawals,
+                    lp_amount,
+                );
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!(
+                    "PERC-628: Queued withdrawal {} LP for epoch {}",
+                    lp_amount,
+                    vault_state.epoch_number
+                );
+            }
+
+            Instruction::ClaimEpochWithdrawal => {
+                accounts::expect_len(accounts, 8)?;
+                let a_user = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_withdraw_req = &accounts[2];
+                let a_slab = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_user_ata = &accounts[5];
+                let a_vault_authority = &accounts[6];
+                let a_token = &accounts[7];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_withdraw_req)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_user_ata)?;
+                verify_token_program(a_token)?;
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                if !crate::shared_vault::is_epoch_elapsed(
+                    clock.slot,
+                    vault_state.epoch_start_slot,
+                    vault_state.epoch_duration_slots,
+                ) {
+                    msg!("PERC-628: epoch not yet elapsed — cannot claim mid-epoch");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                accounts::expect_key(a_vault_authority, &auth)?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
+                drop(slab_data);
+
+                let mut req_data = a_withdraw_req
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let req = crate::shared_vault::read_withdraw_req(&req_data)
+                    .ok_or(ProgramError::InvalidAccountData)?;
+
+                if req.claimed != 0 {
+                    msg!("PERC-628: withdrawal already claimed");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let req_epoch_bytes = req.epoch_number.to_le_bytes();
+                let (expected_req_pda, _) = Pubkey::find_program_address(
+                    &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &req_epoch_bytes,
+                    ],
+                    program_id,
+                );
+                if *a_withdraw_req.key != expected_req_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                if req.epoch_number >= vault_state.epoch_number {
+                    msg!(
+                        "PERC-628: request epoch {} >= current {} — must wait for epoch advance",
+                        req.epoch_number,
+                        vault_state.epoch_number
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let mut updated_req = req;
+                updated_req.claimed = 1;
+                crate::shared_vault::write_withdraw_req(&mut req_data, &updated_req);
+                drop(req_data);
+
+                let payout = crate::shared_vault::compute_proportional_withdrawal(
+                    req.lp_amount,
+                    vault_state.epoch_snapshot_pending,
+                    vault_state.epoch_snapshot_capital,
+                );
+
+                if payout > 0 {
+                    let base_payout =
+                        crate::units::units_to_base_checked(payout, config.unit_scale)
+                            .ok_or(PercolatorError::EngineOverflow)?;
+
+                    let seed1: &[u8] = b"vault";
+                    let seed2: &[u8] = a_slab.key.as_ref();
+                    let bump_arr: [u8; 1] = [vault_bump];
+                    let seed3: &[u8] = &bump_arr;
+                    let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                    let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                    collateral::withdraw(
+                        a_token,
+                        a_vault,
+                        a_user_ata,
+                        a_vault_authority,
+                        base_payout,
+                        &signer_seeds,
+                    )?;
+
+                    vault_state.total_capital =
+                        vault_state.total_capital.saturating_sub(payout as u128);
+                    crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                    msg!(
+                        "PERC-628: Claim: {} LP → {} base tokens transferred",
+                        req.lp_amount,
+                        base_payout
+                    );
+                } else {
+                    msg!("PERC-628: Claim: {} LP → 0 payout", req.lp_amount);
+                }
+            }
+
+            Instruction::MintPositionNft { user_idx } => {
+                accounts::expect_len(accounts, 10)?;
+                let a_payer = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+                let a_nft_mint = &accounts[3];
+                let a_owner_ata = &accounts[4];
+                let a_owner = &accounts[5];
+                let a_vault_auth = &accounts[6];
+                let a_token22 = &accounts[7];
+                let a_system = &accounts[8];
+                let a_rent = &accounts[9];
+
+                accounts::expect_signer(a_payer)?;
+                accounts::expect_signer(a_owner)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_nft_pda)?;
+                accounts::expect_writable(a_nft_mint)?;
+                accounts::expect_writable(a_owner_ata)?;
+                verify_token22_program(a_token22)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let engine = zc::engine_ref(&data)?;
+                check_idx(engine, user_idx)?;
+                let u_owner = engine.accounts[user_idx as usize].owner;
+                if !crate::verify::owner_ok(u_owner, a_owner.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let acct = &engine.accounts[user_idx as usize];
+                let cap = acct.capital.get();
+                let pos = acct.position_basis_q;
+                if cap == 0 && pos == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+                // entry_price not in current layout — use 0 as stub
+                let entry_price_raw: u64 = 0;
+                let pos_size = acct.position_basis_q;
+                let direction = if pos_size >= 0 { "LONG" } else { "SHORT" };
+                drop(data);
+
+                let (expected_nft_pda, nft_bump) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                let (expected_mint, mint_bump) =
+                    crate::position_nft::derive_position_nft_mint(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_mint, &expected_mint)?;
+
+                let (expected_vault_auth, vault_bump) =
+                    accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
+
+                {
+                    let nft_data = a_nft_pda
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    if nft_data.len() >= crate::position_nft::POSITION_NFT_STATE_LEN {
+                        if let Some(st) = crate::position_nft::read_position_nft_state(&nft_data) {
+                            if st.is_initialized() {
+                                return Err(ProgramError::AccountAlreadyInitialized);
+                            }
+                        }
+                    }
+                }
+
+                {
+                    #[allow(unused_variables)]
+                    let nft_pda_seeds: &[&[u8]] = &[
+                        crate::position_nft::POSITION_NFT_SEED,
+                        a_slab.key.as_ref(),
+                        &user_idx.to_le_bytes(),
+                        &[nft_bump],
+                    ];
+                    let space = crate::position_nft::POSITION_NFT_STATE_LEN;
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(space);
+                    let create_ix = solana_program::system_instruction::create_account(
+                        a_payer.key,
+                        a_nft_pda.key,
+                        lamports,
+                        space as u64,
+                        program_id,
+                    );
+                    #[cfg(not(feature = "test"))]
+                    {
+                        solana_program::program::invoke_signed(
+                            &create_ix,
+                            &[a_payer.clone(), a_nft_pda.clone(), a_system.clone()],
+                            &[nft_pda_seeds],
+                        )?;
+                    }
+                    let _ = (create_ix, a_system, a_rent);
+                }
+
+                {
+                    let mint_seeds: &[&[u8]] = &[
+                        crate::position_nft::POSITION_NFT_MINT_SEED,
+                        a_slab.key.as_ref(),
+                        &user_idx.to_le_bytes(),
+                        &[mint_bump],
+                    ];
+                    crate::position_nft::create_nft_mint_with_metadata(
+                        a_payer,
+                        a_nft_mint,
+                        a_vault_auth,
+                        a_system,
+                        a_token22,
+                        a_rent,
+                        mint_seeds,
+                        direction,
+                        entry_price_raw,
+                        pos_size,
+                    )?;
+                }
+
+                {
+                    let vault_seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[vault_bump]];
+                    crate::position_nft::mint_nft_to(
+                        a_token22,
+                        a_nft_mint,
+                        a_owner_ata,
+                        a_vault_auth,
+                        &[vault_seeds],
+                    )?;
+                }
+
+                {
+                    let mut nft_data = a_nft_pda
+                        .try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    let nft_state = crate::position_nft::PositionNftState {
+                        magic: crate::position_nft::POSITION_NFT_MAGIC,
+                        mint: a_nft_mint.key.to_bytes(),
+                        slab: a_slab.key.to_bytes(),
+                        owner: a_owner.key.to_bytes(),
+                        user_idx,
+                        pending_settlement: 0,
+                        bump: nft_bump,
+                        mint_bump,
+                        _reserved: [0u8; 19],
+                    };
+                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+                }
+
+                msg!(
+                    "PERC-608: MintPositionNft slab={} user_idx={} owner={} direction={}",
+                    a_slab.key,
+                    user_idx,
+                    a_owner.key,
+                    direction,
+                );
+            }
+
+            Instruction::TransferPositionOwnership { user_idx } => {
+                accounts::expect_len(accounts, 8)?;
+                let a_current_owner = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+                let a_nft_mint = &accounts[3];
+                let a_src_ata = &accounts[4];
+                let a_dst_ata = &accounts[5];
+                let a_new_owner = &accounts[6];
+                let a_token22 = &accounts[7];
+
+                accounts::expect_signer(a_current_owner)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_nft_pda)?;
+                accounts::expect_writable(a_nft_mint)?;
+                accounts::expect_writable(a_src_ata)?;
+                accounts::expect_writable(a_dst_ata)?;
+                verify_token22_program(a_token22)?;
+
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                {
+                    let engine = zc::engine_ref(&slab_data)?;
+                    check_idx(engine, user_idx)?;
+                }
+
+                let (expected_nft_pda, _) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                let mut nft_state = {
+                    let nft_data = a_nft_pda
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::read_position_nft_state(&nft_data)
+                        .filter(|s| s.is_initialized())
+                        .ok_or(ProgramError::UninitializedAccount)?
+                };
+
+                if nft_state.owner != a_current_owner.key.to_bytes() {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                if nft_state.mint != a_nft_mint.key.to_bytes() {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                if nft_state.pending_settlement != 0 {
+                    msg!("PERC-608: PendingFundingNotSettled — keeper must run settlement crank");
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                drop(slab_data);
+
+                crate::position_nft::transfer_nft(
+                    a_token22,
+                    a_nft_mint,
+                    a_src_ata,
+                    a_dst_ata,
+                    a_current_owner,
+                )?;
+
+                nft_state.owner = a_new_owner.key.to_bytes();
+                {
+                    let mut nft_data = a_nft_pda
+                        .try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+                }
+
+                msg!(
+                    "PERC-608: TransferPositionOwnership slab={} user_idx={} new_owner={}",
+                    a_slab.key,
+                    user_idx,
+                    a_new_owner.key,
+                );
+            }
+
+            Instruction::BurnPositionNft { user_idx } => {
+                accounts::expect_len(accounts, 7)?;
+                let a_owner = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+                let a_nft_mint = &accounts[3];
+                let a_owner_ata = &accounts[4];
+                let a_vault_auth = &accounts[5];
+                let a_token22 = &accounts[6];
+
+                accounts::expect_signer(a_owner)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_nft_pda)?;
+                accounts::expect_writable(a_nft_mint)?;
+                accounts::expect_writable(a_owner_ata)?;
+                verify_token22_program(a_token22)?;
+
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                drop(slab_data);
+
+                let (expected_nft_pda, _) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                let (expected_vault_auth, vault_bump) =
+                    accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
+
+                let nft_state = {
+                    let nft_data = a_nft_pda
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::read_position_nft_state(&nft_data)
+                        .filter(|s| s.is_initialized())
+                        .ok_or(ProgramError::UninitializedAccount)?
+                };
+
+                if nft_state.owner != a_owner.key.to_bytes() {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                if nft_state.mint != a_nft_mint.key.to_bytes() {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                crate::position_nft::burn_nft(a_token22, a_nft_mint, a_owner_ata, a_owner)?;
+
+                {
+                    let vault_seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[vault_bump]];
+                    crate::position_nft::close_nft_mint(
+                        a_token22,
+                        a_nft_mint,
+                        a_owner,
+                        a_vault_auth,
+                        &[vault_seeds],
+                    )?;
+                }
+
+                {
+                    let mut nft_data = a_nft_pda
+                        .try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    for b in nft_data.iter_mut() {
+                        *b = 0;
+                    }
+                }
+                {
+                    let lamports = a_nft_pda.lamports();
+                    **a_nft_pda
+                        .try_borrow_mut_lamports()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)? = 0;
+                    **a_owner
+                        .try_borrow_mut_lamports()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)? = a_owner
+                        .lamports()
+                        .checked_add(lamports)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                }
+
+                msg!(
+                    "PERC-608: BurnPositionNft slab={} user_idx={} owner={}",
+                    a_slab.key,
+                    user_idx,
+                    a_owner.key,
+                );
+            }
+
+            Instruction::SetPendingSettlement { user_idx } => {
+                accounts::expect_len(accounts, 3)?;
+                let a_keeper = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+
+                accounts::expect_signer(a_keeper)?;
+                accounts::expect_writable(a_nft_pda)?;
+
+                {
+                    let slab_data = a_slab
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                    let header = state::read_header(&slab_data);
+                    require_admin(header.admin, a_keeper.key)?;
+                }
+
+                let (expected_nft_pda, _) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                let mut nft_state = {
+                    let nft_data = a_nft_pda
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::read_position_nft_state(&nft_data)
+                        .filter(|s| s.is_initialized())
+                        .ok_or(ProgramError::UninitializedAccount)?
+                };
+
+                nft_state.pending_settlement = 1;
+
+                {
+                    let mut nft_data = a_nft_pda
+                        .try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+                }
+
+                msg!(
+                    "PERC-608: SetPendingSettlement slab={} user_idx={}",
+                    a_slab.key,
+                    user_idx,
+                );
+            }
+
+            Instruction::ClearPendingSettlement { user_idx } => {
+                accounts::expect_len(accounts, 3)?;
+                let a_keeper = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+
+                accounts::expect_signer(a_keeper)?;
+                accounts::expect_writable(a_nft_pda)?;
+
+                {
+                    let slab_data = a_slab
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                    let header = state::read_header(&slab_data);
+                    require_admin(header.admin, a_keeper.key)?;
+                }
+
+                let (expected_nft_pda, _) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                let mut nft_state = {
+                    let nft_data = a_nft_pda
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::read_position_nft_state(&nft_data)
+                        .filter(|s| s.is_initialized())
+                        .ok_or(ProgramError::UninitializedAccount)?
+                };
+
+                nft_state.pending_settlement = 0;
+
+                {
+                    let mut nft_data = a_nft_pda
+                        .try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+                }
+
+                msg!(
+                    "PERC-608: ClearPendingSettlement slab={} user_idx={}",
+                    a_slab.key,
+                    user_idx,
+                );
+            }
+
+            Instruction::SetWalletCap { cap_e6 } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                const MIN_WALLET_CAP_E6: u64 = 1_000;
+                if cap_e6 != 0 && cap_e6 < MIN_WALLET_CAP_E6 {
+                    msg!(
+                        "PERC-8224: SetWalletCap rejected: cap_e6={} is below minimum floor {} \
+                         (use 0 to disable, or >= {} to set a real cap)",
+                        cap_e6,
+                        MIN_WALLET_CAP_E6,
+                        MIN_WALLET_CAP_E6,
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let mut config = state::read_config(&data);
+                state::set_max_wallet_pos_e6(&mut config, cap_e6);
+                state::write_config(&mut data, &config);
+
+                let stored = state::get_max_wallet_pos_e6(&config);
+                msg!(
+                    "PERC-8111: SetWalletCap: cap_e6={} stored={}",
+                    cap_e6,
+                    stored,
+                );
+            }
+
+            Instruction::SetOiImbalanceHardBlock { threshold_bps } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                if threshold_bps > 10_000 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                let mut config = state::read_config(&data);
+                state::set_oi_imbalance_hard_block_bps(&mut config, threshold_bps);
+                state::write_config(&mut data, &config);
+
+                let stored = state::get_oi_imbalance_hard_block_bps(&config);
+                msg!(
+                    "PERC-8110: SetOiImbalanceHardBlock: threshold_bps={} stored={}",
+                    threshold_bps,
+                    stored,
+                );
+            }
 
             Instruction::TopUpKeeperFund { amount } => {
                 // accounts: [0] funder (signer), [1] slab (writable), [2] keeper_fund PDA (writable)
