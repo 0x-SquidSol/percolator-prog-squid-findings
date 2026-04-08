@@ -10105,37 +10105,72 @@ pub mod processor {
             }
 
             Instruction::ReclaimSlabRent => {
-                accounts::expect_len(accounts, 2)?;
-                let a_dest = &accounts[0];
-                let a_slab = &accounts[1];
+                // Two modes:
+                //   Mode A (2 accounts): slab is a signer — anyone with the keypair can reclaim.
+                //   Mode B (3 accounts): admin signs — reclaims orphan slabs without the keypair.
+                //     accounts[2] = slab account (not signer), admin verified from header if magic set.
+                let (a_dest, a_slab) = if accounts.len() >= 3 {
+                    // Mode B: admin reclaim for orphan zero-magic slabs
+                    let a_admin = &accounts[0];
+                    let a_slab = &accounts[1];
+                    let a_dest_override = &accounts[2];
+                    accounts::expect_signer(a_admin)?;
+                    accounts::expect_writable(a_slab)?;
+                    accounts::expect_writable(a_dest_override)?;
 
-                accounts::expect_signer(a_dest)?;
-                accounts::expect_writable(a_dest)?;
+                    if a_slab.owner != program_id {
+                        return Err(ProgramError::IllegalOwner);
+                    }
 
-                accounts::expect_signer(a_slab)?;
-                accounts::expect_writable(a_slab)?;
+                    // For Mode B, verify slab has NO magic (truly orphaned/uninitialized)
+                    let slab_data = a_slab.try_borrow_data()?;
+                    if slab_data.len() >= 8 {
+                        let magic = u64::from_le_bytes(
+                            slab_data[0..8].try_into()
+                                .map_err(|_| PercolatorError::InvalidMagic)?,
+                        );
+                        if magic == MAGIC {
+                            // Initialized slab — use CloseStaleSlabs or CloseOrphanSlab instead
+                            return Err(PercolatorError::AlreadyInitialized.into());
+                        }
+                    }
+                    drop(slab_data);
+
+                    (a_dest_override, a_slab)
+                } else {
+                    // Mode A: original — slab is signer
+                    accounts::expect_len(accounts, 2)?;
+                    let a_dest = &accounts[0];
+                    let a_slab = &accounts[1];
+
+                    accounts::expect_signer(a_dest)?;
+                    accounts::expect_writable(a_dest)?;
+
+                    accounts::expect_signer(a_slab)?;
+                    accounts::expect_writable(a_slab)?;
+
+                    if a_slab.owner != program_id {
+                        return Err(ProgramError::IllegalOwner);
+                    }
+
+                    let slab_data = a_slab.try_borrow_data()?;
+                    if slab_data.len() >= 8 {
+                        let magic = u64::from_le_bytes(
+                            slab_data[0..8].try_into()
+                                .map_err(|_| PercolatorError::InvalidMagic)?,
+                        );
+                        if magic == MAGIC {
+                            return Err(PercolatorError::AlreadyInitialized.into());
+                        }
+                    }
+                    drop(slab_data);
+
+                    (a_dest, a_slab)
+                };
 
                 if a_dest.key == a_slab.key {
                     return Err(ProgramError::InvalidArgument);
                 }
-
-                if a_slab.owner != program_id {
-                    return Err(ProgramError::IllegalOwner);
-                }
-
-                let slab_data = a_slab.try_borrow_data()?;
-                let slab_len = slab_data.len();
-                if slab_len >= 8 {
-                    let magic = u64::from_le_bytes(
-                        slab_data[0..8]
-                            .try_into()
-                            .map_err(|_| PercolatorError::InvalidMagic)?,
-                    );
-                    if magic == MAGIC {
-                        return Err(PercolatorError::AlreadyInitialized.into());
-                    }
-                }
-                drop(slab_data);
 
                 {
                     let mut data = a_slab.try_borrow_mut_data()?;
@@ -10150,9 +10185,8 @@ pub mod processor {
                     .ok_or(PercolatorError::EngineOverflow)?;
 
                 msg!(
-                    "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab (size={})",
+                    "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab",
                     slab_lamports,
-                    slab_len,
                 );
             }
 
