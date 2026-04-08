@@ -29,29 +29,25 @@ pub const TAG_SET_ORACLE_PRICE_CAP: u8 = 18;
 pub const TAG_RESOLVE_MARKET: u8 = 19;
 pub const TAG_WITHDRAW_INSURANCE: u8 = 20;
 pub const TAG_ADMIN_FORCE_CLOSE: u8 = 21;
-pub const TAG_UPDATE_RISK_PARAMS: u8 = 22;
-pub const TAG_RENOUNCE_ADMIN: u8 = 23;
-pub const TAG_CREATE_INSURANCE_MINT: u8 = 24;
-pub const TAG_DEPOSIT_INSURANCE_LP: u8 = 25;
-pub const TAG_WITHDRAW_INSURANCE_LP: u8 = 26;
-pub const TAG_PAUSE_MARKET: u8 = 27;
-pub const TAG_UNPAUSE_MARKET: u8 = 28;
-/// Two-step admin transfer: new admin accepts the proposal.
-pub const TAG_ACCEPT_ADMIN: u8 = 29;
-/// Set insurance withdrawal policy on a resolved market (PERC-110).
-pub const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 30;
-/// Withdraw limited amount from insurance fund per policy (PERC-110).
-pub const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
-/// Configure on-chain Pyth oracle for a market (PERC-117).
+// Tags 22-28: upstream repurposed these slots. Old names
+// (UpdateRiskParams, RenounceAdmin, CreateInsuranceMint,
+// DepositInsuranceLp, WithdrawInsuranceLp) no longer exist.
+// Correct mappings per decode table:
+pub const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 22;
+pub const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+pub const TAG_QUERY_LP_FEES: u8 = 24;
+pub const TAG_RECLAIM_EMPTY_ACCOUNT: u8 = 25;
+pub const TAG_SETTLE_ACCOUNT: u8 = 26;
+pub const TAG_DEPOSIT_FEE_CREDITS: u8 = 27;
+pub const TAG_CONVERT_RELEASED_PNL: u8 = 28;
+pub const TAG_RESOLVE_PERMISSIONLESS: u8 = 29;
+pub const TAG_FORCE_CLOSE_RESOLVED: u8 = 30;
+// Tag 31: gap (no decode arm)
+// Tags 32-36: reserved upstream slots (no decode arm in fork).
 pub const TAG_SET_PYTH_ORACLE: u8 = 32;
-/// Update mark price EMA (PERC-118, reserved).
 pub const TAG_UPDATE_MARK_PRICE: u8 = 33;
-/// Update Hyperp mark from DEX oracle (PERC-119).
 pub const TAG_UPDATE_HYPERP_MARK: u8 = 34;
-/// Optimized TradeCpi with caller-provided PDA bump (PERC-154).
-/// Eliminates find_program_address (~1500 CU savings).
 pub const TAG_TRADE_CPI_V2: u8 = 35;
-/// Unresolve a market: clear RESOLVED flag, re-enable trading (PERC-273).
 pub const TAG_UNRESOLVE_MARKET: u8 = 36;
 
 // ═══════════════════════════════════════════════════════════════
@@ -211,16 +207,16 @@ mod tests {
             TAG_RESOLVE_MARKET,
             TAG_WITHDRAW_INSURANCE,
             TAG_ADMIN_FORCE_CLOSE,
-            TAG_UPDATE_RISK_PARAMS,
-            TAG_RENOUNCE_ADMIN,
-            TAG_CREATE_INSURANCE_MINT,
-            TAG_DEPOSIT_INSURANCE_LP,
-            TAG_WITHDRAW_INSURANCE_LP,
-            TAG_PAUSE_MARKET,
-            TAG_UNPAUSE_MARKET,
-            TAG_ACCEPT_ADMIN,
             TAG_SET_INSURANCE_WITHDRAW_POLICY,
             TAG_WITHDRAW_INSURANCE_LIMITED,
+            TAG_QUERY_LP_FEES,
+            TAG_RECLAIM_EMPTY_ACCOUNT,
+            TAG_SETTLE_ACCOUNT,
+            TAG_DEPOSIT_FEE_CREDITS,
+            TAG_CONVERT_RELEASED_PNL,
+            TAG_RESOLVE_PERMISSIONLESS,
+            TAG_FORCE_CLOSE_RESOLVED,
+            // 31 = gap (no decode arm)
             TAG_SET_PYTH_ORACLE,
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
@@ -274,7 +270,7 @@ mod tests {
         }
     }
 
-    /// Ensure tags are sequential starting from 0.
+    /// Ensure tags are monotonically increasing (allows gaps for removed instructions).
     #[test]
     fn tags_are_sequential() {
         let tags: &[u8] = &[
@@ -300,16 +296,16 @@ mod tests {
             TAG_RESOLVE_MARKET,
             TAG_WITHDRAW_INSURANCE,
             TAG_ADMIN_FORCE_CLOSE,
-            TAG_UPDATE_RISK_PARAMS,
-            TAG_RENOUNCE_ADMIN,
-            TAG_CREATE_INSURANCE_MINT,
-            TAG_DEPOSIT_INSURANCE_LP,
-            TAG_WITHDRAW_INSURANCE_LP,
-            TAG_PAUSE_MARKET,
-            TAG_UNPAUSE_MARKET,
-            TAG_ACCEPT_ADMIN,
             TAG_SET_INSURANCE_WITHDRAW_POLICY,
             TAG_WITHDRAW_INSURANCE_LIMITED,
+            TAG_QUERY_LP_FEES,
+            TAG_RECLAIM_EMPTY_ACCOUNT,
+            TAG_SETTLE_ACCOUNT,
+            TAG_DEPOSIT_FEE_CREDITS,
+            TAG_CONVERT_RELEASED_PNL,
+            TAG_RESOLVE_PERMISSIONLESS,
+            TAG_FORCE_CLOSE_RESOLVED,
+            // 31 = gap (no decode arm)
             TAG_SET_PYTH_ORACLE,
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
@@ -349,11 +345,12 @@ mod tests {
             TAG_CLEAR_PENDING_SETTLEMENT,
         ];
 
-        for (i, &tag) in tags.iter().enumerate() {
-            assert_eq!(
-                tag, i as u8,
-                "Tag at index {} should be {} but is {}",
-                i, i, tag
+        // Verify monotonically increasing (allows gaps for removed instructions)
+        for i in 1..tags.len() {
+            assert!(
+                tags[i] > tags[i - 1],
+                "Tags not monotonically increasing at index {}: {} <= {}",
+                i, tags[i], tags[i - 1]
             );
         }
     }

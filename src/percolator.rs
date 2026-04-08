@@ -3736,7 +3736,10 @@ pub mod lp_vault {
         pub total_epochs: u8,
         pub _pad: [u8; 6],
         pub claimed_so_far: u64,
-        pub _reserved: [u8; 24],
+        /// SECURITY(CR-2): Slot of last successful claim. Used to enforce
+        /// one claim per epoch_duration window. 0 = no claim yet.
+        pub last_claim_slot: u64,
+        pub _reserved: [u8; 16],
     }
 
     impl WithdrawQueue {
@@ -3817,7 +3820,8 @@ pub mod lp_vault {
                 total_epochs: epochs,
                 _pad: [0; 6],
                 claimed_so_far: 0,
-                _reserved: [0; 24],
+                last_claim_slot: 0,
+                _reserved: [0; 16],
             }
         }
         #[test]
@@ -6636,6 +6640,8 @@ pub mod processor {
             }
             Instruction::LiquidateAtOracle { target_idx } => {
                 accounts::expect_len(accounts, 4)?;
+                // AUDIT CRIT-2 FIX: require caller to be a signer
+                accounts::expect_signer(&accounts[0])?;
                 let a_slab = &accounts[1];
                 let a_oracle = &accounts[3];
                 accounts::expect_writable(a_slab)?;
@@ -7116,8 +7122,17 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
-                // Update oracle authority in config
+                // SECURITY(M-4): Block SetOracleAuthority on Pyth-pinned markets.
+                // Pyth-pinned markets guarantee decentralized oracle pricing.
+                // Setting a non-zero authority would silently switch to admin-oracle
+                // mode, breaking the trust model users signed up for.
                 let mut config = state::read_config(&data);
+                if crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id)
+                    && new_authority != Pubkey::default()
+                {
+                    msg!("SetOracleAuthority: blocked on Pyth-pinned market");
+                    return Err(ProgramError::InvalidArgument);
+                }
                 // Hyperp: reject zero-address unless trade flow has bootstrapped
                 // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
                 // there's no mark price source. With EWMA bootstrapped, the market
@@ -8718,7 +8733,7 @@ pub mod processor {
             }
 
             Instruction::LpVaultWithdraw { lp_amount } => {
-                accounts::expect_len(accounts, 10)?;
+                accounts::expect_len(accounts, 11)?;
                 let a_withdrawer = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_withdrawer_ata = &accounts[2];
@@ -8742,6 +8757,8 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
                 }
 
+                // accounts[9] = creator_lock_pda (existing)
+                // accounts[10] = withdraw_queue_pda (SECURITY H-6)
                 {
                     let a_creator_lock = &accounts[9];
                     let (expected_lock_pda, _) = Pubkey::find_program_address(
@@ -8789,6 +8806,37 @@ pub mod processor {
                                     msg!("CREATOR_LOCK: fee redirect activated");
                                 }
                                 crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                            }
+                        }
+                    }
+                }
+
+                // SECURITY(H-6): Block instant withdraw when user has an active
+                // withdrawal queue. Without this, the user can queue LP tokens
+                // and then immediately withdraw the same tokens via LpVaultWithdraw,
+                // creating a double-spend on the queued claim.
+                {
+                    let a_withdraw_queue = &accounts[10];
+                    let (expected_queue, _) =
+                        accounts::derive_withdraw_queue(program_id, a_slab.key, a_withdrawer.key);
+                    accounts::expect_key(a_withdraw_queue, &expected_queue)?;
+                    if a_withdraw_queue.data_len() >= crate::lp_vault::WITHDRAW_QUEUE_LEN {
+                        let q_data = a_withdraw_queue
+                            .try_borrow_data()
+                            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                        if let Some(queue) = crate::lp_vault::read_withdraw_queue(&q_data) {
+                            if queue.is_initialized() {
+                                let unclaimed =
+                                    queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
+                                if unclaimed > 0 {
+                                    msg!(
+                                        "LpVaultWithdraw blocked: active queue has {} unclaimed LP",
+                                        unclaimed
+                                    );
+                                    return Err(
+                                        PercolatorError::WithdrawQueueAlreadyExists.into()
+                                    );
+                                }
                             }
                         }
                     }
@@ -9359,6 +9407,14 @@ pub mod processor {
 
                 let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+                // SECURITY(H-2): Validate LP escrow is owned by vault authority PDA
+                // and holds the correct LP vault mint. Without this, an attacker can
+                // pass their own token account as escrow, getting engine collateral
+                // credit while retaining control of the LP tokens.
+                let (vault_auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_token_account(a_lp_escrow, &vault_auth, &expected_mint)?;
+
                 let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
 
                 let collateral_units = crate::lp_collateral::lp_token_value(
@@ -9456,6 +9512,11 @@ pub mod processor {
 
                 let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+                // SECURITY(H-2): Validate LP escrow on withdrawal too (defense-in-depth).
+                let (vault_auth_check, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_token_account(a_lp_escrow, &vault_auth_check, &expected_mint)?;
+
                 let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
 
                 let collateral_units = crate::lp_collateral::lp_token_value(
@@ -9595,7 +9656,8 @@ pub mod processor {
                     total_epochs: queue_epochs,
                     _pad: [0; 6],
                     claimed_so_far: 0,
-                    _reserved: [0; 24],
+                    last_claim_slot: 0,
+                    _reserved: [0; 16],
                 };
 
                 let mut q_data = a_queue.try_borrow_mut_data()?;
@@ -9642,6 +9704,26 @@ pub mod processor {
                     return Err(PercolatorError::WithdrawQueueNotFound.into());
                 }
 
+                // SECURITY(CR-2): Enforce one claim per epoch duration window.
+                // Without this, all epochs are claimable in a single slot because
+                // claimable_this_epoch() uses only the epochs_remaining counter
+                // with no clock check.
+                let clock = Clock::get()?;
+                if queue.last_claim_slot > 0
+                    && clock.slot
+                        < queue
+                            .last_claim_slot
+                            .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS)
+                {
+                    msg!(
+                        "ClaimQueuedWithdrawal: epoch not elapsed (slot={}, next={})",
+                        clock.slot,
+                        queue.last_claim_slot
+                            .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS),
+                    );
+                    return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
+                }
+
                 let claimable = queue.claimable_this_epoch();
                 if claimable == 0 {
                     return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
@@ -9649,6 +9731,7 @@ pub mod processor {
 
                 queue.claimed_so_far = queue.claimed_so_far.saturating_add(claimable);
                 queue.epochs_remaining = queue.epochs_remaining.saturating_sub(1);
+                queue.last_claim_slot = clock.slot;
                 crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
                 drop(q_data);
 
@@ -9702,8 +9785,13 @@ pub mod processor {
 
                 let slab_data = a_slab.try_borrow_data()?;
                 let config = state::read_config(&slab_data);
-                let base_amount =
-                    crate::units::units_to_base(capital_units as u64, config.unit_scale);
+                // SECURITY(M-8): use units_to_base_checked (matches LpVaultWithdraw).
+                // The saturating variant silently clamps to u64::MAX on overflow.
+                let base_amount = crate::units::units_to_base_checked(
+                    capital_units as u64,
+                    config.unit_scale,
+                )
+                .ok_or(PercolatorError::EngineOverflow)?;
 
                 if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
                     let remaining = vault_state
@@ -9838,6 +9926,12 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
+                // SECURITY H-1: Block ADL on resolved markets — resolved markets
+                // use ForceCloseResolved at settlement price, not ADL at oracle price.
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 {
                     let header = state::read_header(&data);
                     require_admin(header.admin, a_keeper.key)?;
@@ -9873,6 +9967,7 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
 
+                // H-4: Insurance fund must be fully depleted before ADL activates.
                 let insurance_balance = engine.insurance_fund.balance.get();
                 if insurance_balance != 0 {
                     msg!(
@@ -9882,46 +9977,45 @@ pub mod processor {
                     return Err(PercolatorError::InsuranceFundNotDepleted.into());
                 }
 
-                check_idx(engine, target_idx)?;
-                let pos_size = engine.accounts[target_idx as usize].position_basis_q;
-                if pos_size == 0 {
-                    msg!("ADL: target_idx={} position already closed", target_idx);
-                    return Err(PercolatorError::BankruptPositionAlreadyClosed.into());
-                }
-
-                let pnl_pos_tot = engine.pnl_pos_tot;
+                // SECURITY(H-4): Pre-check — reject ADL when PnL clearly within cap.
+                // The definitive check uses post-touch pnl_pos_tot (see below).
                 let cap = state::get_max_pnl_cap(&config) as u128;
-                let excess = if pnl_pos_tot > cap {
-                    pnl_pos_tot.saturating_sub(cap)
-                } else {
-                    pnl_pos_tot
-                };
-
-                // execute_adl not in current RiskEngine layout.
-                // Stub: record the closed position size and zero out the position via set_position_basis_q.
-                // Note: set_position_basis_q is private — we set position_basis_q directly.
-                let closed_abs = pos_size.unsigned_abs();
-                engine.accounts[target_idx as usize].position_basis_q = 0;
-
-                let final_pnl = engine.accounts[target_idx as usize].pnl;
-                if final_pnl > 0 {
-                    let settle = final_pnl as u128;
-                    let old_cap = engine.accounts[target_idx as usize].capital.get();
-                    engine.accounts[target_idx as usize].capital =
-                        percolator::U128::new(old_cap.saturating_add(settle));
-                    engine.set_pnl(target_idx as usize, 0);
-                    engine.c_tot = percolator::U128::new(engine.c_tot.get().saturating_add(settle));
+                {
+                    let pnl_pre = engine.pnl_pos_tot;
+                    if cap > 0 && pnl_pre <= cap {
+                        msg!(
+                            "ADL: pnl_pos_tot={} within cap={} — no deleverage needed",
+                            pnl_pre,
+                            cap
+                        );
+                        return Err(ProgramError::InvalidArgument);
+                    }
                 }
+
+                let funding_rate = compute_current_funding_rate(&config);
+
+                let (closed_abs, final_pnl) = engine
+                    .execute_adl_not_atomic(
+                        target_idx as usize,
+                        clock.slot,
+                        price,
+                        funding_rate,
+                    )
+                    .map_err(map_risk_error)?;
+
+                // SECURITY(H-2): Recompute excess from post-touch pnl_pos_tot for accurate logging.
+                let excess = engine.pnl_pos_tot.saturating_sub(cap);
 
                 let closed_lo = closed_abs as u64;
                 let closed_hi = (closed_abs >> 64) as u64;
                 sol_log_64(0xAD1E_0001, target_idx as u64, price, closed_lo, closed_hi);
 
                 msg!(
-                    "ADL: idx={} closed={} excess={} insurance=0 pnl_pos_tot_after={}",
+                    "ADL: idx={} closed={} excess={} final_pnl={} insurance=0 pnl_pos_tot_after={}",
                     target_idx,
                     closed_abs,
                     excess,
+                    final_pnl,
                     engine.pnl_pos_tot
                 );
             }
@@ -9938,16 +10032,24 @@ pub mod processor {
                     return Err(ProgramError::IllegalOwner);
                 }
 
-                const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
-                const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
+                // SECURITY(H-7): Reject slabs with valid sizes — use CloseSlab for those.
+                // Synchronized with slab_guard's accepted sizes. Previous version had:
+                //   - PRE_118/OLDEST using stale offsets (-16/-24 instead of -48/-56)
+                //   - PRE_DEX_POOL_SLAB_LEN missing entirely
+                //   - V1M2_MEDIUM_TRANSITIONAL missing entirely
+                const PRE_DEX_POOL_SLAB_LEN: usize = SLAB_LEN - 32;
+                const PRE_118_SLAB_LEN: usize = SLAB_LEN - 48;
+                const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56;
                 const PRE_ADL_SLAB_LEN: usize = 1025880;
                 const V1M_SMALL_LEN: usize = 65416;
                 const V1M_MEDIUM_LEN: usize = 257512;
                 const V1M_LARGE_LEN: usize = 1025896;
                 const V1M2_MEDIUM_LEN: usize = 323312;
+                const V1M2_MEDIUM_TRANSITIONAL: usize = 323328;
                 let slab_data = a_slab.try_borrow_data()?;
                 let slab_len = slab_data.len();
                 if slab_len == SLAB_LEN
+                    || slab_len == PRE_DEX_POOL_SLAB_LEN
                     || slab_len == PRE_118_SLAB_LEN
                     || slab_len == OLDEST_SLAB_LEN
                     || slab_len == PRE_ADL_SLAB_LEN
@@ -9955,6 +10057,7 @@ pub mod processor {
                     || slab_len == V1M_MEDIUM_LEN
                     || slab_len == V1M_LARGE_LEN
                     || slab_len == V1M2_MEDIUM_LEN
+                    || slab_len == V1M2_MEDIUM_TRANSITIONAL
                 {
                     return Err(PercolatorError::InvalidSlabLen.into());
                 }
@@ -10094,65 +10197,29 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // SECURITY(CR-1): Use typed engine accessor instead of hardcoded
+                // byte offsets. The old code had three critical bugs:
+                //   1. Read slab_data[8..10] as max_accounts — actually the version field
+                //   2. Hardcoded ACCT_SIZE=240 — actual Account is 320 bytes on SBF
+                //   3. Hardcoded ACCT_OWNER_OFF=184 — stale after Account struct changes
+                // Fix: use zc::engine_mut() + direct struct field access, matching
+                // every other instruction handler in the codebase.
                 let mut slab_data = a_slab.try_borrow_mut_data()?;
-                if slab_data.len() < 16 {
-                    return Err(ProgramError::AccountDataTooSmall);
-                }
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
 
-                let magic = u64::from_le_bytes(
-                    slab_data[0..8]
-                        .try_into()
-                        .map_err(|_| PercolatorError::InvalidMagic)?,
-                );
-                if magic != MAGIC {
-                    return Err(PercolatorError::InvalidMagic.into());
-                }
+                let engine = zc::engine_mut(&mut slab_data)?;
 
-                let max_accounts = u16::from_le_bytes(
-                    slab_data[8..10]
-                        .try_into()
-                        .map_err(|_| ProgramError::InvalidAccountData)?,
-                );
-
-                if user_idx >= max_accounts {
+                // Validate user_idx is in range and slot is allocated (bitmap).
+                if (user_idx as usize) >= percolator::MAX_ACCOUNTS
+                    || !engine.is_used(user_idx as usize)
+                {
                     return Err(ProgramError::InvalidArgument);
                 }
 
-                const ACCT_SIZE: usize = 240;
-                const V0_BITMAP_OFF: usize = 608;
-                const V1D_BITMAP_OFF: usize = 1048;
-
-                let bitmap_bytes = (max_accounts as usize).div_ceil(8);
-                let v0_accounts_off = V0_BITMAP_OFF + bitmap_bytes;
-                let v1d_accounts_off = V1D_BITMAP_OFF + bitmap_bytes;
-
-                let v0_total = v0_accounts_off + (max_accounts as usize) * ACCT_SIZE;
-                let v1d_total = v1d_accounts_off + (max_accounts as usize) * ACCT_SIZE;
-
-                let (bitmap_off, accounts_off) =
-                    if slab_data.len() >= v0_total && slab_data.len() <= v0_total + 8 {
-                        (V0_BITMAP_OFF, v0_accounts_off)
-                    } else if slab_data.len() >= v1d_total && slab_data.len() <= v1d_total + 16 {
-                        (V1D_BITMAP_OFF, v1d_accounts_off)
-                    } else {
-                        return Err(ProgramError::InvalidAccountData);
-                    };
-
-                let acct_off = accounts_off + (user_idx as usize) * ACCT_SIZE;
-
-                let byte_idx = bitmap_off + (user_idx as usize) / 8;
-                let bit_idx = (user_idx as usize) % 8;
-                if byte_idx >= slab_data.len() || (slab_data[byte_idx] & (1 << bit_idx)) == 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                const ACCT_OWNER_OFF: usize = 184;
-                let owner_off = acct_off + ACCT_OWNER_OFF;
-                if owner_off + 32 > slab_data.len() {
-                    return Err(ProgramError::AccountDataTooSmall);
-                }
-
-                slab_data[owner_off..owner_off + 32].copy_from_slice(&new_owner);
+                // Write new owner via typed struct — compiler resolves correct
+                // field offset for the target architecture (SBF vs native).
+                engine.accounts[user_idx as usize].owner = new_owner;
 
                 msg!(
                     "TransferPositionOwnership: idx={}, new_owner={}",
@@ -12046,4 +12113,64 @@ pub mod risk {
     pub use crate::processor::{
         MatchingEngine, NoOpMatcher, TradeExecution,
     };
+}
+
+// =============================================================================
+// Fuzz helpers — only compiled when the "test" feature is enabled.
+// These thin wrappers expose private or panic-unsafe internal paths with safe
+// signatures so libFuzzer targets can drive them without crashing the harness.
+// =============================================================================
+
+/// Public fuzz surface gated behind the `test` feature flag.
+/// None of these functions are reachable from a deployed BPF binary.
+#[cfg(feature = "test")]
+pub mod fuzz_helpers {
+    use super::*;
+    use crate::constants::{HEADER_LEN, CONFIG_LEN};
+    use crate::state::{SlabHeader, MarketConfig};
+    use solana_program::program_error::ProgramError;
+
+    /// Decode an arbitrary byte slice as a program instruction.
+    /// Always returns Ok or Err — never panics.
+    pub fn fuzz_decode_instruction(input: &[u8]) -> Result<ix::Instruction, ProgramError> {
+        ix::Instruction::decode(input)
+    }
+
+    /// Parse risk params from an arbitrary byte slice by routing through the
+    /// InitMarket tag (0).  The decoder calls `read_risk_params` internally,
+    /// so we exercise that private path without duplicating its logic.
+    ///
+    /// Returns Ok or Err — never panics regardless of input length.
+    pub fn fuzz_read_risk_params_via_decode(payload: &[u8]) -> Result<ix::Instruction, ProgramError> {
+        // Prepend tag=0 (InitMarket) and let the full decoder run.
+        let mut buf = alloc::vec![0u8]; // tag byte
+        buf.extend_from_slice(payload);
+        ix::Instruction::decode(&buf)
+    }
+
+    /// Safe slab-header parse: returns None if the buffer is too short,
+    /// SlabHeader on any valid-length input.  Never panics.
+    pub fn fuzz_read_header(data: &[u8]) -> Option<SlabHeader> {
+        if data.len() < HEADER_LEN {
+            return None;
+        }
+        Some(state::read_header(data))
+    }
+
+    /// Safe market-config parse: returns None if the buffer is too short,
+    /// MarketConfig on any valid-length input.  Never panics.
+    pub fn fuzz_read_config(data: &[u8]) -> Option<MarketConfig> {
+        if data.len() < HEADER_LEN + CONFIG_LEN {
+            return None;
+        }
+        Some(state::read_config(data))
+    }
+
+    /// Parse both header and config from a single slab byte slice.
+    /// Returns (header, config) if the slice is large enough, None otherwise.
+    pub fn fuzz_read_header_and_config(data: &[u8]) -> Option<(SlabHeader, MarketConfig)> {
+        let h = fuzz_read_header(data)?;
+        let c = fuzz_read_config(data)?;
+        Some((h, c))
+    }
 }
