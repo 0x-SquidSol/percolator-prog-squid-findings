@@ -1323,6 +1323,10 @@ pub mod ix {
         /// Reads DEX pool price (PumpSwap/Raydium CLMM/Meteora DLMM),
         /// applies EMA smoothing with circuit breaker, and writes new mark price.
         UpdateHyperpMark,
+        /// Admin emergency pause (tag 76). Blocks Trade/Deposit/Withdraw/InitUser.
+        PauseMarket,
+        /// Admin unpause (tag 77). Re-enables all operations.
+        UnpauseMarket,
 
         // ─── Fork-specific instructions ────────────────────────────────────
 
@@ -1753,6 +1757,8 @@ pub mod ix {
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
                 34 => Ok(Instruction::UpdateHyperpMark),
+                76 => Ok(Instruction::PauseMarket),
+                77 => Ok(Instruction::UnpauseMarket),
                 // Fork-specific instructions
                 57 => {
                     // TopUpKeeperFund
@@ -5989,6 +5995,14 @@ pub mod processor {
             // Accounts: [0] slab(writable), [1] DEX pool, [2] clock, [3..N] remaining
             Instruction::UpdateHyperpMark => {
                 handle_update_hyperp_mark(program_id, accounts)?;
+            }
+
+            Instruction::PauseMarket => {
+                handle_pause_market(program_id, accounts)?;
+            }
+
+            Instruction::UnpauseMarket => {
+                handle_unpause_market(program_id, accounts)?;
             }
 
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
@@ -13411,6 +13425,56 @@ pub mod processor {
             dex_result.quote_liquidity,
         );
 
+        Ok(())
+    }
+
+    // --- PauseMarket (tag 76) ---
+    #[inline(never)]
+    fn handle_pause_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        state::set_paused(&mut data, true);
+        msg!("Market paused by admin");
+        Ok(())
+    }
+
+    // --- UnpauseMarket (tag 77) ---
+    #[inline(never)]
+    fn handle_unpause_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        state::set_paused(&mut data, false);
+        msg!("Market unpaused by admin");
         Ok(())
     }
 

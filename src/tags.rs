@@ -176,6 +176,11 @@ pub const TAG_SET_DEX_POOL: u8 = 74;
 ///       skew_spread_mult_bps(2) = 72 bytes total
 /// Accounts: [admin(signer), slab(readonly), matcher_ctx(writable), matcher_prog(executable), lp_pda]
 pub const TAG_INIT_MATCHER_CTX: u8 = 75;
+/// Admin emergency pause — blocks Trade, Deposit, Withdraw, InitUser.
+/// Crank, Liquidate, and admin ops still work while paused.
+pub const TAG_PAUSE_MARKET: u8 = 76;
+/// Admin unpause — re-enables all operations.
+pub const TAG_UNPAUSE_MARKET: u8 = 77;
 
 #[cfg(test)]
 mod tests {
@@ -261,6 +266,8 @@ mod tests {
             TAG_CLOSE_ORPHAN_SLAB,
             TAG_SET_DEX_POOL,
             TAG_INIT_MATCHER_CTX,
+            TAG_PAUSE_MARKET,
+            TAG_UNPAUSE_MARKET,
         ];
 
         for i in 0..tags.len() {
