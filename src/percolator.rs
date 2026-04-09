@@ -97,6 +97,15 @@ pub mod constants {
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
 
+    // Hyperp EMA oracle constants
+    /// EMA window in slots for UpdateHyperpMark (~8 hours at 2.5 slots/sec).
+    pub const MARK_PRICE_EMA_WINDOW_SLOTS: u64 = 72_000;
+    /// Per-slot alpha for the 8-hour Hyperp EMA (≈ 2/72001 in e6 units).
+    pub const MARK_PRICE_EMA_ALPHA_E6: u64 = 2_000_000 / (MARK_PRICE_EMA_WINDOW_SLOTS + 1);
+    /// Minimum quote-side DEX liquidity required for UpdateHyperpMark to accept a price.
+    /// 2_000_000_000_000 = 2,000,000 USDC (at 6 decimals). Thin pools below this are rejected.
+    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 2_000_000_000_000;
+
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
     // 1..9: req_id (u64)
@@ -1106,6 +1115,7 @@ pub mod error {
         BankruptPositionAlreadyClosed,
         AuditViolation,
         CrossMarginPairNotFound,
+        InsufficientDexLiquidity,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1308,6 +1318,11 @@ pub mod ix {
         ForceCloseResolved {
             user_idx: u16,
         },
+
+        /// Permissionless Hyperp DEX EMA oracle update (tag 34).
+        /// Reads DEX pool price (PumpSwap/Raydium CLMM/Meteora DLMM),
+        /// applies EMA smoothing with circuit breaker, and writes new mark price.
+        UpdateHyperpMark,
 
         // ─── Fork-specific instructions ────────────────────────────────────
 
@@ -1737,6 +1752,7 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
+                34 => Ok(Instruction::UpdateHyperpMark),
                 // Fork-specific instructions
                 57 => {
                     // TopUpKeeperFund
@@ -2579,6 +2595,19 @@ pub mod state {
     #[inline]
     pub fn set_market_created_slot(_config: &mut MarketConfig, _v: u64) {}
 
+    /// PERC-118: Read the mark oracle weight bps.
+    /// The field is absent in this layout — always returns 0 (pure DEX price, no oracle blend).
+    #[inline]
+    pub fn get_mark_oracle_weight_bps(_config: &MarketConfig) -> u16 {
+        0
+    }
+
+    /// Write the last observed DEX quote liquidity.
+    /// The dedicated storage field is absent in this layout — this is a no-op.
+    /// Pool depth enforcement is handled via the dex_pool key check instead.
+    #[inline]
+    pub fn set_last_dex_liquidity_k(_config: &mut MarketConfig, _quote_liquidity: u64) {}
+
     pub fn read_config(data: &[u8]) -> MarketConfig {
         let mut c = MarketConfig::zeroed();
         let src = &data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
@@ -3258,6 +3287,449 @@ pub mod oracle {
             return Err(super::error::PercolatorError::OracleStale.into());
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // DEX Oracle Readers (PumpSwap, Raydium CLMM, Meteora DLMM)
+    // Used by handle_update_hyperp_mark (tag 34).
+    // =========================================================================
+
+    // Raydium CLMM PoolState layout (Anchor — 8-byte discriminator)
+    const RAYDIUM_CLMM_MIN_LEN: usize = 269;
+    const RAYDIUM_CLMM_OFF_DECIMALS0: usize = 233;
+    const RAYDIUM_CLMM_OFF_DECIMALS1: usize = 234;
+    const RAYDIUM_CLMM_OFF_SQRT_PRICE_X64: usize = 253;
+
+    // PumpSwap pool layout (no Anchor discriminator)
+    const PUMPSWAP_MIN_LEN: usize = 195;
+    const PUMPSWAP_OFF_BASE_MINT: usize = 35;
+    const PUMPSWAP_OFF_QUOTE_MINT: usize = 67;
+    const PUMPSWAP_OFF_BASE_VAULT: usize = 131;
+    const PUMPSWAP_OFF_QUOTE_VAULT: usize = 163;
+
+    // SPL Token Account: amount is at offset 64 (u64 LE)
+    const SPL_TOKEN_AMOUNT_OFF: usize = 64;
+    const SPL_TOKEN_ACCOUNT_MIN_LEN: usize = 72;
+
+    // Meteora DLMM LbPair layout offsets
+    const METEORA_DLMM_PRICE_MIN_LEN: usize = 80;
+    const METEORA_DLMM_MIN_LEN: usize = 216;
+    const METEORA_DLMM_OFF_BIN_STEP_SEED: usize = 73;
+    const METEORA_DLMM_OFF_ACTIVE_ID: usize = 76;
+    const METEORA_DLMM_OFF_RESERVE_Y: usize = 184;
+
+    /// DEX price result with liquidity information.
+    /// Used by UpdateHyperpMark to enforce minimum liquidity before accepting a price.
+    pub struct DexPriceResult {
+        /// The spot price in e6 format.
+        pub price_e6: u64,
+        /// Quote-side liquidity in the pool (quote token lamports/atoms).
+        /// For PumpSwap: quote vault balance.
+        /// For Raydium CLMM: virtual quote depth (L * sqrt_price / 2^64).
+        /// For Meteora DLMM: vault_y SPL token balance.
+        pub quote_liquidity: u64,
+    }
+
+    /// Read spot price from a Raydium CLMM pool account.
+    /// Uses sqrt_price_x64 (Q64.64 fixed-point) to compute token_1 per token_0 in e6.
+    fn read_raydium_clmm_price_e6(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+    ) -> Result<u64, ProgramError> {
+        if price_ai.key.to_bytes() != *expected_feed_id {
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+
+        let data = price_ai.try_borrow_data()?;
+        if data.len() < RAYDIUM_CLMM_MIN_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let decimals_0 = data[RAYDIUM_CLMM_OFF_DECIMALS0] as i32;
+        let decimals_1 = data[RAYDIUM_CLMM_OFF_DECIMALS1] as i32;
+
+        let sqrt_price_x64 = u128::from_le_bytes(
+            data[RAYDIUM_CLMM_OFF_SQRT_PRICE_X64..RAYDIUM_CLMM_OFF_SQRT_PRICE_X64 + 16]
+                .try_into()
+                .unwrap(),
+        );
+
+        if sqrt_price_x64 == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        let decimal_diff = 6i32 + decimals_0 - decimals_1;
+
+        // Hi/lo decomposition for pseudo-256-bit squaring precision
+        let hi = sqrt_price_x64 >> 64;
+        let lo = sqrt_price_x64 & ((1u128 << 64) - 1);
+        let hh = hi * hi;
+        let hl2 = hi.checked_mul(lo).unwrap_or(u128::MAX >> 1) << 1;
+        let price_ratio = hh.saturating_add(hl2 >> 64);
+
+        let price_e6_raw = price_ratio
+            .checked_mul(1_000_000)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        let price_e6 = if decimal_diff >= 0 {
+            let scale = 10u128.pow(decimal_diff as u32);
+            price_e6_raw
+                .checked_mul(scale)
+                .ok_or(PercolatorError::EngineOverflow)?
+        } else {
+            let scale = 10u128.pow((-decimal_diff) as u32);
+            price_e6_raw / scale
+        };
+
+        if price_e6 == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        if price_e6 > u64::MAX as u128 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+
+        Ok(price_e6 as u64)
+    }
+
+    /// Read spot price from a PumpSwap AMM pool. Price = quote_reserve / base_reserve in e6.
+    fn read_pumpswap_price_e6(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+        remaining: &[AccountInfo],
+    ) -> Result<u64, ProgramError> {
+        if price_ai.key.to_bytes() != *expected_feed_id {
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+
+        let pool_data = price_ai.try_borrow_data()?;
+        if pool_data.len() < PUMPSWAP_MIN_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if remaining.len() < 2 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+
+        let _base_mint: [u8; 32] = pool_data[PUMPSWAP_OFF_BASE_MINT..PUMPSWAP_OFF_BASE_MINT + 32]
+            .try_into()
+            .unwrap();
+        let _quote_mint: [u8; 32] = pool_data
+            [PUMPSWAP_OFF_QUOTE_MINT..PUMPSWAP_OFF_QUOTE_MINT + 32]
+            .try_into()
+            .unwrap();
+
+        let expected_base_vault: [u8; 32] = pool_data
+            [PUMPSWAP_OFF_BASE_VAULT..PUMPSWAP_OFF_BASE_VAULT + 32]
+            .try_into()
+            .unwrap();
+        let expected_quote_vault: [u8; 32] = pool_data
+            [PUMPSWAP_OFF_QUOTE_VAULT..PUMPSWAP_OFF_QUOTE_VAULT + 32]
+            .try_into()
+            .unwrap();
+
+        if remaining[0].key.to_bytes() != expected_base_vault {
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+        if remaining[1].key.to_bytes() != expected_quote_vault {
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+
+        let base_vault_data = remaining[0].try_borrow_data()?;
+        let quote_vault_data = remaining[1].try_borrow_data()?;
+
+        if base_vault_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN
+            || quote_vault_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let base_amount = u64::from_le_bytes(
+            base_vault_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let quote_amount = u64::from_le_bytes(
+            quote_vault_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+
+        if base_amount == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        let price_e6 = (quote_amount as u128)
+            .checked_mul(1_000_000)
+            .ok_or(PercolatorError::EngineOverflow)?
+            / (base_amount as u128);
+
+        if price_e6 == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        if price_e6 > u64::MAX as u128 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+
+        Ok(price_e6 as u64)
+    }
+
+    /// Read spot price from a Meteora DLMM pool account.
+    /// Price formula: (1 + bin_step/10000) ^ active_id, converted to e6.
+    fn read_meteora_dlmm_price_e6(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+    ) -> Result<u64, ProgramError> {
+        if price_ai.key.to_bytes() != *expected_feed_id {
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+
+        let data = price_ai.try_borrow_data()?;
+        if data.len() < METEORA_DLMM_PRICE_MIN_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let bin_step = u16::from_le_bytes(
+            data[METEORA_DLMM_OFF_BIN_STEP_SEED..METEORA_DLMM_OFF_BIN_STEP_SEED + 2]
+                .try_into()
+                .unwrap(),
+        ) as u64;
+
+        let active_id = i32::from_le_bytes(
+            data[METEORA_DLMM_OFF_ACTIVE_ID..METEORA_DLMM_OFF_ACTIVE_ID + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        if bin_step == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        let is_negative = active_id < 0;
+        let exp = if is_negative {
+            (-(active_id as i64)) as u64
+        } else {
+            active_id as u64
+        };
+
+        const SCALE: u128 = 1_000_000_000_000_000_000; // 1e18
+        let base = SCALE + (bin_step as u128) * SCALE / 10_000;
+
+        let mut result: u128 = SCALE;
+        let mut b: u128 = base;
+        let mut e = exp;
+
+        while e > 0 {
+            if e & 1 == 1 {
+                result = result
+                    .checked_mul(b)
+                    .ok_or(PercolatorError::EngineOverflow)?
+                    / SCALE;
+            }
+            e >>= 1;
+            if e > 0 {
+                b = b.checked_mul(b).ok_or(PercolatorError::EngineOverflow)? / SCALE;
+            }
+        }
+
+        let price_e6 = if is_negative {
+            if result == 0 {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            SCALE
+                .checked_mul(1_000_000)
+                .ok_or(PercolatorError::EngineOverflow)?
+                / result
+        } else {
+            result / 1_000_000_000_000 // 1e18 -> 1e6
+        };
+
+        if price_e6 == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        if price_e6 > u64::MAX as u128 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+
+        Ok(price_e6 as u64)
+    }
+
+    /// Read DEX spot price with liquidity information.
+    /// Returns both the price and a measure of pool liquidity (quote-side depth).
+    /// Applies inversion and unit scaling to the price.
+    pub fn read_dex_price_with_liquidity(
+        price_ai: &AccountInfo,
+        invert: u8,
+        unit_scale: u32,
+        remaining_accounts: &[AccountInfo],
+    ) -> Result<DexPriceResult, ProgramError> {
+        let dex_feed_id = price_ai.key.to_bytes();
+
+        let (raw_price, quote_liquidity) = if *price_ai.owner == PUMPSWAP_PROGRAM_ID {
+            let pool_data = price_ai.try_borrow_data()?;
+            if pool_data.len() < PUMPSWAP_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            if remaining_accounts.len() < 2 {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            }
+            let quote_vault_data = remaining_accounts[1].try_borrow_data()?;
+            if quote_vault_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let quote_amount = u64::from_le_bytes(
+                quote_vault_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            drop(quote_vault_data);
+            drop(pool_data);
+            let price = read_pumpswap_price_e6(price_ai, &dex_feed_id, remaining_accounts)?;
+            (price, quote_amount)
+        } else if *price_ai.owner == RAYDIUM_CLMM_PROGRAM_ID {
+            let data = price_ai.try_borrow_data()?;
+            if data.len() < RAYDIUM_CLMM_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            const RAYDIUM_CLMM_OFF_LIQUIDITY: usize = 237;
+            let liquidity = if data.len() >= RAYDIUM_CLMM_OFF_LIQUIDITY + 16 {
+                let liq = u128::from_le_bytes(
+                    data[RAYDIUM_CLMM_OFF_LIQUIDITY..RAYDIUM_CLMM_OFF_LIQUIDITY + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let sqrt_price_x64 = u128::from_le_bytes(
+                    data[RAYDIUM_CLMM_OFF_SQRT_PRICE_X64..RAYDIUM_CLMM_OFF_SQRT_PRICE_X64 + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let virtual_quote = liq.saturating_mul(sqrt_price_x64) >> 64;
+                core::cmp::min(virtual_quote, u64::MAX as u128) as u64
+            } else {
+                0
+            };
+            drop(data);
+            let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
+            (price, liquidity)
+        } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
+            if remaining_accounts.is_empty() {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            }
+            let pool_data = price_ai.try_borrow_data()?;
+            if pool_data.len() < METEORA_DLMM_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let expected_reserve_y: [u8; 32] = pool_data
+                [METEORA_DLMM_OFF_RESERVE_Y..METEORA_DLMM_OFF_RESERVE_Y + 32]
+                .try_into()
+                .unwrap();
+            drop(pool_data);
+
+            let vault_y_ai = &remaining_accounts[0];
+            if vault_y_ai.key.to_bytes() != expected_reserve_y {
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+            let is_valid_token_program = *vault_y_ai.owner == crate::spl_token::id()
+                || *vault_y_ai.owner == spl_token_2022::id();
+            if !is_valid_token_program {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            let vault_y_data = vault_y_ai.try_borrow_data()?;
+            if vault_y_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let quote_amount = u64::from_le_bytes(
+                vault_y_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            drop(vault_y_data);
+            let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
+            (price, quote_amount)
+        } else {
+            return Err(PercolatorError::OracleInvalid.into());
+        };
+
+        let price_after_invert = crate::verify::invert_price_e6(raw_price, invert)
+            .ok_or(PercolatorError::OracleInvalid)?;
+        let final_price = crate::verify::scale_price_e6(price_after_invert, unit_scale)
+            .ok_or::<ProgramError>(PercolatorError::OracleInvalid.into())?;
+
+        Ok(DexPriceResult {
+            price_e6: final_price,
+            quote_liquidity,
+        })
+    }
+
+    /// Compute blended mark price from oracle (index) and DEX spot (impact_mid).
+    /// When oracle_weight_bps == 0: returns impact_mid_e6 (pure DEX, backward compat).
+    /// When oracle_weight_bps == 10_000: returns oracle_e6 (pure oracle).
+    /// Values in between blend proportionally using u128 arithmetic.
+    pub fn compute_blend_mark_price(
+        oracle_e6: u64,
+        impact_mid_e6: u64,
+        oracle_weight_bps: u16,
+    ) -> u64 {
+        // Degenerate cases: use whichever is non-zero
+        if impact_mid_e6 == 0 {
+            return oracle_e6;
+        }
+        if oracle_e6 == 0 {
+            return impact_mid_e6;
+        }
+        let w = (oracle_weight_bps as u64).min(10_000);
+        let tw = 10_000u64.saturating_sub(w);
+        // u128 arithmetic: max(price_e6) * 10_000 fits u128
+        let blended = (oracle_e6 as u128)
+            .saturating_mul(w as u128)
+            .saturating_add((impact_mid_e6 as u128).saturating_mul(tw as u128))
+            / 10_000u128;
+        blended.min(u64::MAX as u128) as u64
+    }
+
+    /// Compute the next EMA mark price step.
+    ///
+    /// Circuit breaker clamped BEFORE EMA: oracle clamped to ±cap_e2bps*dt per slot.
+    /// Bootstrap: mark_prev==0 returns oracle directly.
+    pub fn compute_ema_mark_price(
+        mark_prev_e6: u64,
+        oracle_e6: u64,
+        dt_slots: u64,
+        alpha_e6: u64,
+        cap_e2bps: u64,
+    ) -> u64 {
+        if oracle_e6 == 0 {
+            return mark_prev_e6;
+        }
+        if mark_prev_e6 == 0 || dt_slots == 0 {
+            return oracle_e6;
+        }
+
+        // Circuit breaker: clamp oracle toward prev mark
+        let oracle_clamped = if cap_e2bps > 0 {
+            let max_delta = (mark_prev_e6 as u128)
+                .saturating_mul(cap_e2bps as u128)
+                .saturating_mul(dt_slots as u128)
+                / 1_000_000u128;
+            let max_delta = max_delta.min(mark_prev_e6 as u128) as u64;
+            oracle_e6.clamp(
+                mark_prev_e6.saturating_sub(max_delta),
+                mark_prev_e6.saturating_add(max_delta),
+            )
+        } else {
+            oracle_e6
+        };
+
+        // EMA with compound alpha (effective_alpha = alpha * dt, capped at 1_000_000)
+        let eff_alpha = (alpha_e6 as u128)
+            .saturating_mul(dt_slots as u128)
+            .min(1_000_000u128) as u64;
+        let one_minus = 1_000_000u64.saturating_sub(eff_alpha);
+
+        let ema = (oracle_clamped as u128)
+            .saturating_mul(eff_alpha as u128)
+            .saturating_add((mark_prev_e6 as u128).saturating_mul(one_minus as u128))
+            / 1_000_000u128;
+
+        ema.min(u64::MAX as u128) as u64
     }
 }
 
@@ -5511,6 +5983,12 @@ pub mod processor {
             // Accounts: [admin(signer,writable), slab(writable), vault(readonly)]
             Instruction::CloseOrphanSlab => {
                 handle_close_orphan_slab(program_id, accounts)?;
+            }
+
+            // UpdateHyperpMark (Tag 34): Permissionless Hyperp DEX EMA oracle update.
+            // Accounts: [0] slab(writable), [1] DEX pool, [2] clock, [3..N] remaining
+            Instruction::UpdateHyperpMark => {
+                handle_update_hyperp_mark(program_id, accounts)?;
             }
 
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
@@ -12668,6 +13146,271 @@ pub mod processor {
             .ok_or(PercolatorError::EngineOverflow)?;
 
         msg!("PERC-8400: closed orphan slab, reclaimed {} lamports", slab_lamports);
+        Ok(())
+    }
+
+    // --- UpdateHyperpMark (tag 34) ---
+    // Permissionless Hyperp EMA oracle: reads DEX pool price, applies EMA smoothing,
+    // writes new mark price to config.authority_price_e6.
+    //
+    // Accounts:
+    //   0. [writable] Slab
+    //   1. []         DEX pool account (PumpSwap/Raydium CLMM/Meteora DLMM)
+    //   2. []         Clock sysvar
+    //   3..N []       Remaining: PumpSwap: [3]=base_vault, [4]=quote_vault
+    //                             Meteora DLMM: [3]=vault_y
+    //                             Raydium CLMM: none required
+    #[inline(never)]
+    fn handle_update_hyperp_mark<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        if accounts.len() < 3 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+
+        // SECURITY GATE 2: Reject if called via CPI.
+        // Threat: bundling UpdateHyperpMark + Trade in same tx to exploit fresh EMA.
+        // Defence: stack height == 1 only for top-level instructions.
+        if solana_program::instruction::get_stack_height()
+            > solana_program::instruction::TRANSACTION_LEVEL_STACK_HEIGHT
+        {
+            msg!("UpdateHyperpMark: CPI invocation rejected (security gate 2)");
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        let a_slab = &accounts[0];
+        let a_dex_pool = &accounts[1];
+        let a_clock = &accounts[2];
+
+        accounts::expect_writable(a_slab)?;
+
+        let clock = Clock::from_account_info(a_clock)?;
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        require_not_paused(&data)?;
+
+        let mut config = state::read_config(&data);
+        if !oracle::is_hyperp_mode(&config) {
+            msg!("UpdateHyperpMark: not a Hyperp market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Bootstrap guard: admin must seed initial mark via PushOraclePrice first.
+        // When prev_mark==0 the circuit breaker has no reference to clamp against,
+        // so a thin-pool attacker could set an arbitrary initial mark.
+        if config.authority_price_e6 == 0 {
+            msg!("UpdateHyperpMark: market not bootstrapped (prev_mark==0), use PushOraclePrice first");
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // Resolved markets don't need mark updates
+        if state::is_resolved(&data) {
+            return Ok(());
+        }
+
+        // Read last update slot from engine
+        let last_slot = {
+            let engine = zc::engine_ref(&data)?;
+            engine.current_slot
+        };
+        let dt_slots = clock.slot.saturating_sub(last_slot);
+        if dt_slots == 0 {
+            return Ok(()); // same slot — no-op
+        }
+
+        // PERC-367: Minimum update interval (25 slots ≈ 10s) limits manipulation frequency.
+        // An attacker calling every slot can only drift EMA at 0.6%/min with this guard.
+        const MIN_HYPERP_UPDATE_INTERVAL_SLOTS: u64 = 25;
+        if dt_slots < MIN_HYPERP_UPDATE_INTERVAL_SLOTS {
+            return Ok(()); // too soon — skip silently
+        }
+
+        // SECURITY (PERC-SetDexPool): Verify pool matches admin-pinned address.
+        // All-zeros means SetDexPool was never called → reject.
+        if config.dex_pool == [0u8; 32] {
+            msg!("UpdateHyperpMark: dex_pool not set — admin must call SetDexPool first");
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        if a_dex_pool.key.to_bytes() != config.dex_pool {
+            msg!(
+                "UpdateHyperpMark: pool key {} does not match stored dex_pool",
+                a_dex_pool.key,
+            );
+            return Err(PercolatorError::InvalidOracleKey.into());
+        }
+
+        // SECURITY: verify the DEX pool account is owned by an approved DEX program
+        let is_dex = *a_dex_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID
+            || *a_dex_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID
+            || *a_dex_pool.owner == crate::oracle::METEORA_DLMM_PROGRAM_ID;
+        if !is_dex {
+            msg!("UpdateHyperpMark: oracle account not owned by approved DEX program");
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // SECURITY (MEDIUM #2): for PumpSwap pools, verify pool.base_mint matches
+        // the market's collateral_mint. Without this check, a caller could pass any
+        // valid PumpSwap pool for a different token pair.
+        if *a_dex_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID {
+            let pool_data = a_dex_pool.try_borrow_data()?;
+            const PUMPSWAP_OFF_BASE_MINT_HYPERP: usize = 35;
+            if pool_data.len() < PUMPSWAP_OFF_BASE_MINT_HYPERP + 32 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let pool_base_mint: [u8; 32] = pool_data
+                [PUMPSWAP_OFF_BASE_MINT_HYPERP..PUMPSWAP_OFF_BASE_MINT_HYPERP + 32]
+                .try_into()
+                .unwrap();
+            if pool_base_mint != config.collateral_mint {
+                msg!("UpdateHyperpMark: pool base_mint does not match market collateral_mint");
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+        }
+
+        // SECURITY (M-4): Raydium CLMM and Meteora DLMM pools must bind one token
+        // to the market's collateral_mint.
+        if *a_dex_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID {
+            let pool_data = a_dex_pool.try_borrow_data()?;
+            const RAYDIUM_CLMM_OFF_MINT0: usize = 73;
+            const RAYDIUM_CLMM_OFF_MINT1: usize = 105;
+            if pool_data.len() < RAYDIUM_CLMM_OFF_MINT1 + 32 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let mint0: [u8; 32] = pool_data
+                [RAYDIUM_CLMM_OFF_MINT0..RAYDIUM_CLMM_OFF_MINT0 + 32]
+                .try_into()
+                .unwrap();
+            let mint1: [u8; 32] = pool_data
+                [RAYDIUM_CLMM_OFF_MINT1..RAYDIUM_CLMM_OFF_MINT1 + 32]
+                .try_into()
+                .unwrap();
+            if mint0 != config.collateral_mint && mint1 != config.collateral_mint {
+                msg!("UpdateHyperpMark: Raydium CLMM pool mints do not match collateral_mint");
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+        } else if *a_dex_pool.owner == crate::oracle::METEORA_DLMM_PROGRAM_ID {
+            let pool_data = a_dex_pool.try_borrow_data()?;
+            const METEORA_OFF_TOKEN_X_MINT: usize = 81;
+            const METEORA_OFF_TOKEN_Y_MINT: usize = 113;
+            if pool_data.len() < METEORA_OFF_TOKEN_Y_MINT + 32 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let mint_x: [u8; 32] = pool_data
+                [METEORA_OFF_TOKEN_X_MINT..METEORA_OFF_TOKEN_X_MINT + 32]
+                .try_into()
+                .unwrap();
+            let mint_y: [u8; 32] = pool_data
+                [METEORA_OFF_TOKEN_Y_MINT..METEORA_OFF_TOKEN_Y_MINT + 32]
+                .try_into()
+                .unwrap();
+            if mint_x != config.collateral_mint && mint_y != config.collateral_mint {
+                msg!("UpdateHyperpMark: Meteora DLMM pool mints do not match collateral_mint");
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+        }
+
+        let remaining = &accounts[3..];
+        let dex_result = oracle::read_dex_price_with_liquidity(
+            a_dex_pool,
+            config.invert,
+            config.unit_scale,
+            remaining,
+        )?;
+
+        // SECURITY (#297): Minimum DEX liquidity check.
+        if dex_result.quote_liquidity < crate::constants::MIN_DEX_QUOTE_LIQUIDITY {
+            msg!(
+                "UpdateHyperpMark: insufficient DEX liquidity {} < minimum {}",
+                dex_result.quote_liquidity,
+                crate::constants::MIN_DEX_QUOTE_LIQUIDITY
+            );
+            return Err(PercolatorError::InsufficientDexLiquidity.into());
+        }
+
+        let dex_price = dex_result.price_e6;
+        let prev_mark = config.authority_price_e6;
+
+        // SECURITY: Max deviation clamp — clamp DEX spot price to ±5% band around
+        // current EMA mark. Flash-loan attacks are clamped rather than rejected
+        // to avoid permanently wedging the oracle on legitimate rapid moves.
+        const MAX_HYPERP_DEVIATION_BPS: u64 = 500;
+        let dex_price = if prev_mark > 0 {
+            let max_delta = (prev_mark as u128)
+                .saturating_mul(MAX_HYPERP_DEVIATION_BPS as u128)
+                / 10_000;
+            let max_delta = max_delta.min(prev_mark as u128) as u64;
+            let lo = prev_mark.saturating_sub(max_delta);
+            let hi = prev_mark.saturating_add(max_delta);
+            if dex_price < lo || dex_price > hi {
+                msg!(
+                    "UpdateHyperpMark: DEX price {} outside band [{}, {}] (mark {}), clamping",
+                    dex_price, lo, hi, prev_mark,
+                );
+            }
+            dex_price.clamp(lo, hi)
+        } else {
+            dex_price
+        };
+
+        // PERC-118: Hyperp EMA Blend — blend oracle index + DEX spot price.
+        // oracle_weight_bps == 0 (default on V12_1 layout) → pure DEX price (backward compat).
+        let oracle_for_blend = if config.last_effective_price_e6 > 0 {
+            config.last_effective_price_e6
+        } else {
+            prev_mark
+        };
+        let oracle_weight_bps = state::get_mark_oracle_weight_bps(&config);
+        let blend_input = oracle::compute_blend_mark_price(
+            oracle_for_blend,
+            dex_price,
+            oracle_weight_bps,
+        );
+
+        // SECURITY (#297 Fix 2): Circuit breaker BEFORE EMA. Hyperp markets always
+        // enforce at least DEFAULT_HYPERP_PRICE_CAP_E2BPS even if admin sets cap to 0.
+        let effective_cap = core::cmp::max(
+            config.oracle_price_cap_e2bps,
+            crate::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+        );
+        let new_mark = oracle::compute_ema_mark_price(
+            prev_mark,
+            blend_input,
+            dt_slots,
+            crate::constants::MARK_PRICE_EMA_ALPHA_E6,
+            effective_cap,
+        );
+
+        // Update last_effective_price_e6 toward new_mark (rate-limited).
+        let new_index = oracle::clamp_toward_with_dt(
+            oracle_for_blend.max(1),
+            new_mark,
+            effective_cap,
+            dt_slots,
+        );
+
+        config.authority_price_e6 = new_mark;
+        config.last_effective_price_e6 = new_index;
+
+        // Record pool depth for per-epoch OI cap enforcement (no-op in V12_1 layout).
+        state::set_last_dex_liquidity_k(&mut config, dex_result.quote_liquidity);
+
+        state::write_config(&mut data, &config);
+
+        msg!(
+            "UpdateHyperpMark: dex_price={} oracle={} blend={} prev_mark={} new_mark={} index={} weight_bps={} dt={} pool_depth={}",
+            dex_price,
+            oracle_for_blend,
+            blend_input,
+            prev_mark,
+            new_mark,
+            new_index,
+            oracle_weight_bps,
+            dt_slots,
+            dex_result.quote_liquidity,
+        );
+
         Ok(())
     }
 
