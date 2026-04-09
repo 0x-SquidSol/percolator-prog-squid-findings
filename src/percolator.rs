@@ -834,7 +834,9 @@ pub mod verify {
     /// A market with a non-zero oracle_authority and zero index_feed_id is pinned.
     #[inline]
     pub fn is_pyth_pinned_mode(oracle_authority: [u8; 32], index_feed_id: [u8; 32]) -> bool {
-        oracle_authority != [0u8; 32] && index_feed_id == [0u8; 32]
+        // Pyth-pinned: non-zero authority AND non-zero feed ID (actual Pyth feed).
+        // Hyperp mode (feed_id=[0;32]) is NOT Pyth-pinned — admin can change oracle authority.
+        oracle_authority != [0u8; 32] && index_feed_id != [0u8; 32]
     }
 }
 
