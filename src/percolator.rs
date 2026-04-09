@@ -13414,6 +13414,8 @@ pub mod processor {
         );
 
         config.authority_price_e6 = new_mark;
+        config.mark_ewma_e6 = new_mark;
+        config.mark_ewma_last_slot = clock.slot;
         config.last_effective_price_e6 = new_index;
 
         // Record pool depth for per-epoch OI cap enforcement (no-op in V12_1 layout).
