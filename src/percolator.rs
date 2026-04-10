@@ -3364,11 +3364,13 @@ pub mod oracle {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
+        // decimal_diff already includes +6 for e6 format: total exponent = 6 + d0 - d1
         let decimal_diff = 6i32 + decimals_0 - decimals_1;
 
-        // Compute price_e6 = sqrt^2 * 10^(6 + decimal_diff) / 2^128
-        // Must scale BEFORE dividing to avoid precision loss for prices < 2^64.
-        let scale_exp = (6i32 + decimal_diff).max(0) as u32;
+        // SECURITY(C-2): Compute price_e6 = sqrt^2 * 10^decimal_diff / 2^128.
+        // Previously `scale_exp = (6 + decimal_diff)` double-counted the +6 since
+        // decimal_diff already includes it, inflating prices by 10^6.
+        let scale_exp = decimal_diff.max(0) as u32;
         let scale = 10u128.pow(scale_exp);
         // sqrt fits in 128 bits. sqrt * sqrt_scaled to avoid overflow:
         // Split: price = (sqrt / 2^64)^2 * scale = sqrt^2 * scale / 2^128
