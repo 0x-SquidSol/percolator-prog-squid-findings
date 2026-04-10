@@ -10684,12 +10684,13 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         lp_amount: u64,
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 5)?;
+        accounts::expect_len(accounts, 6)?;
         let a_user = &accounts[0];
         let a_slab = &accounts[1];
         let a_lp_vault_state = &accounts[2];
         let a_queue = &accounts[3];
         let a_system = &accounts[4];
+        let a_creator_lock = &accounts[5];
 
         accounts::expect_signer(a_user)?;
         accounts::expect_writable(a_queue)?;
@@ -10702,6 +10703,45 @@ pub mod processor {
         require_initialized(&data)?;
         require_not_paused(&data)?;
         drop(data);
+
+        // SECURITY(M-7): Creator lock enforcement — prevents lock bypass via
+        // queue+claim path. Without this, a creator with locked LP tokens could
+        // queue and claim withdrawals bypassing the lock enforced in LpVaultWithdraw.
+        {
+            let (expected_lock_pda, _) = Pubkey::find_program_address(
+                &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
+            if a_creator_lock.data_len() > 0 {
+                if let Ok(lock_data) = a_creator_lock.try_borrow_data() {
+                    if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                        let creator_key = Pubkey::new_from_array(lock_state.creator);
+                        if *a_user.key == creator_key {
+                            let clock = solana_program::clock::Clock::get()?;
+                            let expired = crate::creator_lock::is_lock_expired(
+                                clock.slot,
+                                lock_state.lock_start_slot,
+                                lock_state.lock_duration_slots,
+                            );
+                            let max_withdraw = crate::creator_lock::max_withdrawable(
+                                lp_amount,
+                                lock_state.lp_amount_locked,
+                                expired,
+                            );
+                            if lp_amount > max_withdraw {
+                                msg!(
+                                    "CREATOR_LOCK: queue {} > max {}",
+                                    lp_amount,
+                                    max_withdraw
+                                );
+                                return Err(ProgramError::InvalidArgument);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
         accounts::expect_key(a_lp_vault_state, &expected_state)?;
