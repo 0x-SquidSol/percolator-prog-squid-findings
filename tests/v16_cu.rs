@@ -8953,3 +8953,175 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
     assert_eq!(g_final.source_backing_buckets[1].valid_liened_backing_num, 0, "no valid residue");
     assert_eq!(g_final.source_backing_buckets[1].impaired_liened_backing_num, 0, "no impaired residue");
 }
+
+// FIX-1 regression test (positive case): bankruptcy_hlock_active auto-clears when the LAST
+// negative-PnL account is settled back to zero via principal.
+//
+// Scenario: a prior deep liquidation set the hlock.  The user's loss is fully covered by their
+// own remaining capital (no insurance drain, no b-stale, no open positions).  Calling
+// PermissionlessCrank (Refresh) runs `settle_negative_pnl_from_principal_core_not_atomic`,
+// which now calls `try_clear_bankruptcy_hlock_if_healthy` at the end.  Once
+// negative_pnl_account_count == 0 and all other counters are zero, the hlock must clear and
+// the previously-blocked insurance withdrawal must succeed.
+//
+// Non-vacuous: the same withdrawal demonstrably succeeds on a fresh healthy market (the sanity
+// check at the top), confirming the hlock — not some unrelated precondition — was the sole
+// blocker during the middle section of the test.
+#[test]
+fn v16_hlock_auto_clears_when_last_negative_pnl_account_settles() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 10_000, 10_000, 24);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100_000_000);
+    env.top_up_insurance(1_000_000);
+    env.top_up_insurance_domain_with_authority(&env.admin.insecure_clone(), 0, 1_000_000);
+    let admin = env.admin.insecure_clone();
+
+    // Sanity: on a healthy, flat market the insurance withdrawal succeeds immediately.
+    env.svm.expire_blockhash();
+    env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
+        .expect("sanity: flat healthy market must allow insurance withdrawal");
+
+    // Create a user, deposit enough capital to cover the simulated loss.
+    let user = Keypair::new();
+    let user_portfolio = env.create_portfolio(&user);
+    env.deposit(&user, user_portfolio, 10_000);
+
+    // Simulate a prior bankruptcy event: inject negative PnL (fully covered by the user's
+    // capital) and set the hlock as a deep-liquidation path would.
+    env.force_portfolio_loss_for_security_test(user_portfolio, 500);
+    env.mutate_market(|_cfg, group| {
+        group.bankruptcy_hlock_active = true;
+    });
+
+    // BLOCKED: the hlock is now active — the same withdrawal that succeeded above must now fail.
+    env.svm.expire_blockhash();
+    let before = env.market_state().1;
+    let blocked = env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100);
+    assert!(
+        blocked.is_err(),
+        "insurance withdrawal must be blocked while bankruptcy_hlock_active is set"
+    );
+    assert_eq!(
+        env.market_state().1.insurance, before.insurance,
+        "rejected withdrawal must leave insurance unchanged"
+    );
+
+    // Settle the negative-PnL account via PermissionlessCrank (Refresh, action=0).  The engine
+    // call chain is: permissionless_crank_not_atomic → settle_account_side_effects_not_atomic
+    // → settle_negative_pnl_from_principal_not_atomic → settle_negative_pnl_from_principal_core_not_atomic
+    // → (my fix) try_clear_bankruptcy_hlock_if_healthy.
+    env.svm.expire_blockhash();
+    env.crank(
+        user_portfolio,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,    // Refresh
+            asset_index: 0,
+            now_slot: 1,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+
+    // FIX-1 assertion: hlock must be auto-cleared after settling the last negative-PnL account.
+    let (_, g_after) = env.market_state();
+    assert!(
+        !g_after.bankruptcy_hlock_active,
+        "FIX-1: bankruptcy_hlock_active must auto-clear once negative_pnl_account_count reaches 0"
+    );
+    assert_eq!(g_after.negative_pnl_account_count, 0, "counter must be zero after settlement");
+
+    // UNBLOCKED: the previously-blocked withdrawal must now succeed.
+    env.svm.expire_blockhash();
+    env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
+        .expect("FIX-1: insurance withdrawal must succeed after hlock auto-clears");
+}
+
+// FIX-1 regression test (negative case): bankruptcy_hlock_active MUST NOT clear while ANY
+// negative-PnL account remains outstanding.
+//
+// Two users sustain losses.  After settling ONLY the first user, the hlock must stay active
+// because the second user's negative-PnL account (negative_pnl_account_count = 1) keeps the
+// condition from being met.  Only after the second user's PnL is settled does the hlock clear.
+#[test]
+fn v16_hlock_stays_set_while_any_negative_pnl_account_remains() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 10_000, 10_000, 24);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100_000_000);
+    env.top_up_insurance(1_000_000);
+    env.top_up_insurance_domain_with_authority(&env.admin.insecure_clone(), 0, 1_000_000);
+    let admin = env.admin.insecure_clone();
+
+    // Create two users, each with enough capital to cover their loss.
+    let user_a = Keypair::new();
+    let portfolio_a = env.create_portfolio(&user_a);
+    env.deposit(&user_a, portfolio_a, 10_000);
+
+    let user_b = Keypair::new();
+    let portfolio_b = env.create_portfolio(&user_b);
+    env.deposit(&user_b, portfolio_b, 10_000);
+
+    // Both accounts sustain a loss; hlock is set (simulating a prior deep liquidation).
+    env.force_portfolio_loss_for_security_test(portfolio_a, 500);
+    env.force_portfolio_loss_for_security_test(portfolio_b, 500);
+    env.mutate_market(|_cfg, group| {
+        group.bankruptcy_hlock_active = true;
+    });
+    let (_, g_init) = env.market_state();
+    assert_eq!(g_init.negative_pnl_account_count, 2, "both users must be in the negative-pnl count");
+
+    // Settle ONLY the first user's account.
+    env.svm.expire_blockhash();
+    env.crank(
+        portfolio_a,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 1,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+
+    // Hlock must remain — user B still has negative PnL (negative_pnl_account_count == 1).
+    let (_, g_mid) = env.market_state();
+    assert_eq!(g_mid.negative_pnl_account_count, 1, "one negative-PnL account remains");
+    assert!(
+        g_mid.bankruptcy_hlock_active,
+        "hlock must NOT clear while user B's negative-PnL account is still outstanding"
+    );
+    env.svm.expire_blockhash();
+    assert!(
+        env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100).is_err(),
+        "withdrawal must remain blocked while hlock is active"
+    );
+
+    // Now settle the second user's account.
+    env.svm.expire_blockhash();
+    env.crank(
+        portfolio_b,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 1,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+
+    // Both counters now zero — hlock must auto-clear.
+    let (_, g_final) = env.market_state();
+    assert_eq!(g_final.negative_pnl_account_count, 0, "both accounts settled");
+    assert!(
+        !g_final.bankruptcy_hlock_active,
+        "hlock must auto-clear once ALL negative-PnL accounts are settled"
+    );
+    env.svm.expire_blockhash();
+    env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
+        .expect("insurance withdrawal must succeed after all accounts are settled and hlock clears");
+}
