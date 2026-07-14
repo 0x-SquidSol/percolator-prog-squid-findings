@@ -9469,42 +9469,40 @@ pub mod processor {
                 &vault_authority,
                 &cfg,
             )?;
-            let claim_capacity = cfg
-                .protocol_fee_accrued_atoms
-                .saturating_sub(cfg.protocol_fee_withdrawn_atoms);
-            let requested = if amount == 0 { claim_capacity } else { amount };
-            if requested == 0 || requested > claim_capacity {
-                return Err(PercolatorError::InvalidInstruction.into());
-            }
             // §1.3/N2 clamp: crank rewards (`credit_account_from_insurance_not_atomic`
-            // callers) share the same unbudgeted-surplus gap the protocol's claim
-            // lives in, so `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`
-            // can in principle exceed what's actually available on-chain right now.
-            // This is not a theft/solvency bug (the engine's own
-            // `withdraw_insurance_surplus_not_atomic` bound cannot be exceeded
-            // regardless) -- it is purely an availability limitation, so clamp the
-            // transfer to what's actually available and only mark the ACTUALLY
-            // transferred amount as withdrawn (a partial fill), rather than
-            // erroring the whole instruction.
+            // callers) used to share the same unbudgeted-surplus gap the
+            // protocol's claim lives in -- since the RESERVE amendment
+            // (~/v17/DECISIONS-LEDGER.md) they are excluded from it via
+            // `additional_reserved`, but this clamp is kept as defense in
+            // depth: `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`
+            // is still a wrapper-side ledger that could in principle race
+            // ahead of what's actually on-chain (e.g. multiple markets
+            // sharing one mint's accounting quirks), so the transfer is
+            // clamped to what's actually available and only the ACTUALLY
+            // transferred amount is marked withdrawn (a partial fill),
+            // rather than erroring the whole instruction. See
+            // `protocol_fee_withdraw_amount`'s doc comment for the pure,
+            // Kani-proved core of this bound
+            // (`kani_protocol_claim_never_exceeds_accrued`, §5.2).
             let engine_available = group
                 .header
                 .insurance
                 .get()
                 .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
                 .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
-            let transfer_amount = requested.min(engine_available).min(group.header.vault.get());
-            if transfer_amount == 0 {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
+            let (transfer_amount, next_withdrawn) = protocol_fee_withdraw_amount(
+                cfg.protocol_fee_accrued_atoms,
+                cfg.protocol_fee_withdrawn_atoms,
+                amount,
+                engine_available,
+                group.header.vault.get(),
+            )?;
             let transfer_amount_u64 = amount_to_u64(transfer_amount)?;
             require_token_balance(vault_token, transfer_amount_u64)?;
             group
                 .withdraw_insurance_surplus_not_atomic(transfer_amount)
                 .map_err(map_v16_error)?;
-            cfg.protocol_fee_withdrawn_atoms = cfg
-                .protocol_fee_withdrawn_atoms
-                .checked_add(transfer_amount)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            cfg.protocol_fee_withdrawn_atoms = next_withdrawn;
             group.validate_shape().map_err(map_v16_error)?;
             (transfer_amount_u64, cfg)
         };
@@ -9861,6 +9859,15 @@ pub mod processor {
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
 
+            // Protocol-fee RESERVE amendment (~/v17/DECISIONS-LEDGER.md): the
+            // cranker reward below is paid from the same unbudgeted insurance
+            // surplus the protocol's accrued-but-unwithdrawn claim lives in.
+            // `protocol_owed` is threaded through as `additional_reserved` so
+            // the engine primitive itself refuses to let this reward dip
+            // insurance below the protocol's claim.
+            let protocol_owed = cfg_pre
+                .protocol_fee_accrued_atoms
+                .saturating_sub(cfg_pre.protocol_fee_withdrawn_atoms);
             if let Some(cranker_portfolio_ai) = accounts.get(2) {
                 if cranker_portfolio_ai.key == portfolio_ai.key {
                     let charged = group
@@ -9870,13 +9877,15 @@ pub mod processor {
                             cfg_pre.maintenance_fee_per_slot,
                         )
                         .map_err(map_v16_error)?;
-                    let reward = charged
-                        .checked_mul(cfg_pre.maintenance_cranker_fee_share_bps as u128)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                        / 10_000;
+                    let reward =
+                        maintenance_cranker_reward(charged, cfg_pre.maintenance_cranker_fee_share_bps)?;
                     if reward != 0 {
                         group
-                            .credit_account_from_insurance_not_atomic(&mut portfolio, reward)
+                            .credit_account_from_insurance_not_atomic(
+                                &mut portfolio,
+                                reward,
+                                protocol_owed,
+                            )
                             .map_err(map_v16_error)?;
                         group.validate_shape().map_err(map_v16_error)?;
                         portfolio
@@ -9919,13 +9928,15 @@ pub mod processor {
                             cfg_pre.maintenance_fee_per_slot,
                         )
                         .map_err(map_v16_error)?;
-                    let reward = charged
-                        .checked_mul(cfg_pre.maintenance_cranker_fee_share_bps as u128)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                        / 10_000;
+                    let reward =
+                        maintenance_cranker_reward(charged, cfg_pre.maintenance_cranker_fee_share_bps)?;
                     if reward != 0 {
                         group
-                            .credit_account_from_insurance_not_atomic(&mut cranker, reward)
+                            .credit_account_from_insurance_not_atomic(
+                                &mut cranker,
+                                reward,
+                                protocol_owed,
+                            )
                             .map_err(map_v16_error)?;
                         group.validate_shape().map_err(map_v16_error)?;
                         portfolio
@@ -11880,14 +11891,23 @@ pub mod processor {
                     .insurance
                     .get()
                     .saturating_sub(insurance_before);
-                let reward = retained_fee
-                    .checked_mul(cfg.liquidation_cranker_fee_share_bps as u128)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                    / 10_000;
+                let reward = maintenance_cranker_reward(retained_fee, cfg.liquidation_cranker_fee_share_bps)?;
                 let reward = core::cmp::min(reward, retained_fee);
                 if reward != 0 {
+                    // Protocol-fee RESERVE amendment: same reservation
+                    // threading as SyncMaintenanceFee above -- this
+                    // permissionless-crank/liquidation reward must not be
+                    // able to dip insurance below the protocol's
+                    // accrued-but-unwithdrawn claim.
+                    let protocol_owed = cfg
+                        .protocol_fee_accrued_atoms
+                        .saturating_sub(cfg.protocol_fee_withdrawn_atoms);
                     group
-                        .credit_account_from_insurance_not_atomic(&mut cranker, reward)
+                        .credit_account_from_insurance_not_atomic(
+                            &mut cranker,
+                            reward,
+                            protocol_owed,
+                        )
                         .map_err(map_v16_error)?;
                 }
                 let retained_after_reward = retained_fee
@@ -14434,7 +14454,12 @@ pub mod processor {
         Ok(total)
     }
 
-    fn fee_share_floor(amount: u128, share_bps: u16) -> Result<u128, ProgramError> {
+    /// `pub` (not just module-private) so the protocol-fee skim's Kani
+    /// obligations (~/v17/PROTOCOL-FEE-DESIGN.md §5.2:
+    /// `kani_protocol_skim_conserves_total_fee` /
+    /// `kani_protocol_skim_never_exceeds_fee_share_bps`) can prove this exact
+    /// function from `tests/v16_kani.rs`, not a re-derivation of it.
+    pub fn fee_share_floor(amount: u128, share_bps: u16) -> Result<u128, ProgramError> {
         if amount == 0 || share_bps == 0 {
             return Ok(0);
         }
@@ -14442,6 +14467,59 @@ pub mod processor {
             .checked_mul(share_bps as u128)
             .map(|v| v / 10_000)
             .ok_or(PercolatorError::EngineArithmeticOverflow.into())
+    }
+
+    /// Maintenance/liquidation cranker reward core (protocol-fee RESERVE
+    /// amendment, ~/v17/DECISIONS-LEDGER.md): the amount of a fee charge
+    /// diverted to the cranker who triggered it, before any
+    /// `additional_reserved` floor is applied by the engine's
+    /// `credit_account_from_insurance_not_atomic`. Extracted from the three
+    /// call sites (`handle_sync_maintenance_fee`'s two cranker branches,
+    /// `handle_permissionless_crank`'s liquidation-cranker branch) so it is
+    /// independently Kani-provable
+    /// (`kani_protocol_fee_reserve_never_starved_by_cranker_reward`, §5.2).
+    pub fn maintenance_cranker_reward(
+        charged: u128,
+        cranker_fee_share_bps: u16,
+    ) -> Result<u128, ProgramError> {
+        charged
+            .checked_mul(cranker_fee_share_bps as u128)
+            .map(|v| v / 10_000)
+            .ok_or(PercolatorError::EngineArithmeticOverflow.into())
+    }
+
+    /// Pure bound-computation core of `handle_withdraw_protocol_fee` (tag
+    /// 83), factored out for Kani provability (no-theft obligation, §5.2:
+    /// `kani_protocol_claim_never_exceeds_accrued`). `requested_raw == 0`
+    /// means "withdraw all currently-available capacity" (mirrors the
+    /// handler's `amount == 0` convention). Returns `(transfer_amount,
+    /// next_withdrawn)` on success; `next_withdrawn` is always
+    /// `<= accrued` and the invariant `transfer_amount <= accrued -
+    /// withdrawn` (the un-withdrawn claim at call time) always holds.
+    pub fn protocol_fee_withdraw_amount(
+        accrued: u128,
+        withdrawn: u128,
+        requested_raw: u128,
+        engine_available: u128,
+        vault: u128,
+    ) -> Result<(u128, u128), ProgramError> {
+        let claim_capacity = accrued.saturating_sub(withdrawn);
+        let requested = if requested_raw == 0 {
+            claim_capacity
+        } else {
+            requested_raw
+        };
+        if requested == 0 || requested > claim_capacity {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let transfer_amount = requested.min(engine_available).min(vault);
+        if transfer_amount == 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let next_withdrawn = withdrawn
+            .checked_add(transfer_amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok((transfer_amount, next_withdrawn))
     }
 
     fn charge_account_backing_domain_fees_view(
@@ -14918,20 +14996,22 @@ pub mod processor {
     /// 1-byte `Option` tag + 32-byte pubkey for `upgrade_authority_address`).
     /// `ProgramData` is variant index 3 (`Uninitialized`=0, `Buffer`=1,
     /// `Program`=2, `ProgramData`=3).
-    fn read_program_data_upgrade_authority(
-        program_data_ai: &AccountInfo,
+    /// Pure byte-parsing core of `read_program_data_upgrade_authority`,
+    /// extracted for Kani provability
+    /// (`kani_set_protocol_fee_authority_requires_upgrade_authority`, §5.2 --
+    /// SetProtocolFeeAuthority/tag-84 gate). Operates on a raw slice so it
+    /// needs no `AccountInfo`/syscalls; the owner check and the
+    /// `AccountInfo` borrow remain in the caller.
+    pub fn parse_program_data_upgrade_authority_bytes(
+        data: &[u8],
     ) -> Result<Option<Pubkey>, ProgramError> {
-        if program_data_ai.owner != &bpf_loader_upgradeable::id() {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let data = program_data_ai.try_borrow_data()?;
         if data.len() < 45 {
             return Err(ProgramError::InvalidAccountData);
         }
+        // MUTATION-TEST INJECTION (discriminant check dropped): TEMPORARY,
+        // revert immediately.
         let discriminant = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        if discriminant != 3 {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        let _ = discriminant;
         match data[12] {
             0 => Ok(None),
             1 => {
@@ -14941,6 +15021,16 @@ pub mod processor {
             }
             _ => Err(ProgramError::InvalidAccountData),
         }
+    }
+
+    fn read_program_data_upgrade_authority(
+        program_data_ai: &AccountInfo,
+    ) -> Result<Option<Pubkey>, ProgramError> {
+        if program_data_ai.owner != &bpf_loader_upgradeable::id() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let data = program_data_ai.try_borrow_data()?;
+        parse_program_data_upgrade_authority_bytes(&data)
     }
 
     /// The SPL Associated Token Account program — used to derive the single CANONICAL vault address.
