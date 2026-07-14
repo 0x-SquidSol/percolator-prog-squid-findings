@@ -15008,10 +15008,10 @@ pub mod processor {
         if data.len() < 45 {
             return Err(ProgramError::InvalidAccountData);
         }
-        // MUTATION-TEST INJECTION (discriminant check dropped): TEMPORARY,
-        // revert immediately.
         let discriminant = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let _ = discriminant;
+        if discriminant != 3 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         match data[12] {
             0 => Ok(None),
             1 => {
