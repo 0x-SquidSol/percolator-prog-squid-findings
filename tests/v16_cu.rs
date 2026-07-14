@@ -1097,6 +1097,7 @@ impl V16CuEnv {
                             exec_price: 100,
                             fee_bps: 0,
                         },
+                        true,
                     )
                     .unwrap();
             }
@@ -1159,6 +1160,7 @@ impl V16CuEnv {
                             exec_price: 100,
                             fee_bps: 0,
                         },
+                        true,
                     )
                     .unwrap();
             }
@@ -3989,9 +3991,9 @@ fn v16_bpf_tradenocpi_executes_and_is_bounded() {
         "consented execution price must not move the effective oracle price"
     );
     assert_eq!(
-        group.insurance, 20,
+        group.insurance, 10,
         "W1 (fee-on-mark): fee billed on the MARK (100), NOT the consented exec_price (150) — \
-         notional=1000 and 100 bps charges 10 to each side"
+         notional=1000 @ 100 bps = 10 (taker-only, one side)"
     );
     assert_eq!(group.vault, 2_000_000);
     assert_eq!(group.c_tot + group.insurance, group.vault);
@@ -4026,9 +4028,9 @@ fn v16_bpf_tradenocpi_fee_is_billed_on_mark_not_exec_price() {
         let market_data = env.svm.get_account(&env.market).unwrap().data;
         let (_, group) = state::read_market(&market_data).unwrap();
         assert_eq!(
-            group.insurance, 20,
-            "exec_price={exec_price}: fee must be billed on the mark (notional 1000 @ 100 bps = 20), \
-             independent of exec_price"
+            group.insurance, 10,
+            "exec_price={exec_price}: fee must be billed on the mark (notional 1000 @ 100 bps = 10, \
+             taker-only one side), independent of exec_price"
         );
         // the consented exec_price never moves the index, so the mark stays 100 for every iteration.
         assert_eq!(group.assets[0].effective_price, 100);
@@ -5592,8 +5594,8 @@ fn v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded() {
     assert_eq!(taker.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
     assert_eq!(maker.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
     assert_eq!(
-        group.insurance, 20,
-        "passive matcher fills at oracle price; 100 bps charges 10 to each side"
+        group.insurance, 10,
+        "passive matcher fills at oracle price; taker-only charges 10 (one side)"
     );
     assert_eq!(
         u32::from_le_bytes(matcher_data[0..4].try_into().unwrap()),
@@ -5670,8 +5672,8 @@ fn v16_bpf_tradecpi_external_matcher_executes_on_added_asset() {
         -((10 * POS_SCALE) as i128)
     );
     assert_eq!(
-        group.insurance, 50,
-        "passive matcher fills asset 2 at 250; notional=2500 and 100 bps charges 25 to each side"
+        group.insurance, 25,
+        "passive matcher fills asset 2 at 250; notional=2500 @ 100 bps = 25 (taker-only, one side)"
     );
     assert_eq!(
         u64::from_le_bytes(matcher_data[56..64].try_into().unwrap()),

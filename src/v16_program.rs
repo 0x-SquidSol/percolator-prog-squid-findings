@@ -18,6 +18,7 @@ use percolator::{
 };
 use solana_program::{
     account_info::AccountInfo,
+    bpf_loader_upgradeable,
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
@@ -42,14 +43,19 @@ pub mod constants {
     };
 
     pub const MAGIC: u64 = 0x5045_5243_5631_3600; // "PERCV16\0"
-    pub const VERSION: u16 = 16;
+    // Protocol-fee program change (taker-only trade fee + 20% protocol skim,
+    // see ~/v17/PROTOCOL-FEE-DESIGN.md): WrapperConfigV16 grows 432 -> 496 B
+    // (additive at the tail). Bump VERSION so `check_header` fail-closed
+    // rejects any pre-existing (old-layout) account rather than misparsing
+    // it -- this forces the explicitly-allowed devnet re-seed.
+    pub const VERSION: u16 = 17;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
     pub const KIND_INSURANCE_LEDGER: u8 = 4;
 
     pub const HEADER_LEN: usize = 16;
-    pub const WRAPPER_CONFIG_LEN: usize = 432;
+    pub const WRAPPER_CONFIG_LEN: usize = 496;
     pub const ASSET_ORACLE_PROFILE_LEN: usize = 400;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -98,6 +104,26 @@ pub mod constants {
     // audited stale-trade and crank CU envelope. Additional markets remain
     // usable through separate portfolios.
     pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 14;
+
+    // ── Protocol-fee program change ─────────────────────────────────────
+    // See ~/v17/PROTOCOL-FEE-DESIGN.md §0/§2. `PROTOCOL_FEE_BPS` is the
+    // rate applied via `fee_share_floor` to 100% of every trade-fee credit
+    // (the two call sites in `credit_trade_fees_to_market_budgets_view`'s
+    // callers). It is a compile-time constant, never stored on-chain and
+    // never settable by anyone short of a program upgrade -- there is
+    // deliberately no `SetProtocolFeeBps` instruction (design §3.3).
+    pub const PROTOCOL_FEE_BPS: u16 = 2000;
+    /// Hardcoded fallback destination for the protocol's accrued fee share,
+    /// set unconditionally at `InitMarket` (never an instruction argument).
+    /// Rotatable later only via the upgrade-authority-gated
+    /// `SetProtocolFeeAuthority` (tag 84). Pinned to the same creator wallet
+    /// currently holding upgrade authority on this program (see
+    /// DECISIONS-LEDGER.md "Pinned deployed revisions") -- an operational
+    /// placeholder the operator is expected to rotate to a real treasury/
+    /// multisig via `SetProtocolFeeAuthority` before or shortly after
+    /// mainnet, not a permanent design commitment.
+    pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
+        solana_program::pubkey!("FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7");
 
     // ── Fork LP Vault (v17 re-expression — tags renumbered 74-80) ──────────
     // Account kinds 1-4 are MARKET / PORTFOLIO / BACKING_DOMAIN_LEDGER /
@@ -861,7 +887,35 @@ pub mod state {
         pub backing_trade_fee_insurance_share_bps_long: u16,
         pub backing_trade_fee_insurance_share_bps_short: u16,
         pub fee_redirect_to_market_0_bps: u16,
+        // --- Protocol-fee program change (additive at the tail, 432 -> 496 B; see
+        // ~/v17/PROTOCOL-FEE-DESIGN.md §1.4/§2). The 20% protocol skim RATE itself
+        // (`PROTOCOL_FEE_BPS`) is a compile-time Rust constant, NOT a field here --
+        // it is never stored on-chain and never settable by anyone short of a
+        // program upgrade. ---
+        /// Destination pubkey for the protocol's accrued fee share. Set to the
+        /// hardcoded `PROTOCOL_FEE_AUTHORITY_DEFAULT` at InitMarket (never an
+        /// instruction argument, so no market can be created with a
+        /// zero/attacker-controlled value here); rotatable only via the
+        /// upgrade-authority-gated `SetProtocolFeeAuthority` (tag 84). NOT
+        /// settable by `marketauth`/`insurance_authority`/any creator-facing gate.
+        pub protocol_fee_authority: [u8; 32],
+        /// Cumulative atoms ever accrued to the protocol's claim (monotonic,
+        /// only incremented at the two trade-fee credit sites). This value is
+        /// never itself credited into any domain's `insurance_domain_budget_*`
+        /// -- it tracks an *unbudgeted* slice of `header.insurance` that no
+        /// `insurance_operator` can reach via `WithdrawInsuranceAsset`.
+        pub protocol_fee_accrued_atoms: u128,
+        /// Cumulative atoms ever paid out via `WithdrawProtocolFee` (tag 83).
+        /// Monotonic, always `<= protocol_fee_accrued_atoms`. The claim
+        /// capacity is `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`.
+        pub protocol_fee_withdrawn_atoms: u128,
     }
+
+    // Compile-time guard (design §5.1 recommendation): a future field addition to
+    // WrapperConfigV16 that forgets to bump WRAPPER_CONFIG_LEN in lockstep now fails
+    // the build instead of silently desyncing the zero-copy layout. Complements the
+    // existing runtime `wrapper_config_len_matches_struct_size` test below.
+    const _: () = assert!(core::mem::size_of::<WrapperConfigV16>() == WRAPPER_CONFIG_LEN);
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -3666,6 +3720,22 @@ pub mod ix {
         UnwrapEscrowedPortfolio {
             new_owner: [u8; 32],
         },
+        // ── Protocol-fee program change (tags 83/84) ────────────────────────
+        // See ~/v17/PROTOCOL-FEE-DESIGN.md §3.
+        /// WithdrawProtocolFee (tag 83) — pays out from the accrued-but-
+        /// unwithdrawn protocol claim to an external token account.
+        /// `amount == 0` means "withdraw all currently-available capacity".
+        /// Signer-gated on `cfg.protocol_fee_authority`.
+        WithdrawProtocolFee {
+            amount: u128,
+        },
+        /// SetProtocolFeeAuthority (tag 84) — rotates `protocol_fee_authority`.
+        /// Gated on the program's BPF upgrade authority (a new pattern for
+        /// this codebase; see `read_program_data_upgrade_authority`), NOT on
+        /// `marketauth`/any creator-facing gate.
+        SetProtocolFeeAuthority {
+            new_authority: [u8; 32],
+        },
     }
 
     impl Instruction {
@@ -3950,6 +4020,12 @@ pub mod ix {
                 },
                 82 => Self::UnwrapEscrowedPortfolio {
                     new_owner: read_bytes32(&mut rest)?,
+                },
+                83 => Self::WithdrawProtocolFee {
+                    amount: read_u128(&mut rest)?,
+                },
+                84 => Self::SetProtocolFeeAuthority {
+                    new_authority: read_bytes32(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -4405,6 +4481,14 @@ pub mod ix {
                 Self::UnwrapEscrowedPortfolio { new_owner } => {
                     out.push(82);
                     out.extend_from_slice(&new_owner);
+                }
+                Self::WithdrawProtocolFee { amount } => {
+                    out.push(83);
+                    push_u128(&mut out, amount);
+                }
+                Self::SetProtocolFeeAuthority { new_authority } => {
+                    out.push(84);
+                    out.extend_from_slice(&new_authority);
                 }
             }
             out
@@ -6410,6 +6494,12 @@ pub mod processor {
             Instruction::UnwrapEscrowedPortfolio { new_owner } => {
                 handle_unwrap_escrowed_portfolio(program_id, accounts, new_owner)
             }
+            Instruction::WithdrawProtocolFee { amount } => {
+                handle_withdraw_protocol_fee(program_id, accounts, amount)
+            }
+            Instruction::SetProtocolFeeAuthority { new_authority } => {
+                handle_set_protocol_fee_authority(program_id, accounts, new_authority)
+            }
         }
     }
 
@@ -6518,6 +6608,13 @@ pub mod processor {
             backing_trade_fee_insurance_share_bps_long: 0,
             backing_trade_fee_insurance_share_bps_short: 0,
             fee_redirect_to_market_0_bps: 0,
+            // Protocol-fee program change: unconditionally set to the
+            // hardcoded default at construction, never a caller-supplied
+            // argument -- no code path can create a market with a
+            // zero/attacker-controlled protocol_fee_authority.
+            protocol_fee_authority: constants::PROTOCOL_FEE_AUTHORITY_DEFAULT.to_bytes(),
+            protocol_fee_accrued_atoms: 0,
+            protocol_fee_withdrawn_atoms: 0,
         };
         state::init_market_account_zero_copy(
             &mut market_ai.try_borrow_mut_data()?,
@@ -6811,12 +6908,19 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            // Taker-only (design §1A): account_a is always the taker/fee-payer
+            // (§1A.2). Whether account_a occupies the engine's first
+            // (long_account) or second (short_account) positional slot
+            // depends on the sign of the caller-supplied size_q, since this
+            // single-trade path reorders (a,b) by sign (§1A.3) -- so
+            // `taker_is_long_account` must mirror that same reordering.
             let outcome = if size_q > 0 {
                 group
                     .execute_trade_with_fee_loss_stale_scoped_not_atomic(
                         &mut account_a,
                         &mut account_b,
                         req,
+                        true, // account_a (taker) is long_account here
                     )
                     .map_err(map_v16_error)?
             } else {
@@ -6825,6 +6929,7 @@ pub mod processor {
                         &mut account_b,
                         &mut account_a,
                         req,
+                        false, // account_a (taker) is short_account here
                     )
                     .map_err(map_v16_error)?
             };
@@ -6841,12 +6946,48 @@ pub mod processor {
                 } else {
                     0
                 };
+            // Protocol-fee skim (design §1/§2): 20% off the top of every
+            // trade-fee-mechanism credit, before any domain sees it. Taker-only
+            // (§1A) already guarantees exactly one of outcome.fee_a/fee_b is
+            // nonzero, so skimming 20% of 0 is 0 -- the maker's domain gets
+            // exactly the 0 credit it should (§1A.6), no special-casing needed.
+            // The skimmed amount is deliberately left uncredited to ANY domain
+            // (not withdrawn/moved elsewhere here) -- it stays in
+            // `header.insurance` as unbudgeted surplus, which is exactly where
+            // `withdraw_insurance_surplus_not_atomic` (engine) draws from.
+            let protocol_cut_a =
+                fee_share_floor(outcome.fee_a, constants::PROTOCOL_FEE_BPS)?;
+            let protocol_cut_b =
+                fee_share_floor(outcome.fee_b, constants::PROTOCOL_FEE_BPS)?;
+            let domain_fee_a = outcome
+                .fee_a
+                .checked_sub(protocol_cut_a)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            let domain_fee_b = outcome
+                .fee_b
+                .checked_sub(protocol_cut_b)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            let protocol_cut_total = protocol_cut_a
+                .checked_add(protocol_cut_b)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if protocol_cut_total != 0 {
+                cfg.protocol_fee_accrued_atoms = cfg
+                    .protocol_fee_accrued_atoms
+                    .checked_add(protocol_cut_total)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // CRITICAL: force the write-back below even if nothing else
+                // in this instruction would otherwise have dirtied cfg (the
+                // pre-existing cfg_after pattern was opt-in per mutation --
+                // a missed write-back here would silently discard accrued
+                // protocol fees, so this is unconditional on protocol_cut_total != 0).
+                cfg_after = Some(cfg);
+            }
             credit_trade_fees_to_market_budgets_view(
                 &cfg,
                 &mut group,
                 asset_index as usize,
-                outcome.fee_a,
-                outcome.fee_b,
+                domain_fee_a,
+                domain_fee_b,
             )?;
             update_hybrid_mark_after_trade_view(
                 &mut oracle_profile,
@@ -6996,8 +7137,10 @@ pub mod processor {
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
             let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(legs.len());
-            // (asset_index, oracle_profile, reported_exec_price, fee_basis_price, fee_bps_eff, abs_size)
-            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u64, u64, u128)> =
+            // (asset_index, oracle_profile, reported_exec_price, fee_basis_price, fee_bps_eff,
+            // abs_size, leg_size_q) -- leg_size_q (the raw signed per-leg size) is carried through
+            // so the taker-only post-pass below can pick the correct single domain per leg (§1A.3).
+            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u64, u64, u128, i128)> =
                 Vec::with_capacity(legs.len());
             for leg in legs {
                 let asset_index = leg.asset_index as usize;
@@ -7041,6 +7184,7 @@ pub mod processor {
                     fee_basis_price,
                     fee_bps_eff,
                     abs_size,
+                    leg.size_q,
                 ));
             }
             ensure_trade_portfolios_current_for_requests_view(
@@ -7052,19 +7196,46 @@ pub mod processor {
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
 
+            // Taker-only (design §1A.3): batches never reorder -- account_a is
+            // always the engine's first (long_account) positional slot for
+            // the whole call, and account_a is always the taker (§1A.2).
             let outcome = group
                 .execute_batch_with_fee_loss_stale_scoped_not_atomic(
                     &mut account_a,
                     &mut account_b,
                     &requests,
+                    true,
                 )
                 .map_err(map_v16_error)?;
 
-            // Post-pass: split fees back to each asset's domains and drive its hybrid mark. Fees are
-            // reconstructed deterministically per leg; the running total must equal the engine's
-            // aggregate or we refuse the batch (no silent mis-accounting).
+            // Taker-only + N1 (design §1A.3/§1A.4): within one batch call,
+            // exactly one physical account pays across the WHOLE batch --
+            // pnl (the only thing `charge_account_fee_current_not_atomic`'s
+            // waiver reads) is invariant across legs within a single call
+            // (only capital changes as fees are charged; nothing in the
+            // per-leg loop -- position-delta application, residual-reward
+            // transfer, recertification -- touches pnl), so it is never a
+            // per-leg mix. `outcome.fee_a`/`outcome.fee_b` are the engine's
+            // AGGREGATE totals across all legs; whichever is nonzero
+            // identifies the uniform payer for this whole batch.
+            let taker_paid = outcome.fee_a > 0;
+            let maker_paid = outcome.fee_b > 0;
+            if taker_paid && maker_paid {
+                // Unreachable given the engine's taker-only charge shape
+                // (see proof_v16_taker_only_charges_exactly_one_side in
+                // percolator/tests/proofs_v16.rs), but the wrapper does not
+                // trust that invariant blindly across the ABI boundary.
+                return Err(PercolatorError::EngineArithmeticOverflow.into());
+            }
+
+            // Post-pass: split fees back to each asset's single paying domain and drive its hybrid
+            // mark. Fees are reconstructed deterministically per leg; the running total must equal
+            // the engine's aggregate or we refuse the batch (no silent mis-accounting). Also skims
+            // the protocol's 20% off the top of each leg's fee before crediting the domain (design
+            // §1/§2), symmetric with the single-trade credit site above.
             let mut reconstructed_total: u128 = 0;
             let mut cfg_dirty = false;
+            let mut protocol_cut_running_total: u128 = 0;
             for (
                 asset_index,
                 oracle_profile,
@@ -7072,28 +7243,65 @@ pub mod processor {
                 fee_basis_price,
                 fee_bps_eff,
                 abs_size,
+                leg_size_q,
             ) in leg_ctx.iter_mut()
             {
                 let fee_leg = batch_leg_fee(*abs_size, *fee_basis_price, *fee_bps_eff)?;
-                credit_trade_fees_to_market_budgets_view(
-                    &cfg,
-                    &mut group,
-                    *asset_index,
-                    fee_leg,
-                    fee_leg,
-                )?;
-                let total_fee_leg = fee_leg
-                    .checked_add(fee_leg)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                if fee_leg != 0 {
+                    let protocol_cut_leg = fee_share_floor(fee_leg, constants::PROTOCOL_FEE_BPS)?;
+                    let domain_amount_leg = fee_leg
+                        .checked_sub(protocol_cut_leg)
+                        .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                    protocol_cut_running_total = protocol_cut_running_total
+                        .checked_add(protocol_cut_leg)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    if taker_paid {
+                        // account_a is always the engine's first (long_account)
+                        // positional slot for batches, so its delta on this leg
+                        // is leg_size_q directly -- positive means account_a's
+                        // exposure on this asset is the LONG domain.
+                        let domain = if *leg_size_q > 0 {
+                            *asset_index * 2
+                        } else {
+                            *asset_index * 2 + 1
+                        };
+                        credit_fee_to_domain_budget_view(
+                            &cfg,
+                            &mut group,
+                            domain,
+                            domain_amount_leg,
+                        )?;
+                    } else if maker_paid {
+                        // account_b's delta on this leg is -leg_size_q (the
+                        // opposite of account_a's) -- positive leg_size_q means
+                        // account_b's exposure on this asset is the SHORT domain.
+                        let domain = if *leg_size_q > 0 {
+                            *asset_index * 2 + 1
+                        } else {
+                            *asset_index * 2
+                        };
+                        credit_fee_to_domain_budget_view(
+                            &cfg,
+                            &mut group,
+                            domain,
+                            domain_amount_leg,
+                        )?;
+                    }
+                    // else: neither side paid anything this batch (both
+                    // waived/insolvent) -- fee_leg stays uncredited to any
+                    // domain, and the post-loop reconstructed_total !=
+                    // engine_total (0) check below rejects the whole batch
+                    // rather than silently dropping a nonzero fee.
+                }
                 reconstructed_total = reconstructed_total
-                    .checked_add(total_fee_leg)
+                    .checked_add(fee_leg)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 update_hybrid_mark_after_trade_view(
                     oracle_profile,
                     &group,
                     *asset_index,
                     *reported_price,
-                    total_fee_leg,
+                    fee_leg,
                 )?;
                 write_oracle_profile_to_view(&mut group, *asset_index, oracle_profile)?;
                 if *asset_index == 0 && oracle_v16::profile_is_price_managed(oracle_profile) {
@@ -7108,6 +7316,16 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             if reconstructed_total != engine_total {
                 return Err(PercolatorError::EngineArithmeticOverflow.into());
+            }
+            if protocol_cut_running_total != 0 {
+                cfg.protocol_fee_accrued_atoms = cfg
+                    .protocol_fee_accrued_atoms
+                    .checked_add(protocol_cut_running_total)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // CRITICAL: same write-back-forcing requirement as the
+                // single-trade site -- a missed write-back here would
+                // silently discard accrued protocol fees.
+                cfg_dirty = true;
             }
             if cfg_dirty {
                 cfg_after = Some(cfg);
@@ -7377,12 +7595,18 @@ pub mod processor {
             exec_price: frozen_mark,
             fee_bps: 0,
         };
+        // Taker-only: this path always trades at fee_bps: 0 (a cranker-driven
+        // forced close, not a fee-bearing trade), so `taker_is_long_account`
+        // is a documented no-op here -- `charge_account_fee_current_not_atomic`
+        // short-circuits on `requested_fee == 0` regardless of which side is
+        // nominally "taker" (design §1A.4).
         if leg_a.side == SideV16::Short {
             group
                 .execute_trade_with_fee_loss_stale_scoped_not_atomic(
                     &mut account_a,
                     &mut account_b,
                     req,
+                    true,
                 )
                 .map_err(map_v16_error)?;
         } else {
@@ -7391,6 +7615,7 @@ pub mod processor {
                     &mut account_b,
                     &mut account_a,
                     req,
+                    true,
                 )
                 .map_err(map_v16_error)?;
         }
@@ -9195,6 +9420,140 @@ pub mod processor {
             signer_seeds,
         )?;
         Ok(())
+    }
+
+    /// WithdrawProtocolFee (tag 83, design §3.1). Pays out from the accrued-
+    /// but-unwithdrawn protocol claim to an external token account.
+    /// `amount == 0` means "withdraw all currently-available capacity".
+    /// Modeled on `handle_withdraw_insurance_asset` minus the domain-budget
+    /// bookkeeping (and with no insurance-withdraw-cooldown gate: that
+    /// mechanism is a creator-facing anti-drain throttle on the *domain*
+    /// budgets; the protocol's claim is a separately-accounted, non-domain
+    /// balance and `protocol_fee_authority` is not an adversary this design
+    /// defends against).
+    #[inline(never)]
+    fn handle_withdraw_protocol_fee<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        let authority = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let dest_token = account(accounts, 2)?;
+        let vault_token = account(accounts, 3)?;
+        let vault_authority_ai = account(accounts, 4)?;
+        let token_program = account(accounts, 5)?;
+        expect_signer(authority)?;
+        expect_writable(market_ai)?;
+        expect_writable(dest_token)?;
+        expect_writable(vault_token)?;
+        expect_owner(market_ai, program_id)?;
+        verify_token_program(token_program)?;
+
+        let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+
+        let (transfer_amount_u64, cfg_after) = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            if !live_authority_matches(&cfg.protocol_fee_authority, authority.key) {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            verify_withdrawable_token_accounts(
+                dest_token,
+                authority.key,
+                vault_token,
+                &vault_authority,
+                &cfg,
+            )?;
+            let claim_capacity = cfg
+                .protocol_fee_accrued_atoms
+                .saturating_sub(cfg.protocol_fee_withdrawn_atoms);
+            let requested = if amount == 0 { claim_capacity } else { amount };
+            if requested == 0 || requested > claim_capacity {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // §1.3/N2 clamp: crank rewards (`credit_account_from_insurance_not_atomic`
+            // callers) share the same unbudgeted-surplus gap the protocol's claim
+            // lives in, so `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`
+            // can in principle exceed what's actually available on-chain right now.
+            // This is not a theft/solvency bug (the engine's own
+            // `withdraw_insurance_surplus_not_atomic` bound cannot be exceeded
+            // regardless) -- it is purely an availability limitation, so clamp the
+            // transfer to what's actually available and only mark the ACTUALLY
+            // transferred amount as withdrawn (a partial fill), rather than
+            // erroring the whole instruction.
+            let engine_available = group
+                .header
+                .insurance
+                .get()
+                .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+            let transfer_amount = requested.min(engine_available).min(group.header.vault.get());
+            if transfer_amount == 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let transfer_amount_u64 = amount_to_u64(transfer_amount)?;
+            require_token_balance(vault_token, transfer_amount_u64)?;
+            group
+                .withdraw_insurance_surplus_not_atomic(transfer_amount)
+                .map_err(map_v16_error)?;
+            cfg.protocol_fee_withdrawn_atoms = cfg
+                .protocol_fee_withdrawn_atoms
+                .checked_add(transfer_amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            group.validate_shape().map_err(map_v16_error)?;
+            (transfer_amount_u64, cfg)
+        };
+        // Unconditional write-back: every successful call here mutates
+        // protocol_fee_withdrawn_atoms, unlike the trade-credit sites' opt-in
+        // cfg_after pattern.
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
+        let bump_arr = [bump];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            dest_token,
+            vault_authority_ai,
+            transfer_amount_u64,
+            signer_seeds,
+        )
+    }
+
+    /// SetProtocolFeeAuthority (tag 84, design §3.2). Rotates
+    /// `protocol_fee_authority` on a single market. Gated on the program's
+    /// BPF upgrade authority -- NOT `marketauth`, NOT any
+    /// creator/insurance_authority-facing gate. No global fan-out: a
+    /// keeper script iterates markets if a mass rotation is ever needed
+    /// (v2 nicety, not a blocker).
+    #[inline(never)]
+    fn handle_set_protocol_fee_authority<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        new_authority: [u8; 32],
+    ) -> ProgramResult {
+        let upgrade_authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        expect_signer(upgrade_authority)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+
+        let (program_data_key, _) = derive_program_data_address(program_id);
+        expect_key(program_data_ai, &program_data_key)?;
+        let stored_upgrade_authority = read_program_data_upgrade_authority(program_data_ai)?;
+        if stored_upgrade_authority != Some(*upgrade_authority.key) {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        let (mut cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        cfg.protocol_fee_authority = new_authority;
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }
 
     #[inline(never)]
@@ -14542,6 +14901,46 @@ pub mod processor {
 
     fn derive_vault_authority(program_id: &Pubkey, market_key: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[b"vault", market_key.as_ref()], program_id)
+    }
+
+    /// ProgramData PDA for `program_id` under the upgradeable BPF loader —
+    /// standard Solana pattern, new to this codebase (design §2/§3.2).
+    fn derive_program_data_address(program_id: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::id())
+    }
+
+    /// Reads `upgrade_authority_address` out of a `UpgradeableLoaderState::ProgramData`
+    /// account's raw bytes without pulling in a bincode dependency for this
+    /// no_std program: the loader's on-chain serialization of this variant
+    /// is a stable, consensus-critical layout —
+    /// `UpgradeableLoaderState::size_of_programdata_metadata() == 45`
+    /// (4-byte little-endian enum discriminant, 8-byte `slot`, then a
+    /// 1-byte `Option` tag + 32-byte pubkey for `upgrade_authority_address`).
+    /// `ProgramData` is variant index 3 (`Uninitialized`=0, `Buffer`=1,
+    /// `Program`=2, `ProgramData`=3).
+    fn read_program_data_upgrade_authority(
+        program_data_ai: &AccountInfo,
+    ) -> Result<Option<Pubkey>, ProgramError> {
+        if program_data_ai.owner != &bpf_loader_upgradeable::id() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let data = program_data_ai.try_borrow_data()?;
+        if data.len() < 45 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let discriminant = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        if discriminant != 3 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        match data[12] {
+            0 => Ok(None),
+            1 => {
+                let mut key_bytes = [0u8; 32];
+                key_bytes.copy_from_slice(&data[13..45]);
+                Ok(Some(Pubkey::new_from_array(key_bytes)))
+            }
+            _ => Err(ProgramError::InvalidAccountData),
+        }
     }
 
     /// The SPL Associated Token Account program — used to derive the single CANONICAL vault address.

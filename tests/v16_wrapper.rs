@@ -544,10 +544,21 @@ fn chainlink_account(key: Pubkey, answer: i128, decimals: u8, publish_time: u32)
     TestAccount::new_with_data(key, oracle_v16::CHAINLINK_STORE_PROGRAM_ID, data)
 }
 
+/// Pre-taker-only helper name, kept for historical clarity in comments.
+/// Taker-only (design §1A) collects exactly ONE side's ceil-rounded fee per
+/// fill now, never two — use `taker_only_fee` at every call site instead.
+#[allow(dead_code)]
 fn two_sided_fee(size_q: u128, price: u64, fee_bps: u64) -> u128 {
+    taker_only_fee(size_q, price, fee_bps) * 2
+}
+
+/// Expected TOTAL fee credited to `group.insurance` for a single fill under
+/// taker-only charging (design §1A): exactly one side's ceil-rounded fee
+/// (`checked_fee_bps`'s rounding, mirrored here), since the passive
+/// maker/LP side pays nothing.
+fn taker_only_fee(size_q: u128, price: u64, fee_bps: u64) -> u128 {
     let notional = size_q * price as u128 / POS_SCALE;
-    let one_side = (notional * fee_bps as u128 + 9_999) / 10_000;
-    one_side * 2
+    (notional * fee_bps as u128 + 9_999) / 10_000
 }
 
 fn run_ix_data(data: &[u8], accounts: &mut [&mut TestAccount]) -> Result<(), ProgramError> {
@@ -9539,7 +9550,8 @@ fn v16_wrapper_auth_mark_trade_cannot_update_authority_mark() {
     let exec_price = before_group.assets[0].effective_price * 150 / 100;
     // W1 (fee-on-mark): the fee is billed on the MARK (effective_price), not the consented
     // exec_price — so the base (no-surcharge) fee an AuthMark trade pays is mark-based.
-    let base_only_fee = two_sided_fee(size_q, before_group.assets[0].effective_price, 1);
+    // Taker-only (design §1A): total collected is one side's fee, not two.
+    let base_only_fee = taker_only_fee(size_q, before_group.assets[0].effective_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
             asset_index: 0,
@@ -11322,8 +11334,8 @@ fn v16_wrapper_tradenocpi_accepts_consented_wide_exec_price_without_moving_index
     assert_eq!(long.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
     assert_eq!(short.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
     assert_eq!(
-        group.insurance, 20,
-        "W1 (fee-on-mark): billed on the mark (100), not exec_price (150) — notional=1000 @ 100 bps = 10/side"
+        group.insurance, 10,
+        "W1 (fee-on-mark): billed on the mark (100), not exec_price (150) — notional=1000 @ 100 bps = 10 (taker-only, one side)"
     );
 }
 
@@ -12346,8 +12358,9 @@ fn v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_ora
     assert_eq!(
         after_group.insurance,
         // W1 (fee-on-mark): billed on the mark (effective_price), not the wide consented exec_price.
-        two_sided_fee(size_q, before_group.assets[0].effective_price, 1),
-        "regular-hours hybrid pays only the static 1 bp two-sided fee (on the mark)"
+        // Taker-only (design §1A): total collected is one side's fee, not two.
+        taker_only_fee(size_q, before_group.assets[0].effective_price, 1),
+        "regular-hours hybrid pays only the static 1 bp taker-only fee (on the mark)"
     );
 }
 
@@ -12564,8 +12577,9 @@ fn v16_wrapper_hybrid_after_hours_fee_floor_scales_with_next_crank_segment_budge
     .unwrap();
     let (_, after_group) = state::read_market(&market.data).unwrap();
     let fee_delta = after_group.insurance - before_insurance;
-    let one_slot_floor = two_sided_fee(size_q, exec_price, 1 + 500);
-    let full_segment_floor = two_sided_fee(size_q, exec_price, 1 + 500 * 10);
+    // Taker-only (design §1A): total collected is one side's fee, not two.
+    let one_slot_floor = taker_only_fee(size_q, exec_price, 1 + 500);
+    let full_segment_floor = taker_only_fee(size_q, exec_price, 1 + 500 * 10);
     assert!(
         fee_delta >= full_segment_floor,
         "stale fallback fee must cover the full price movement budget the next honest crank can consume"
@@ -12764,9 +12778,9 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
 
     let (_, group) = state::read_market(&market.data).unwrap();
     assert_eq!(
-        group.insurance, 20,
+        group.insurance, 10,
         "W1 (fee-on-mark): zero caller fee still pays the 100 bps base fee, billed on the mark (100) \
-         not exec_price (150) — notional=1000 => 10/side"
+         not exec_price (150) — notional=1000 @ 100bps = 10 (taker-only, one side)"
     );
 }
 
@@ -13294,7 +13308,8 @@ fn v16_wrapper_tradecpi_hybrid_regular_and_after_hours_follow_mark_policy() {
     assert_eq!(
         regular_group_after.insurance,
         // W1 (fee-on-mark): billed on the mark (effective_price), not the wide consented exec_price.
-        two_sided_fee(size_q, regular_group_before.assets[0].effective_price, 1),
+        // Taker-only (design §1A): total collected is one side's fee, not two.
+        taker_only_fee(size_q, regular_group_before.assets[0].effective_price, 1),
         "regular-hours hybrid CPI trades pay only the static fee floor (on the mark)"
     );
 
@@ -17385,8 +17400,8 @@ fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
             "exec_price {exec_price} must not move the mark"
         );
         assert_eq!(
-            group.insurance, 20,
-            "exec_price {exec_price}: full mark-based fee (notional 1000 @ 100 bps = 20) is charged"
+            group.insurance, 10,
+            "exec_price {exec_price}: taker-only full mark-based fee (notional 1000 @ 100 bps = 10, one side) is charged"
         );
     }
 }
@@ -17430,7 +17445,10 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
     };
     let lowball = charge_at(1);
     let honest = charge_at(100);
-    assert_eq!(honest, 20, "honest mark trade pays notional 1000 @ 100 bps = 20");
+    assert_eq!(
+        honest, 10,
+        "honest mark trade pays notional 1000 @ 100 bps = 10 (taker-only, one side)"
+    );
     assert_eq!(
         lowball, honest,
         "lowball exec_price=1 must pay the SAME full mark-based fee — fee evasion is closed"
@@ -17540,4 +17558,526 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
     );
     // The canonical vault is accepted.
     top_up_backing_bucket(&mut admin, &mut market, 0, 1_000, 1_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// Protocol-fee program change (~/v17/PROTOCOL-FEE-DESIGN.md): the 20% skim
+// at the two trade-fee credit sites, taker-only + N1 regression guards, and
+// the WithdrawProtocolFee (tag 83) / SetProtocolFeeAuthority (tag 84)
+// instructions.
+// ---------------------------------------------------------------------------
+
+/// Bumps `trade_fee_base_bps` (and `max_trading_fee_bps` if needed) on an
+/// already-initialized market, bypassing the InitMarket wire so tests don't
+/// need to thread a custom mint through `init_market_ix_with`.
+fn set_trade_fee_base_bps(market: &mut TestAccount, bps: u64) {
+    let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+    cfg.trade_fee_base_bps = bps;
+    if group.config.max_trading_fee_bps < bps {
+        group.config.max_trading_fee_bps = bps;
+    }
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+#[test]
+fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_credits_taker_domain_only() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000); // 10%
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+
+    let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_before.protocol_fee_accrued_atoms, 0);
+
+    // account_a (long_owner/long_account) is the taker; size_q > 0 puts it in
+    // the engine's long_account slot (domain 0 for asset 0).
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: (10 * POS_SCALE) as i128,
+            exec_price: 100,
+            fee_bps: 1_000,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
+    let expected_protocol_cut = total_fee * 2_000 / 10_000; // fee_share_floor, PROTOCOL_FEE_BPS
+    let expected_taker_domain = total_fee - expected_protocol_cut;
+
+    assert_eq!(
+        group_after.insurance - group_before.insurance,
+        total_fee,
+        "header.insurance still receives 100% of the fee -- the skim only changes domain routing"
+    );
+    assert_eq!(
+        cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut,
+        "protocol accrues exactly fee_share_floor(fee, 2000)"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
+        expected_taker_domain,
+        "taker's domain (asset 0 long) gets the complement"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
+        "N1/N4 regression guard: maker's domain (asset 0 short) is byte-unchanged"
+    );
+}
+
+#[test]
+fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_credits_taker_domain_only() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut owner_a = signer();
+    let mut owner_b = signer();
+    let mut account_a = portfolio_account();
+    let mut account_b = portfolio_account();
+    init_portfolio(&mut owner_a, &mut market, &mut account_a);
+    init_portfolio(&mut owner_b, &mut market, &mut account_b);
+    deposit(&mut owner_a, &mut market, &mut account_a, 10_000_000);
+    deposit(&mut owner_b, &mut market, &mut account_b, 10_000_000);
+
+    let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+
+    // TradeCpi delegates to handle_trade_nocpi_zero_copy; account_a is always
+    // the taker regardless of the matcher fill's sign convention.
+    run_trade_cpi_with_matcher(
+        &mut owner_a,
+        &mut owner_b,
+        &mut market,
+        &mut account_a,
+        &mut account_b,
+        0,
+        (10 * POS_SCALE) as i128,
+        (10 * POS_SCALE) as i128,
+        100,
+        1_000,
+        0,
+    )
+    .unwrap();
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
+    let expected_protocol_cut = total_fee * 2_000 / 10_000;
+    let expected_taker_domain = total_fee - expected_protocol_cut;
+
+    assert_eq!(group_after.insurance - group_before.insurance, total_fee);
+    assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
+    assert_eq!(
+        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
+        expected_taker_domain,
+        "taker's (account_a) domain gets the complement"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
+        "N1/N4 regression guard: maker's (account_b) domain is byte-unchanged"
+    );
+}
+
+#[test]
+fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain_only() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+
+    let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+
+    run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: (10 * POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 1_000,
+            }],
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
+    let expected_protocol_cut = total_fee * 2_000 / 10_000;
+    let expected_taker_domain = total_fee - expected_protocol_cut;
+
+    assert_eq!(group_after.insurance - group_before.insurance, total_fee);
+    assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
+    assert_eq!(
+        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
+        expected_taker_domain,
+        "batch taker's (account_a, always long_account for batches) domain gets the complement"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
+        "N1/N4 regression guard: batch maker's domain is byte-unchanged"
+    );
+}
+
+// NOT RUN: this file's native in-process `run_ix`/`TestAccount` harness has no
+// real BPF loader, so `invoke_signed` is a stubbed no-op ("SyscallStubs:
+// sol_invoke_signed() not available") -- fine for `handle_trade_cpi` (single
+// trade), which reads the matcher's fill back by directly borrowing
+// `matcher_ctx`'s bytes (pre-seeded by `write_matcher_return` regardless of
+// whether invoke_signed actually ran anything), but NOT fine for
+// `handle_batch_trade_cpi`, which reads the fill via
+// `solana_program::program::get_return_data()` -- a real cross-program
+// return-data syscall that only a genuine callee (or a LiteSVM/real-BPF
+// harness) can populate. This is a PRE-EXISTING gap: zero BatchTradeCpi tests
+// existed anywhere in this file before this change (confirmed by exhaustive
+// grep), so this is not a regression. The protocol-fee skim logic itself is
+// still covered for the BatchTradeCpi (tag 67) path via (a) code-sharing --
+// `handle_batch_trade_cpi` converts the matcher's fills into `BatchTradeLeg`s
+// and delegates to the exact same `handle_batch_execute_zero_copy` core
+// already exercised (with the skim asserted) by
+// `v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain_only`,
+// and (b) the engine-level `proof_v16_taker_only_charges_exactly_one_side`
+// Kani proof, which is call-site-agnostic. A real fix needs a LiteSVM harness
+// with the actual matcher `.so` mounted (see `tests/v16_cu.rs`'s
+// `v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded` for the
+// pattern) -- left as follow-up, not attempted here to avoid a half-verified
+// LiteSVM matcher-CPI harness under time pressure.
+#[test]
+#[ignore = "needs a real BPF/LiteSVM harness for get_return_data(); see comment above"]
+fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_credits_taker_domain_only() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut owner_a = signer();
+    let mut owner_b = signer();
+    let mut account_a = portfolio_account();
+    let mut account_b = portfolio_account();
+    init_portfolio(&mut owner_a, &mut market, &mut account_a);
+    init_portfolio(&mut owner_b, &mut market, &mut account_b);
+    deposit(&mut owner_a, &mut market, &mut account_a, 10_000_000);
+    deposit(&mut owner_b, &mut market, &mut account_b, 10_000_000);
+
+    let mut matcher_program = matcher_program_account();
+    let mut matcher_context = matcher_context_account(&matcher_program);
+    let maker_owner_bytes = state::read_portfolio_owner_preflight(&account_b.data)
+        .map(|(_, owner)| Pubkey::new_from_array(owner))
+        .unwrap_or(owner_b.key);
+    let mut delegate = matcher_delegate_account(
+        &market,
+        &account_b,
+        &maker_owner_bytes,
+        &matcher_program,
+        &matcher_context,
+    );
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [
+            &mut owner_b,
+            &mut market,
+            &mut account_b,
+            &mut matcher_program,
+            &mut matcher_context,
+            &mut delegate,
+        ],
+    )
+    .unwrap();
+
+    let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    let req_id = state::next_market_matcher_req_id(&market.data).unwrap();
+    let lp_account_id = {
+        let bytes = delegate.key.to_bytes();
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap())
+    };
+    write_matcher_return(
+        &mut matcher_context,
+        100,
+        (10 * POS_SCALE) as i128,
+        req_id,
+        lp_account_id,
+        0,
+        group_before.assets[0].effective_price,
+    );
+
+    // Account order matches handle_batch_trade_cpi: [signer_a, market,
+    // account_a, account_b, matcher_prog, matcher_ctx, matcher_delegate].
+    run_ix(
+        Instruction::BatchTradeCpi {
+            legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+                asset_index: 0,
+                size_q: (10 * POS_SCALE) as i128,
+                fee_bps: 1_000,
+                limit_price: 0,
+            }],
+        },
+        &mut [
+            &mut owner_a,
+            &mut market,
+            &mut account_a,
+            &mut account_b,
+            &mut matcher_program,
+            &mut matcher_context,
+            &mut delegate,
+        ],
+    )
+    .unwrap();
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
+    let expected_protocol_cut = total_fee * 2_000 / 10_000;
+    let expected_taker_domain = total_fee - expected_protocol_cut;
+
+    assert_eq!(group_after.insurance - group_before.insurance, total_fee);
+    assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
+    assert_eq!(
+        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
+        expected_taker_domain
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
+        "N1/N4 regression guard: batch-CPI maker's domain is byte-unchanged"
+    );
+}
+
+/// Directly seeds a market's raw insurance/vault/domain-budget/protocol-ledger
+/// fields (bypassing a full trade sequence) so WithdrawProtocolFee's
+/// authorization/clamping logic can be tested in isolation.
+fn seed_protocol_fee_fixture(
+    market: &mut TestAccount,
+    protocol_fee_authority: [u8; 32],
+    accrued: u128,
+    withdrawn: u128,
+    insurance: u128,
+    vault: u128,
+) {
+    let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+    cfg.protocol_fee_authority = protocol_fee_authority;
+    cfg.protocol_fee_accrued_atoms = accrued;
+    cfg.protocol_fee_withdrawn_atoms = withdrawn;
+    group.insurance = insurance;
+    group.vault = vault;
+    group.c_tot = 0;
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+#[test]
+fn v16_wrapper_withdraw_protocol_fee_unauthorized_signer_rejected() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    let mut attacker = signer();
+    seed_protocol_fee_fixture(&mut market, admin.key.to_bytes(), 100, 0, 100, 100);
+
+    let mut dest = user_token_account(attacker.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 100);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = run_ix(
+        Instruction::WithdrawProtocolFee { amount: 50 },
+        &mut [
+            &mut attacker,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "a signer that isn't cfg.protocol_fee_authority must be rejected"
+    );
+    assert_eq!(market.data, before, "rejected withdrawal must not mutate the market");
+}
+
+#[test]
+fn v16_wrapper_withdraw_protocol_fee_clamps_to_surplus_and_double_withdraw_bounded() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    // accrued=100, but the engine's unbudgeted surplus (insurance - reserved -
+    // domain_budget_remaining) is only 60 -- the crank-reward-contention clamp
+    // (design §1.3/N2) must cap the transfer at 60, not error the whole ix.
+    seed_protocol_fee_fixture(&mut market, admin.key.to_bytes(), 100, 0, 60, 60);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 60);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    // amount=0 means "withdraw all currently-available capacity".
+    run_ix(
+        Instruction::WithdrawProtocolFee { amount: 0 },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    )
+    .unwrap();
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.protocol_fee_withdrawn_atoms, 60,
+        "clamped to the actually-available surplus, not the full 100 accrued"
+    );
+    assert_eq!(group_after.insurance, 0, "surplus fully drained by the clamped transfer");
+
+    // A second withdrawal attempt: claim capacity is now accrued(100) -
+    // withdrawn(60) = 40, but there's zero surplus left on-chain -- must be
+    // rejected (transfer_amount == 0), never allowed to exceed accrued.
+    let over_claim = run_ix(
+        Instruction::WithdrawProtocolFee { amount: 1 },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert!(
+        over_claim.is_err(),
+        "double-withdraw beyond the actually-available surplus must be rejected"
+    );
+    let (cfg_final, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_final.protocol_fee_withdrawn_atoms, 60,
+        "a rejected withdrawal must not advance protocol_fee_withdrawn_atoms"
+    );
+    assert!(
+        cfg_final.protocol_fee_withdrawn_atoms <= cfg_final.protocol_fee_accrued_atoms,
+        "no-theft invariant: withdrawn can never exceed accrued"
+    );
+}
+
+#[test]
+fn v16_wrapper_withdraw_protocol_fee_rejects_amount_exceeding_accrued_claim() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_protocol_fee_fixture(&mut market, admin.key.to_bytes(), 100, 0, 1_000, 1_000);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    // Plenty of on-chain surplus (1000) but the LEDGER only allows 100 --
+    // the ledger, not just the engine surplus check, must bound the payout.
+    let rejected = run_ix(
+        Instruction::WithdrawProtocolFee { amount: 101 },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert!(rejected.is_err(), "amount beyond the accrued claim must be rejected");
+    assert_eq!(market.data, before);
+}
+
+/// Raw `UpgradeableLoaderState::ProgramData` bytes matching the manual parse
+/// in `read_program_data_upgrade_authority` (45-byte metadata: 4-byte LE
+/// discriminant=3, 8-byte slot, 1-byte Option tag, 32-byte pubkey).
+fn program_data_account(upgrade_authority: Option<Pubkey>) -> TestAccount {
+    let mut data = vec![0u8; 45];
+    data[0..4].copy_from_slice(&3u32.to_le_bytes());
+    // slot (bytes 4..12) left as 0, unused by the parser.
+    match upgrade_authority {
+        Some(key) => {
+            data[12] = 1;
+            data[13..45].copy_from_slice(key.as_ref());
+        }
+        None => data[12] = 0,
+    }
+    TestAccount::new_with_data(
+        Pubkey::find_program_address(&[program_id().as_ref()], &solana_program::bpf_loader_upgradeable::id()).0,
+        solana_program::bpf_loader_upgradeable::id(),
+        data,
+    )
+}
+
+#[test]
+fn v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+
+    let real_upgrade_authority = signer();
+    let mut attacker = signer();
+    let new_authority = Pubkey::new_unique();
+
+    // Wrong signer (not the upgrade authority, even though a valid
+    // ProgramData account is supplied) must be rejected.
+    let mut program_data = program_data_account(Some(real_upgrade_authority.key));
+    let before = market.data.clone();
+    let rejected = run_ix(
+        Instruction::SetProtocolFeeAuthority {
+            new_authority: new_authority.to_bytes(),
+        },
+        &mut [&mut attacker, &mut program_data, &mut market],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "a signer that isn't the program's upgrade authority must be rejected"
+    );
+    assert_eq!(market.data, before);
+
+    // The real upgrade authority succeeds.
+    let mut real_authority_signer = signer();
+    real_authority_signer.key = real_upgrade_authority.key;
+    run_ix(
+        Instruction::SetProtocolFeeAuthority {
+            new_authority: new_authority.to_bytes(),
+        },
+        &mut [&mut real_authority_signer, &mut program_data, &mut market],
+    )
+    .unwrap();
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.protocol_fee_authority, new_authority.to_bytes());
 }
