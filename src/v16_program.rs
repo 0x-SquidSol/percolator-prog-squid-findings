@@ -116,7 +116,7 @@ pub mod constants {
     /// Hardcoded fallback destination for the protocol's accrued fee share,
     /// set unconditionally at `InitMarket` (never an instruction argument).
     /// Rotatable later only via the upgrade-authority-gated
-    /// `SetProtocolFeeAuthority` (tag 84). Pinned to the same creator wallet
+    /// `SetProtocolFeeAuthority` (tag 85). Pinned to the same creator wallet
     /// currently holding upgrade authority on this program (see
     /// DECISIONS-LEDGER.md "Pinned deployed revisions") -- an operational
     /// placeholder the operator is expected to rotate to a real treasury/
@@ -896,7 +896,7 @@ pub mod state {
         /// hardcoded `PROTOCOL_FEE_AUTHORITY_DEFAULT` at InitMarket (never an
         /// instruction argument, so no market can be created with a
         /// zero/attacker-controlled value here); rotatable only via the
-        /// upgrade-authority-gated `SetProtocolFeeAuthority` (tag 84). NOT
+        /// upgrade-authority-gated `SetProtocolFeeAuthority` (tag 85). NOT
         /// settable by `marketauth`/`insurance_authority`/any creator-facing gate.
         pub protocol_fee_authority: [u8; 32],
         /// Cumulative atoms ever accrued to the protocol's claim (monotonic,
@@ -905,7 +905,7 @@ pub mod state {
         /// -- it tracks an *unbudgeted* slice of `header.insurance` that no
         /// `insurance_operator` can reach via `WithdrawInsuranceAsset`.
         pub protocol_fee_accrued_atoms: u128,
-        /// Cumulative atoms ever paid out via `WithdrawProtocolFee` (tag 83).
+        /// Cumulative atoms ever paid out via `WithdrawProtocolFee` (tag 84).
         /// Monotonic, always `<= protocol_fee_accrued_atoms`. The claim
         /// capacity is `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`.
         pub protocol_fee_withdrawn_atoms: u128,
@@ -3720,16 +3720,46 @@ pub mod ix {
         UnwrapEscrowedPortfolio {
             new_owner: [u8; 32],
         },
-        // ── Protocol-fee program change (tags 83/84) ────────────────────────
-        // See ~/v17/PROTOCOL-FEE-DESIGN.md §3.
-        /// WithdrawProtocolFee (tag 83) — pays out from the accrued-but-
+        /// InitMatcherCtx (tag 83): bootstrap a matcher context by CPIing to the
+        /// matcher program with the delegate PDA as signer.
+        ///
+        /// This is the only way to initialize a matcher context — the delegate PDA
+        /// cannot sign a top-level transaction, so the wrapper must sign via
+        /// invoke_signed. Must be called after SetMatcherConfig has registered the
+        /// (matcher_prog, matcher_ctx, delegate) triple on the LP portfolio.
+        ///
+        /// Ported verbatim (wire-identical) from the deployed lineage
+        /// (percolator-prog@6ca7b97b, "fix(wrapper,v17): InitMatcherCtx (tag 83)")
+        /// so the client's existing ~70-byte tag-83 payload keeps decoding exactly
+        /// as it does against the live program.
+        ///
+        /// Accounts: [lp_owner(signer), market_ai, lp_portfolio_ai,
+        ///            matcher_ctx(writable), matcher_prog(executable), matcher_delegate]
+        InitMatcherCtx {
+            kind: u8,
+            trading_fee_bps: u32,
+            base_spread_bps: u32,
+            max_total_bps: u32,
+            impact_k_bps: u32,
+            liquidity_notional_e6: u128,
+            max_fill_abs: u128,
+            max_inventory_abs: u128,
+            fee_to_insurance_bps: u16,
+            skew_spread_mult_bps: u16,
+        },
+        // ── Protocol-fee program change (tags 84/85) ────────────────────────
+        // See ~/v17/PROTOCOL-FEE-DESIGN.md §3. Renumbered 83/84 → 84/85 (2026-07-15)
+        // to free tag 83 for the ported InitMatcherCtx, which the deployed wrapper
+        // lineage already occupies at that tag (see DECISIONS-LEDGER.md "Pinned
+        // deployed revisions").
+        /// WithdrawProtocolFee (tag 84) — pays out from the accrued-but-
         /// unwithdrawn protocol claim to an external token account.
         /// `amount == 0` means "withdraw all currently-available capacity".
         /// Signer-gated on `cfg.protocol_fee_authority`.
         WithdrawProtocolFee {
             amount: u128,
         },
-        /// SetProtocolFeeAuthority (tag 84) — rotates `protocol_fee_authority`.
+        /// SetProtocolFeeAuthority (tag 85) — rotates `protocol_fee_authority`.
         /// Gated on the program's BPF upgrade authority (a new pattern for
         /// this codebase; see `read_program_data_upgrade_authority`), NOT on
         /// `marketauth`/any creator-facing gate.
@@ -4021,10 +4051,35 @@ pub mod ix {
                 82 => Self::UnwrapEscrowedPortfolio {
                     new_owner: read_bytes32(&mut rest)?,
                 },
-                83 => Self::WithdrawProtocolFee {
+                83 => {
+                    // InitMatcherCtx: bootstrap matcher context via CPI
+                    let kind = read_u8(&mut rest)?;
+                    let trading_fee_bps = read_u32(&mut rest)?;
+                    let base_spread_bps = read_u32(&mut rest)?;
+                    let max_total_bps = read_u32(&mut rest)?;
+                    let impact_k_bps = read_u32(&mut rest)?;
+                    let liquidity_notional_e6 = read_u128(&mut rest)?;
+                    let max_fill_abs = read_u128(&mut rest)?;
+                    let max_inventory_abs = read_u128(&mut rest)?;
+                    let fee_to_insurance_bps = read_u16(&mut rest)?;
+                    let skew_spread_mult_bps = read_u16(&mut rest)?;
+                    Self::InitMatcherCtx {
+                        kind,
+                        trading_fee_bps,
+                        base_spread_bps,
+                        max_total_bps,
+                        impact_k_bps,
+                        liquidity_notional_e6,
+                        max_fill_abs,
+                        max_inventory_abs,
+                        fee_to_insurance_bps,
+                        skew_spread_mult_bps,
+                    }
+                }
+                84 => Self::WithdrawProtocolFee {
                     amount: read_u128(&mut rest)?,
                 },
-                84 => Self::SetProtocolFeeAuthority {
+                85 => Self::SetProtocolFeeAuthority {
                     new_authority: read_bytes32(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
@@ -4482,12 +4537,36 @@ pub mod ix {
                     out.push(82);
                     out.extend_from_slice(&new_owner);
                 }
-                Self::WithdrawProtocolFee { amount } => {
+                Self::InitMatcherCtx {
+                    kind,
+                    trading_fee_bps,
+                    base_spread_bps,
+                    max_total_bps,
+                    impact_k_bps,
+                    liquidity_notional_e6,
+                    max_fill_abs,
+                    max_inventory_abs,
+                    fee_to_insurance_bps,
+                    skew_spread_mult_bps,
+                } => {
                     out.push(83);
+                    out.push(kind);
+                    out.extend_from_slice(&trading_fee_bps.to_le_bytes());
+                    out.extend_from_slice(&base_spread_bps.to_le_bytes());
+                    out.extend_from_slice(&max_total_bps.to_le_bytes());
+                    out.extend_from_slice(&impact_k_bps.to_le_bytes());
+                    out.extend_from_slice(&liquidity_notional_e6.to_le_bytes());
+                    out.extend_from_slice(&max_fill_abs.to_le_bytes());
+                    out.extend_from_slice(&max_inventory_abs.to_le_bytes());
+                    out.extend_from_slice(&fee_to_insurance_bps.to_le_bytes());
+                    out.extend_from_slice(&skew_spread_mult_bps.to_le_bytes());
+                }
+                Self::WithdrawProtocolFee { amount } => {
+                    out.push(84);
                     push_u128(&mut out, amount);
                 }
                 Self::SetProtocolFeeAuthority { new_authority } => {
-                    out.push(84);
+                    out.push(85);
                     out.extend_from_slice(&new_authority);
                 }
             }
@@ -6494,6 +6573,31 @@ pub mod processor {
             Instruction::UnwrapEscrowedPortfolio { new_owner } => {
                 handle_unwrap_escrowed_portfolio(program_id, accounts, new_owner)
             }
+            Instruction::InitMatcherCtx {
+                kind,
+                trading_fee_bps,
+                base_spread_bps,
+                max_total_bps,
+                impact_k_bps,
+                liquidity_notional_e6,
+                max_fill_abs,
+                max_inventory_abs,
+                fee_to_insurance_bps,
+                skew_spread_mult_bps,
+            } => handle_init_matcher_ctx(
+                program_id,
+                accounts,
+                kind,
+                trading_fee_bps,
+                base_spread_bps,
+                max_total_bps,
+                impact_k_bps,
+                liquidity_notional_e6,
+                max_fill_abs,
+                max_inventory_abs,
+                fee_to_insurance_bps,
+                skew_spread_mult_bps,
+            ),
             Instruction::WithdrawProtocolFee { amount } => {
                 handle_withdraw_protocol_fee(program_id, accounts, amount)
             }
@@ -7909,6 +8013,180 @@ pub mod processor {
             }
         };
         state::write_portfolio_matcher_config(&mut lp_portfolio_ai.try_borrow_mut_data()?, &cfg)
+    }
+
+    /// InitMatcherCtx (tag 83) — bootstrap a matcher context via CPI.
+    ///
+    /// This is the only path that can call the matcher's tag-2 `process_init` with the
+    /// `matcher_delegate` PDA as signer — a PDA cannot sign top-level transactions, so
+    /// only an `invoke_signed` from this wrapper can supply the required signature.
+    ///
+    /// Pre-conditions (checked here):
+    ///   - `lp_owner` is a signer
+    ///   - `market_ai` is owned by this program
+    ///   - `lp_portfolio_ai` is owned by this program and its recorded owner matches `lp_owner`
+    ///   - `matcher_ctx` is owned by `matcher_prog` and is writable with len >= MATCHER_CONTEXT_MIN_LEN
+    ///   - `matcher_prog` is executable
+    ///   - `matcher_delegate` matches the PDA derived from the six seeds
+    ///   - The LP portfolio's stored matcher config matches the supplied accounts (via
+    ///     `matcher_tail_start_or_verify_lp_config`), ensuring the LP owner cannot
+    ///     bootstrap a context for an arbitrary matcher — only the one they previously
+    ///     registered via SetMatcherConfig
+    ///
+    /// After this instruction the matcher program's `process_init` has written the
+    /// `MatcherCtx` into `matcher_ctx`, and subsequent `TradeCpi`/`BatchTradeCpi`
+    /// calls will succeed.
+    ///
+    /// Ported verbatim from percolator-prog@6ca7b97b so the wire format, account
+    /// list, and behavior byte-match the deployed program (DECISIONS-LEDGER.md
+    /// "Pinned deployed revisions").
+    ///
+    /// Accounts:
+    ///   0  lp_owner       [signer]           — owns the LP portfolio
+    ///   1  market_ai      [ro]               — wrapper-owned market account
+    ///   2  lp_portfolio   [ro]               — LP's portfolio (provenance checked)
+    ///   3  matcher_ctx    [writable]         — matcher context account to initialise
+    ///   4  matcher_prog   [ro, executable]   — the matcher program
+    ///   5  matcher_delegate [ro]             — `["matcher", market, lp_portfolio,
+    ///                                          lp_owner, matcher_prog, matcher_ctx]`
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn handle_init_matcher_ctx<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        kind: u8,
+        trading_fee_bps: u32,
+        base_spread_bps: u32,
+        max_total_bps: u32,
+        impact_k_bps: u32,
+        liquidity_notional_e6: u128,
+        max_fill_abs: u128,
+        max_inventory_abs: u128,
+        fee_to_insurance_bps: u16,
+        skew_spread_mult_bps: u16,
+    ) -> ProgramResult {
+        if accounts.len() < 6 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let lp_owner = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let lp_portfolio_ai = account(accounts, 2)?;
+        let matcher_ctx = account(accounts, 3)?;
+        let matcher_prog = account(accounts, 4)?;
+        let matcher_delegate = account(accounts, 5)?;
+
+        // Caller must sign.
+        expect_signer(lp_owner)?;
+        // matcher_ctx must be writable (it will be written by the matcher CPI).
+        expect_writable(matcher_ctx)?;
+        // Verify wrapper owns the market and LP portfolio accounts.
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_portfolio_ai, program_id)?;
+
+        // Verify LP portfolio is valid and caller owns it.
+        let (portfolio_header, portfolio_owner) =
+            state::read_portfolio_owner_preflight(&lp_portfolio_ai.try_borrow_data()?)?;
+        if portfolio_header.portfolio_account_id != lp_portfolio_ai.key.to_bytes() {
+            return Err(PercolatorError::EngineProvenanceMismatch.into());
+        }
+        if portfolio_header.market_group_id != market_ai.key.to_bytes() {
+            return Err(PercolatorError::EngineProvenanceMismatch.into());
+        }
+        if portfolio_owner != lp_owner.key.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        // Validate matcher shape: must be executable, ctx owned by prog, right size.
+        if matcher_prog.key == program_id
+            || !matcher_prog.executable
+            || matcher_ctx.executable
+            || matcher_ctx.owner != matcher_prog.key
+            || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        // Derive the delegate PDA and verify the caller supplied the right account.
+        let lp_owner_key = Pubkey::new_from_array(portfolio_owner);
+        let (delegate, bump) = derive_matcher_delegate(
+            program_id,
+            market_ai.key,
+            lp_portfolio_ai.key,
+            &lp_owner_key,
+            matcher_prog.key,
+            matcher_ctx.key,
+        );
+        expect_key(matcher_delegate, &delegate)?;
+
+        // Verify the LP's stored matcher config matches — this prevents an LP owner
+        // from re-initializing with a different (matcher_prog, matcher_ctx) pair than
+        // they registered via SetMatcherConfig.
+        matcher_tail_start_or_verify_lp_config(
+            lp_portfolio_ai,
+            matcher_prog.key,
+            matcher_ctx.key,
+            matcher_delegate.key,
+        )?;
+
+        // The lp_account_id stored in the matcher context is the first 8 bytes of
+        // the delegate PDA — the same value used in every subsequent TradeCpi call.
+        let lp_account_id = matcher_lp_account_id(&delegate);
+
+        // Build the 78-byte matcher init payload (tag=2, InitParams layout).
+        // Byte layout:
+        //   [0]     MATCHER_INIT_VAMM_TAG = 2
+        //   [1]     kind
+        //   [2..6]  trading_fee_bps (u32 le)
+        //   [6..10] base_spread_bps (u32 le)
+        //   [10..14] max_total_bps (u32 le)
+        //   [14..18] impact_k_bps (u32 le)
+        //   [18..34] liquidity_notional_e6 (u128 le)
+        //   [34..50] max_fill_abs (u128 le)
+        //   [50..66] max_inventory_abs (u128 le)
+        //   [66..68] fee_to_insurance_bps (u16 le)
+        //   [68..70] skew_spread_mult_bps (u16 le)
+        //   [70..78] lp_account_id (u64 le)
+        let mut cpi_data = [0u8; 78];
+        cpi_data[0] = 2; // MATCHER_INIT_VAMM_TAG
+        cpi_data[1] = kind;
+        cpi_data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
+        cpi_data[6..10].copy_from_slice(&base_spread_bps.to_le_bytes());
+        cpi_data[10..14].copy_from_slice(&max_total_bps.to_le_bytes());
+        cpi_data[14..18].copy_from_slice(&impact_k_bps.to_le_bytes());
+        cpi_data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
+        cpi_data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
+        cpi_data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
+        cpi_data[66..68].copy_from_slice(&fee_to_insurance_bps.to_le_bytes());
+        cpi_data[68..70].copy_from_slice(&skew_spread_mult_bps.to_le_bytes());
+        cpi_data[70..78].copy_from_slice(&lp_account_id.to_le_bytes());
+
+        // matcher's process_init accounts: [lp_pda (signer), ctx_account (writable)]
+        let metas = [
+            AccountMeta::new_readonly(*matcher_delegate.key, true),
+            AccountMeta::new(*matcher_ctx.key, false),
+        ];
+        let ix = SolInstruction {
+            program_id: *matcher_prog.key,
+            accounts: metas.to_vec(),
+            data: cpi_data.to_vec(),
+        };
+
+        // Signs the CPI as the delegate PDA using invoke_signed.
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[
+            b"matcher",
+            market_ai.key.as_ref(),
+            lp_portfolio_ai.key.as_ref(),
+            lp_owner_key.as_ref(),
+            matcher_prog.key.as_ref(),
+            matcher_ctx.key.as_ref(),
+            &bump_arr,
+        ];
+        invoke_signed(
+            &ix,
+            &[matcher_delegate.clone(), matcher_ctx.clone(), matcher_prog.clone()],
+            &[seeds],
+        )
     }
 
     /// Maximum legs in a single matcher batch CPI: the matcher returns N*64 bytes via
@@ -9422,7 +9700,7 @@ pub mod processor {
         Ok(())
     }
 
-    /// WithdrawProtocolFee (tag 83, design §3.1). Pays out from the accrued-
+    /// WithdrawProtocolFee (tag 84, design §3.1). Pays out from the accrued-
     /// but-unwithdrawn protocol claim to an external token account.
     /// `amount == 0` means "withdraw all currently-available capacity".
     /// Modeled on `handle_withdraw_insurance_asset` minus the domain-budget
@@ -9522,7 +9800,7 @@ pub mod processor {
         )
     }
 
-    /// SetProtocolFeeAuthority (tag 84, design §3.2). Rotates
+    /// SetProtocolFeeAuthority (tag 85, design §3.2). Rotates
     /// `protocol_fee_authority` on a single market. Gated on the program's
     /// BPF upgrade authority -- NOT `marketauth`, NOT any
     /// creator/insurance_authority-facing gate. No global fan-out: a
@@ -14999,7 +15277,7 @@ pub mod processor {
     /// Pure byte-parsing core of `read_program_data_upgrade_authority`,
     /// extracted for Kani provability
     /// (`kani_set_protocol_fee_authority_requires_upgrade_authority`, §5.2 --
-    /// SetProtocolFeeAuthority/tag-84 gate). Operates on a raw slice so it
+    /// SetProtocolFeeAuthority/tag-85 gate). Operates on a raw slice so it
     /// needs no `AccountInfo`/syscalls; the owner check and the
     /// `AccountInfo` borrow remain in the caller.
     pub fn parse_program_data_upgrade_authority_bytes(

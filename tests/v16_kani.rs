@@ -2133,7 +2133,7 @@ fn kani_protocol_fee_reserve_never_starved_by_cranker_reward() {
     }
 }
 
-// (d) SetProtocolFeeAuthority (tag 84) is gated on the BPF *upgrade*
+// (d) SetProtocolFeeAuthority (tag 85) is gated on the BPF *upgrade*
 // authority, never on `marketauth`/any creator-facing key. Two parts: the
 // raw-byte parse of the `ProgramData` account's `upgrade_authority_address`
 // is decode-faithful (mirrors `kani_v16_init_market_decode_preserves_wire_fields`

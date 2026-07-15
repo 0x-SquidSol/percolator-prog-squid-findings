@@ -17563,7 +17563,7 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
 // ---------------------------------------------------------------------------
 // Protocol-fee program change (~/v17/PROTOCOL-FEE-DESIGN.md): the 20% skim
 // at the two trade-fee credit sites, taker-only + N1 regression guards, and
-// the WithdrawProtocolFee (tag 83) / SetProtocolFeeAuthority (tag 84)
+// the WithdrawProtocolFee (tag 84) / SetProtocolFeeAuthority (tag 85)
 // instructions.
 // ---------------------------------------------------------------------------
 
