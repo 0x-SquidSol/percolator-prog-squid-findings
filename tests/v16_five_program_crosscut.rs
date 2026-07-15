@@ -42,7 +42,8 @@ use percolator::{
 };
 use percolator_prog::{
     constants::{
-        HEADER_LEN, KIND_PORTFOLIO, MAGIC, MATCHER_ABI_VERSION, NFT_REGISTRY_SEED, VERSION,
+        HEADER_LEN, KIND_PORTFOLIO, LP_VAULT_MINIMUM_LIQUIDITY, MAGIC, MATCHER_ABI_VERSION,
+        NFT_REGISTRY_SEED, VERSION,
     },
     ix::Instruction as ProgInstruction,
     processor::ASSET_ACTION_ACTIVATE,
@@ -239,7 +240,9 @@ fn create_lp_vault_ix(
         program_id: PERCOLATOR_MAINNET,
         accounts: vec![
             AccountMeta::new(admin, true),                        // 0 admin (signer, writable)
-            AccountMeta::new_readonly(market, false),             // 1 market (owner==MAINNET; read)
+            // FIND-1 fix: market must be writable — CreateLpVault now writes
+            // backing_bucket_authority = registry PDA into the asset's oracle profile.
+            AccountMeta::new(market, false),                      // 1 market (owner==MAINNET; writable)
             AccountMeta::new(registry, false),                    // 2 registry PDA (writable)
             AccountMeta::new(mint, false),                        // 3 mint PDA (writable)
             AccountMeta::new_readonly(system_program::ID, false), // 4 system program
@@ -474,8 +477,12 @@ impl CrosscutEnv {
 
     fn activate_asset(&mut self, asset_index: u16, now_slot: u64, initial_price: u64) {
         let admin = self.admin.insecure_clone();
-        // backing_bucket_authority = LP registry PDA so DepositToLpVault passes the
-        // authority-handover gate (two-step create; LpVaultAuthorityMismatch otherwise).
+        // Pre-set backing_bucket_authority = LP registry PDA at activation time.
+        // FIND-1 fix: CreateLpVault (v16_program.rs handle_create_lp_vault) now
+        // writes this authority itself, atomically with vault creation, so this
+        // pre-set is no longer load-bearing for DepositToLpVault — it's kept
+        // here only because it's a convenient way for this fixture to seed a
+        // non-zero starting value and is idempotent with CreateLpVault's write.
         // Harmless to the trade/user-deposit paths, which never touch it.
         self.try_wrapper(
             ProgInstruction::UpdateAssetLifecycle {
@@ -866,8 +873,8 @@ impl CrosscutEnv {
 
 impl CrosscutEnv {
     /// CreateLpVault (tag 74) on `CROSSCUT_DOMAIN`. Creates the registry + LP mint
-    /// PDAs (the asset's backing authority was already set to `lp_registry` in
-    /// `new()`, completing the two-step handover).
+    /// PDAs and (FIND-1 fix) writes backing_bucket_authority = registry PDA into
+    /// the asset's oracle profile directly, atomically with vault creation.
     fn lp_create(&mut self, fee_share_bps: u16, redemption_cooldown_slots: u64) {
         self.lp_create_full(fee_share_bps, redemption_cooldown_slots, 0);
     }
@@ -888,7 +895,9 @@ impl CrosscutEnv {
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new_readonly(self.market, false),
+                // FIND-1 fix: market must be writable — CreateLpVault now writes
+                // backing_bucket_authority = registry PDA into the asset's oracle profile.
+                AccountMeta::new(self.market, false),
                 AccountMeta::new(self.lp_registry, false),
                 AccountMeta::new(self.lp_mint, false),
                 AccountMeta::new_readonly(system_program::ID, false),
@@ -1020,32 +1029,47 @@ impl CrosscutEnv {
 /// MAINNET, sharing the market vault with the user-collateral path.
 #[test]
 fn x0_lp_vault_lifecycle_at_mainnet() {
+    // BUG-2 / N7: this depositor is the vault's TRUE genesis depositor, so the
+    // wrapper's LP_VAULT_MINIMUM_LIQUIDITY dead-share carve-out applies — it
+    // mints MINTED (1_000_000 - LP_VAULT_MINIMUM_LIQUIDITY), not the full
+    // amount, and the registry's outstanding-shares count never returns to a
+    // literal 0 (it floors at LP_VAULT_MINIMUM_LIQUIDITY, permanently).
+    const DEPOSIT_AMOUNT: u128 = 1_000_000;
+    let minted: u128 = DEPOSIT_AMOUNT - LP_VAULT_MINIMUM_LIQUIDITY;
+
     let mut env = CrosscutEnv::new();
     env.lp_create(0, 0); // no fee, zero cooldown (immediate redeem)
 
     let depositor = Keypair::new();
     env.svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
-    let (lp_ata, source) = env.lp_deposit(&depositor, 1_000_000);
+    let (lp_ata, source) = env.lp_deposit(&depositor, DEPOSIT_AMOUNT);
 
-    // Executed guard: first deposit mints 1:1, collateral into the vault.
-    assert_eq!(env.token_amount(lp_ata), 1_000_000, "first deposit mints amount shares");
-    assert_eq!(env.token_amount(env.vault), 1_000_000, "vault received LP collateral");
+    // Executed guard: genesis deposit mints amount - MINIMUM_LIQUIDITY, full
+    // collateral still moves into the vault.
+    assert_eq!(env.token_amount(lp_ata), minted as u64, "genesis deposit mints amount minus dead-share floor");
+    assert_eq!(env.token_amount(env.vault), DEPOSIT_AMOUNT as u64, "vault received LP collateral");
     assert_eq!(env.token_amount(source), 0, "source debited");
     let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, 1_000_000, "registry shares == minted");
+    assert_eq!(reg.total_lp_shares_outstanding, DEPOSIT_AMOUNT, "registry shares == full genesis amount");
 
-    // Redeem the full position.
+    // Redeem the full REAL position (what the depositor actually holds).
     let redemption = state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
-    env.lp_request_redeem(&depositor, redemption, lp_ata, 1_000_000);
+    env.lp_request_redeem(&depositor, redemption, lp_ata, minted);
     assert_eq!(env.token_amount(lp_ata), 0, "shares moved to escrow");
-    assert_eq!(env.token_amount(env.lp_escrow), 1_000_000, "escrow holds the shares");
+    assert_eq!(env.token_amount(env.lp_escrow), minted as u64, "escrow holds the shares");
 
     let dest = env.lp_execute_redeem(&depositor, redemption);
-    assert_eq!(env.token_amount(dest), 1_000_000, "redeemer paid 1:1");
+    assert_eq!(env.token_amount(dest), minted as u64, "redeemer paid 1:1 for the shares they held");
     assert_eq!(env.token_amount(env.lp_escrow), 0, "escrow burned to zero");
-    assert_eq!(env.token_amount(env.vault), 0, "vault drained");
+    assert_eq!(
+        env.token_amount(env.vault), LP_VAULT_MINIMUM_LIQUIDITY as u64,
+        "vault drained down to the dead-share floor's stranded principal, not fully to 0"
+    );
     let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, 0, "registry outstanding back to 0");
+    assert_eq!(
+        reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
+        "registry outstanding floors at the dead-share amount, not 0"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1586,20 +1610,29 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
     assert_eq!(g.vault, 2 * d, "group.vault conserved through the trade");
 
     // LP deposit (collateral → same vault, tracked in the backing ledger).
+    // BUG-2 / N7: this is the vault's TRUE genesis deposit, so it mints
+    // l - LP_VAULT_MINIMUM_LIQUIDITY, not the full l.
+    let minted_lp = l - LP_VAULT_MINIMUM_LIQUIDITY;
     let lp = Keypair::new();
     env.svm.airdrop(&lp.pubkey(), 1_000_000_000).unwrap();
     let (lp_ata, src_lp) = env.lp_deposit(&lp, l);
     assert_eq!(env.token_amount(env.vault), (2 * d + l) as u64, "vault now holds user + LP collateral");
 
-    // LP redeem (collateral → dest, 1:1 with no earnings).
+    // LP redeem (collateral → dest, 1:1 with no earnings) — the depositor can only
+    // redeem the REAL shares they hold (minted_lp), not the full l.
     let redemption = state::derive_lp_redemption(&env.program_id, &env.lp_registry, &lp.pubkey()).0;
-    env.lp_request_redeem(&lp, redemption, lp_ata, l);
+    env.lp_request_redeem(&lp, redemption, lp_ata, minted_lp);
     let dest_lp = env.lp_execute_redeem(&lp, redemption);
-    assert_eq!(env.token_amount(env.vault), (2 * d) as u64, "vault back to user collateral after redeem");
-    assert_eq!(env.token_amount(dest_lp), l as u64, "LP redeemed 1:1");
+    assert_eq!(
+        env.token_amount(env.vault), (2 * d + LP_VAULT_MINIMUM_LIQUIDITY) as u64,
+        "vault back to user collateral PLUS the dead-share floor's stranded principal"
+    );
+    assert_eq!(env.token_amount(dest_lp), minted_lp as u64, "LP redeemed 1:1 for the shares it held");
 
     // ── Conservation: Σ collateral across every collateral account == created. ──
-    // (lp_ata / lp_escrow hold LP SHARES, a different mint — excluded.)
+    // (lp_ata / lp_escrow hold LP SHARES, a different mint — excluded.) Still
+    // holds EXACTLY under N7: the LP_VAULT_MINIMUM_LIQUIDITY atoms never left
+    // any account — they're just stranded in env.vault instead of dest_lp.
     let sum_collateral = env.token_amount(src_a) as u128
         + env.token_amount(src_b) as u128
         + env.token_amount(src_lp) as u128
@@ -1609,9 +1642,12 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
         sum_collateral, total_created,
         "no collateral created or destroyed across deposit→trade→LP-deposit→redeem"
     );
-    // LP-share mint nets to zero (minted on deposit, burned on redeem).
+    // LP-share mint nets to the dead-share floor, not literal zero (N7).
     let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, 0, "LP shares net to zero");
+    assert_eq!(
+        reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
+        "LP shares net to the dead-share floor, not zero"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2227,9 +2263,12 @@ fn x3_lp_redemption_oi_reservation_guard_fires() {
     let depositor = Keypair::new();
     env.svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
     let l: u128 = 1_000_000;
+    // BUG-2 / N7: this is the vault's TRUE genesis deposit, so it mints
+    // l - LP_VAULT_MINIMUM_LIQUIDITY, not the full l.
+    let minted = l - LP_VAULT_MINIMUM_LIQUIDITY;
     let (lp_ata, _src) = env.lp_deposit(&depositor, l);
     // Executed guard: the deposit really minted shares (the guard isn't trivially met).
-    assert_eq!(env.token_amount(lp_ata), l as u64, "deposit minted LP shares");
+    assert_eq!(env.token_amount(lp_ata), minted as u64, "deposit minted LP shares");
 
     // A PARTIAL redemption against fresh backing is fail-closed by the OI guard.
     let redemption =

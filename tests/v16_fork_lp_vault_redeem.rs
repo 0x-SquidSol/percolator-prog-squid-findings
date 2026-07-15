@@ -21,6 +21,7 @@
 
 use litesvm::LiteSVM;
 use percolator::MarketModeV16;
+use percolator_prog::constants::LP_VAULT_MINIMUM_LIQUIDITY;
 use percolator_prog::ix::Instruction as ProgInstruction;
 use percolator_prog::processor::ASSET_ACTION_ACTIVATE;
 use percolator_prog::state::{
@@ -44,6 +45,14 @@ const MAX_PORTFOLIO_ASSETS: u16 = 1;
 const APPEND_ASSET_INDEX: u16 = 1;
 const DOMAIN: u16 = 2;
 const DEPOSIT: u128 = 1_000_000;
+// BUG-2 / N7: `new_depositor(env, DEPOSIT)` used as the SOLE depositor in a
+// freshly-created vault is always that vault's TRUE genesis deposit, so the
+// wrapper's LP_VAULT_MINIMUM_LIQUIDITY dead-share carve-out applies — the
+// depositor's LP ATA holds MINTED (DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY), NOT
+// DEPOSIT. registry.total_lp_shares_outstanding still counts the full DEPOSIT.
+// Use MINTED wherever a REAL token balance (LP ATA / escrow / redemption
+// request/payout) is asserted or requested for a SOLE genesis depositor.
+const MINTED: u128 = DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY;
 
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -202,7 +211,9 @@ fn setup_vault_oi(cooldown_slots: u64, oi_reservation_threshold_bps: u16) -> Env
         fee_share_bps: 5_000, redemption_cooldown_slots: cooldown_slots, oi_reservation_threshold_bps, domain: DOMAIN,
     }, vec![
         AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new_readonly(market, false),
+        // FIND-1 fix: market must be writable — CreateLpVault now writes
+        // backing_bucket_authority = registry PDA into the asset's oracle profile.
+        AccountMeta::new(market, false),
         AccountMeta::new(registry, false),
         AccountMeta::new(lp_mint, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
@@ -372,22 +383,26 @@ fn close_slab(env: &mut Env, dest: Pubkey) -> Result<(), String> {
 fn request_then_execute_pays_pro_rata() {
     let mut env = setup_vault(0); // immediate
     let d = new_depositor(&mut env, DEPOSIT);
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64);
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64);
 
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     // Shares moved to escrow; redeemer's LP ATA drained.
     assert_eq!(tok(&env.svm, d.lp_ata), 0);
-    assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64);
+    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64);
 
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("execute");
-    // Redeemer paid 1:1 (no earnings); escrow burned to 0; vault drained.
-    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "redeemer paid pro-rata");
+    // Redeemer paid 1:1 (no earnings) for the shares they actually hold; escrow
+    // burned to 0; vault drains down to the dead-share floor's principal.
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow burned to zero");
-    assert_eq!(tok(&env.svm, env.vault_token), 0, "vault drained");
-    // Registry outstanding back to 0.
+    assert_eq!(
+        tok(&env.svm, env.vault_token), (DEPOSIT - MINTED) as u64,
+        "vault drained down to the dead-share floor's stranded principal"
+    );
+    // Registry outstanding back to the dead-share floor, not 0.
     let reg = state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, 0);
+    assert_eq!(reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY);
     // Redemption PDA consumed (magic zeroed) → unreadable.
     assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
         "redemption PDA consumed");
@@ -397,7 +412,7 @@ fn request_then_execute_pays_pro_rata() {
 fn execute_before_cooldown_rejects() {
     let mut env = setup_vault(1000); // long cooldown
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
     let res = execute(&mut env, &d);
     assert!(res.is_err(), "execute before cooldown must reject (I5): {res:?}");
@@ -409,15 +424,15 @@ fn execute_twice_two_tx_second_rejects() {
     // HEADLINE replay guard (two-tx): request → execute → execute MUST reject, no second payout.
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("first execute");
-    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64);
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
 
     env.svm.expire_blockhash();
     let res = execute(&mut env, &d);
     assert!(res.is_err(), "second execute (2nd tx) MUST reject — replay guard: {res:?}");
-    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "no second payout");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "no second payout");
 }
 
 #[test]
@@ -428,7 +443,7 @@ fn execute_twice_same_tx_second_rejects() {
     // the data-keyed (magic) guard prevents it.
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
 
     let pid = env.program_id;
@@ -451,27 +466,38 @@ fn multi_redeemer_each_gets_pro_rata() {
     // I12: escrow == Σ outstanding shares. Two depositors, two concurrent
     // pending redemptions in the shared escrow. Execute both; each gets exactly
     // its pro-rata; escrow zeroes out.
+    //
+    // BUG-2 / N7: d1 is this vault's TRUE genesis depositor, so it mints only
+    // MINTED (999_000, not DEPOSIT) — d2 deposits second (not genesis) and
+    // mints the full 2*DEPOSIT, 1:1, unaffected. With no earnings ever seeded,
+    // nav == total_shares == available_principal at every step (by induction:
+    // every deposit/redemption before this one was exactly 1:1), so BOTH
+    // redemptions remain exact — no rounding dust — even with the dead-share
+    // floor baked into total_shares.
     let mut env = setup_vault(0);
-    let d1 = new_depositor(&mut env, DEPOSIT); // 1_000_000 shares
+    let d1 = new_depositor(&mut env, DEPOSIT); // MINTED (999_000) real shares
     let d2 = new_depositor(&mut env, 2 * DEPOSIT); // 2_000_000 shares (1:1, no earnings)
 
-    request(&mut env, &d1, DEPOSIT).expect("request d1");
+    request(&mut env, &d1, MINTED).expect("request d1");
     request(&mut env, &d2, 2 * DEPOSIT).expect("request d2");
-    // I12: escrow holds the sum of both pending redemptions.
-    assert_eq!(tok(&env.svm, env.escrow), (DEPOSIT + 2 * DEPOSIT) as u64, "escrow == Σ pending shares");
+    // I12: escrow holds the sum of both pending redemptions (real shares only).
+    assert_eq!(tok(&env.svm, env.escrow), (MINTED + 2 * DEPOSIT) as u64, "escrow == Σ pending shares");
 
     env.svm.expire_blockhash();
     execute(&mut env, &d1).expect("execute d1");
     env.svm.expire_blockhash();
     execute(&mut env, &d2).expect("execute d2");
 
-    // 1:1, no earnings → each redeems exactly what they deposited.
-    assert_eq!(tok(&env.svm, d1.dest), DEPOSIT as u64, "d1 pro-rata");
+    // 1:1, no earnings → each redeems exactly the shares they hold.
+    assert_eq!(tok(&env.svm, d1.dest), MINTED as u64, "d1 pro-rata");
     assert_eq!(tok(&env.svm, d2.dest), 2 * DEPOSIT as u64, "d2 pro-rata");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow zeroes out");
     let reg = state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, 0, "all shares redeemed");
-    assert_eq!(tok(&env.svm, env.vault_token), 0, "vault fully drained");
+    assert_eq!(reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY, "dead-share floor remains, not 0");
+    assert_eq!(
+        tok(&env.svm, env.vault_token), (DEPOSIT - MINTED) as u64,
+        "vault drained down to the dead-share floor's stranded principal, not fully to 0"
+    );
 }
 
 #[test]
@@ -480,8 +506,15 @@ fn execute_redemption_backing_state_matches_withdraw() {
     // counters + market vault total match an equivalent WithdrawBackingBucket
     // (atoms) call (admin authority). Identity fields (authority/market) differ
     // across the two markets and are excluded.
+    //
+    // BUG-2 / N7: Path B's depositor is the vault's TRUE genesis depositor, so
+    // it can only ever redeem MINTED (999_000), not the full DEPOSIT it put
+    // in — the LP_VAULT_MINIMUM_LIQUIDITY dead-share floor stays behind. Both
+    // paths top up the bucket with the FULL DEPOSIT (so `total_deposited_atoms`
+    // still matches) but withdraw only MINTED, so the two paths' resulting
+    // ledger/vault state matches again.
 
-    // Path A: deposit then WithdrawBackingBucket(DEPOSIT) by admin (admin is the
+    // Path A: deposit then WithdrawBackingBucket(MINTED) by admin (admin is the
     // backing authority on this market's appended asset).
     let mut env_a = setup_vault_admin_authority();
     // Top up backing via admin so there is principal to withdraw, then withdraw it.
@@ -497,7 +530,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
     send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::TopUpBackingBucket { domain: DOMAIN, amount: DEPOSIT, expiry_slot: percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT },
         vec![AccountMeta::new(admin_a.pubkey(), true), AccountMeta::new(env_a.market, false), AccountMeta::new(src_a, false), AccountMeta::new(env_a.vault_token, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new(ledger_a, false)])], &[&admin_a]).expect("top up");
     env_a.svm.expire_blockhash();
-    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::WithdrawBackingBucket { domain: DOMAIN, amount: DEPOSIT },
+    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::WithdrawBackingBucket { domain: DOMAIN, amount: MINTED },
         vec![AccountMeta::new(admin_a.pubkey(), true), AccountMeta::new(env_a.market, false), AccountMeta::new(dest_a, false), AccountMeta::new(env_a.vault_token, false), AccountMeta::new_readonly(env_a.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new(ledger_a, false)])], &[&admin_a]).expect("withdraw");
     let led_a = state::read_backing_domain_ledger(&env_a.svm.get_account(&ledger_a).unwrap().data).unwrap();
     let (_, group_a) = state::read_market(&env_a.svm.get_account(&env_a.market).unwrap().data).unwrap();
@@ -505,7 +538,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
     // Path B: deposit then request+execute (registry authority).
     let mut env_b = setup_vault(0);
     let d = new_depositor(&mut env_b, DEPOSIT);
-    request(&mut env_b, &d, DEPOSIT).expect("request");
+    request(&mut env_b, &d, MINTED).expect("request");
     env_b.svm.expire_blockhash();
     execute(&mut env_b, &d).expect("execute");
     let led_b = state::read_backing_domain_ledger(&env_b.svm.get_account(&env_b.ledger).unwrap().data).unwrap();
@@ -616,16 +649,18 @@ fn deposit_to_lp_vault_rejects_noncanonical_vault() {
     let msg = res.expect_err("DepositToLpVault to a non-canonical vault must reject");
     assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
 
-    // ACCEPT: the canonical vault deposit goes through.
+    // ACCEPT: the canonical vault deposit goes through (this is the vault's TRUE
+    // genesis deposit — the rejected attempt above never committed — so
+    // BUG-2 / N7's dead-share carve-out applies: MINTED, not DEPOSIT).
     let d = new_depositor(&mut env, DEPOSIT);
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "canonical-vault deposit accepted");
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "canonical-vault deposit accepted");
 }
 
 #[test]
 fn execute_redemption_rejects_noncanonical_vault() {
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
 
     let mut accts = execute_accounts(&env, &d);
@@ -637,11 +672,15 @@ fn execute_redemption_rejects_noncanonical_vault() {
     assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
 
     // The rejected execute reverted; the redemption is still pending and the CANONICAL vault still
-    // executes (dual-gate intact) — draining env.vault_token, as proven end-to-end above.
+    // executes (dual-gate intact) — draining env.vault_token down to the dead-share floor's
+    // stranded principal, as proven end-to-end above.
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("canonical-vault execute accepted");
-    assert_eq!(tok(&env.svm, env.vault_token), 0, "canonical vault drained on accept");
-    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "redeemer paid pro-rata through the canonical vault");
+    assert_eq!(
+        tok(&env.svm, env.vault_token), (DEPOSIT - MINTED) as u64,
+        "canonical vault drained down to the dead-share floor's stranded principal"
+    );
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata through the canonical vault");
 }
 
 // ── Conservation tests for the principal/earnings split (v17 bug fix) ────────
@@ -745,27 +784,47 @@ fn set_c_tot_for_test(env: &mut Env, c_tot: u128) {
 ///   lp_earnings_total = floor(400_000 * 5_000 / 10_000) = 200_000.
 ///   NAV_total = 3_200_000.
 ///
-/// LP A REDEEM (1_000_000 / 3_000_000 shares):
-///   atoms_A = floor(1_000_000 * 3_200_000 / 3_000_000) = 1_066_666
-///   principal_A = floor(1_000_000 * 3_000_000 / 3_000_000) = 1_000_000
-///   earnings_A = 66_666
-///   gross_consumed_A = ceil(66_666 * 10_000 / 5_000) = ceil(133_332) = 133_332
-///   → net_earnings_remaining = 400_000 - 133_332 = 266_668
-///   → lp_earnings_remaining  = floor(266_668 * 5_000/10_000) = 133_334
+/// BUG-2 / N7 UPDATE: LP A is this vault's TRUE genesis depositor (deposits
+/// 1_000_000 first), so the wrapper's LP_VAULT_MINIMUM_LIQUIDITY (1_000)
+/// dead-share carve-out applies to A's mint — A's LP ATA holds only 999_000
+/// (MINTED_A), NOT 1_000_000, even though `registry.total_lp_shares_outstanding`
+/// still counts the full 1_000_000 (the 1_000 difference is permanently
+/// unminted dead supply — see handle_deposit_to_lp_vault). LP B deposits
+/// second (not genesis) and mints the full 2_000_000, 1:1, unaffected.
 ///
-/// LP B REDEEM (2_000_000 / 2_000_000 shares):
-///   NAV_B = 2_000_000 + 133_334 = 2_133_334
-///   atoms_B = floor(2_000_000 * 2_133_334 / 2_000_000) = 2_133_334
-///   principal_B = 2_000_000, earnings_B = 133_334
-///   gross_consumed_B = ceil(133_334 * 10_000 / 5_000) = ceil(266_668) = 266_668
+/// total_shares stays 3_000_000 (registry counts A's FULL genesis amount, dead
+/// shares included) and NAV is unaffected (ledger-counter-derived, not
+/// share-count-derived), so the PRICE per share is byte-identical to the
+/// pre-N7 numbers below — only the amount LP A can actually REQUEST/REDEEM
+/// changes (999_000, not 1_000_000, since that's all they hold). All
+/// downstream numbers were re-derived from that single change and
+/// cross-checked with a reference script; see the dead-share dust note at the
+/// end for how the "insurance stub == exactly 50%" property is affected.
+///
+/// LP A REDEEM (999_000 / 3_000_000 shares — MINTED_A, not the full genesis amount):
+///   atoms_A = floor(999_000 * 3_200_000 / 3_000_000) = 1_065_600 (exact)
+///   principal_A = floor(999_000 * 3_000_000 / 3_000_000) = 999_000 (exact)
+///   earnings_A = 66_600
+///   gross_consumed_A = ceil(66_600 * 10_000 / 5_000) = 133_200 (exact)
+///   → net_earnings_remaining = 400_000 - 133_200 = 266_800
+///   → lp_earnings_remaining  = floor(266_800 * 5_000/10_000) = 133_400 (exact)
+///
+/// LP B REDEEM (2_000_000 / 2_001_000 shares — the 1_000 dead shares now
+/// permanently dilute B's claim on the remaining pool, since B no longer
+/// holds "all remaining shares"):
+///   NAV_B = 2_001_000 + 133_400 = 2_134_400
+///   atoms_B = floor(2_000_000 * 2_134_400 / 2_001_000) = 2_133_333 (floor; small
+///     dead-share dust — NOT the clean 2_133_334 from the pre-N7 all-shares case)
+///   principal_B = floor(2_000_000 * 2_001_000 / 2_001_000) = 2_000_000 (exact)
+///   earnings_B = 133_333
+///   gross_consumed_B = ceil(133_333 * 10_000 / 5_000) = 266_666 (exact)
 ///
 /// CONSERVATION:
-///   total_payout = 1_066_666 + 2_133_334 = 3_200_000
-///   insurance_stub = 3_400_000 - 3_200_000 = 200_000 = 50% of 400_000 EXACTLY
-///   (89382f1 bug: stub was only 166_667, short by 33_333 due to fee_share leak)
-///
-/// FEE_SHARE SPLIT PRESERVED: LP total = 200_000 = 50% of gross earnings ✓
-///                             insurance stub = 200_000 = 50% ✓
+///   total_payout = 1_065_600 + 2_133_333 = 3_198_933
+///   remainder (insurance stub + dead-share dust) = 3_400_000 - 3_198_933 = 201_067
+///   (vs. 200_000 pre-N7 — the extra 1_067 is the LP_VAULT_MINIMUM_LIQUIDITY
+///   dead-share floor's principal+earnings share, permanently stranded in the
+///   vault rather than paid to anyone — the expected N7 cost, not a bug)
 #[test]
 fn conservation_with_earnings_partial_then_full_redeem() {
     let mut env = setup_vault(0); // fee_share_bps = 5_000, immediate cooldown
@@ -773,82 +832,81 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     // ── Setup: two depositors, then seed earnings. ──
     let d_a = new_depositor(&mut env, 1_000_000);
     let d_b = new_depositor(&mut env, 2_000_000);
+    const MINTED_A: u128 = 1_000_000 - 1_000; // LP_VAULT_MINIMUM_LIQUIDITY carved out of A's genesis mint
+    assert_eq!(tok(&env.svm, d_a.lp_ata), MINTED_A as u64, "A's genesis mint minus dead-share floor");
+    assert_eq!(tok(&env.svm, d_b.lp_ata), 2_000_000, "B's non-genesis mint is 1:1, unaffected");
     assert_eq!(vault_balance(&env), 3_000_000, "vault after deposits");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 3_000_000, "shares after deposits");
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 3_000_000, "shares after deposits (dead shares included)");
 
     // Seed 400_000 gross earnings into domain bucket.
     seed_earnings(&mut env, 400_000);
     assert_eq!(vault_balance(&env), 3_400_000, "vault after earnings seed");
 
-    // ── LP A redeems all 1_000_000 shares. ──
-    request(&mut env, &d_a, 1_000_000).expect("A request");
+    // ── LP A redeems all 999_000 shares they actually hold. ──
+    request(&mut env, &d_a, MINTED_A).expect("A request");
     env.svm.expire_blockhash();
     execute(&mut env, &d_a).expect("A execute");
 
     let payout_a = tok(&env.svm, d_a.dest) as u128;
-    // atoms_A = floor(1_000_000 * 3_200_000 / 3_000_000) = 1_066_666
-    assert_eq!(payout_a, 1_066_666, "LP A payout = principal + earnings slice");
+    // atoms_A = floor(999_000 * 3_200_000 / 3_000_000) = 1_065_600
+    assert_eq!(payout_a, 1_065_600, "LP A payout = principal + earnings slice");
 
     // Ledger after A (gross_consumed model):
-    //   principal decremented by 1_000_000
-    //   total_earnings_withdrawn_atoms += gross_consumed_A = 133_332
-    //     (NOT 66_666 as in 89382f1 — the gross chunk is consumed, insurance stub stays)
+    //   principal decremented by principal_A = 999_000
+    //   total_earnings_withdrawn_atoms += gross_consumed_A = 133_200
     let led_a = ledger(&env);
-    assert_eq!(led_a.total_principal_atoms, 2_000_000, "principal remaining after A");
-    assert_eq!(led_a.total_principal_withdrawn_atoms, 1_000_000, "principal withdrawn after A");
+    assert_eq!(led_a.total_principal_atoms, 2_001_000, "principal remaining after A");
+    assert_eq!(led_a.total_principal_withdrawn_atoms, 999_000, "principal withdrawn after A");
     assert_eq!(
-        led_a.total_earnings_withdrawn_atoms, 133_332,
-        "earnings_withdrawn = gross_consumed_A (133_332), not LP slice (66_666)"
+        led_a.total_earnings_withdrawn_atoms, 133_200,
+        "earnings_withdrawn = gross_consumed_A (133_200), not LP slice (66_600)"
     );
     assert_eq!(led_a.total_earnings_atoms, 400_000, "total_earnings_atoms unchanged by redemption");
 
-    // Remaining shares: 2_000_000 (all held by LP B).
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 2_000_000, "shares after A redeems");
+    // Remaining shares: 2_001_000 — LP B's 2_000_000 PLUS the 1_000 dead shares.
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 2_001_000, "shares after A redeems");
 
-    // Vault after A: 3_400_000 - 1_066_666 = 2_333_334
-    // Insurance stub for A's chunk: 133_332 - 66_666 = 66_666 atoms still in vault.
-    assert_eq!(vault_balance(&env), 2_333_334, "vault balance after A redeems");
+    // Vault after A: 3_400_000 - 1_065_600 = 2_334_400
+    assert_eq!(vault_balance(&env), 2_334_400, "vault balance after A redeems");
 
-    // ── LP B redeems all 2_000_000 shares. ──
+    // ── LP B redeems all 2_000_000 shares they hold (not "all remaining" —
+    // 1_000 dead shares stay behind, permanently unredeemable). ──
     request(&mut env, &d_b, 2_000_000).expect("B request");
     env.svm.expire_blockhash();
     execute(&mut env, &d_b).expect("B execute");
 
     let payout_b = tok(&env.svm, d_b.dest) as u128;
-    // net_earnings_remaining = 400_000 - 133_332 = 266_668
-    // lp_earnings_B = floor(266_668 * 5_000 / 10_000) = floor(133_334) = 133_334
-    // NAV_B = 2_000_000 + 133_334 = 2_133_334
-    // atoms_B = floor(2_000_000 * 2_133_334 / 2_000_000) = 2_133_334
-    assert_eq!(payout_b, 2_133_334, "LP B payout (fee_share split preserved — not inflated by A's stub)");
+    // net_earnings_remaining = 400_000 - 133_200 = 266_800
+    // lp_earnings_B = floor(266_800 * 5_000 / 10_000) = 133_400
+    // NAV_B = 2_001_000 + 133_400 = 2_134_400
+    // atoms_B = floor(2_000_000 * 2_134_400 / 2_001_000) = 2_133_333 (dead-share dust)
+    assert_eq!(payout_b, 2_133_333, "LP B payout (diluted by the 1_000 dead shares in the denominator)");
 
     // Ledger after B.
     let led_b = ledger(&env);
-    assert_eq!(led_b.total_principal_atoms, 0, "principal zero after B");
-    assert_eq!(led_b.total_principal_withdrawn_atoms, 3_000_000, "total principal withdrawn");
-    // gross_consumed_B = ceil(133_334 * 10_000 / 5_000) = 266_668
-    // total_earnings_withdrawn_atoms = 133_332 + 266_668 = 400_000
+    assert_eq!(led_b.total_principal_atoms, 1_000, "dead-share principal remainder, not zero");
+    assert_eq!(led_b.total_principal_withdrawn_atoms, 2_999_000, "total principal withdrawn (A + B)");
+    // gross_consumed_B = ceil(133_333 * 10_000 / 5_000) = 266_666
+    // total_earnings_withdrawn_atoms = 133_200 + 266_666 = 399_866
     assert_eq!(
-        led_b.total_earnings_withdrawn_atoms, 400_000,
-        "total earnings withdrawn = full gross (133_332 + 266_668)"
+        led_b.total_earnings_withdrawn_atoms, 399_866,
+        "total earnings withdrawn = gross_consumed_A + gross_consumed_B (133_200 + 266_666)"
     );
 
-    // Outstanding shares zero.
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "all shares redeemed");
+    // Outstanding shares == the LP_VAULT_MINIMUM_LIQUIDITY dead-share floor, not 0.
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 1_000, "dead-share floor remains, not fully zeroed");
 
-    // ── Conservation: vault remainder = insurance stub = exactly 50% of gross earnings. ──
-    // Total paid = 1_066_666 + 2_133_334 = 3_200_000
+    // ── Conservation: vault remainder = insurance stub + dead-share dust. ──
+    // Total paid = 1_065_600 + 2_133_333 = 3_198_933
     // Total seeded = 3_400_000
-    // Insurance stub = 200_000 = 50% of 400_000 = fee_share preserved exactly.
+    // Remainder = 201_067 (vs. the pre-N7 clean 200_000 = 50% of 400_000 — the
+    // extra 1_067 is the dead-share floor's principal+earnings share,
+    // permanently stranded rather than paid to anyone; see doc above).
     let total_payout = payout_a + payout_b;
-    assert_eq!(total_payout, 3_200_000, "total payout = principal + 50% of earnings");
+    assert_eq!(total_payout, 3_198_933, "total payout = both LPs' real principal + earnings slices");
     let remainder = vault_balance(&env) as u128;
-    assert_eq!(remainder, 200_000, "vault remainder = insurance stub (50% of earnings)");
-    assert_eq!(remainder, 3_400_000 - total_payout, "vault remainder = seeded - paid");
-
-    // CRITICAL: insurance stub equals exactly (1 - fee_share) * gross_earnings.
-    // 89382f1 model gave only 166_667 here (stub shrank by 33_333 due to fee_share leak).
-    // Correct model: 50% * 400_000 = 200_000. ✓
-    assert_eq!(remainder, 200_000, "fee_share split preserved: insurance stub = 50% of gross earnings");
+    assert_eq!(remainder, 201_067, "vault remainder = insurance stub + dead-share dust");
+    assert_eq!(remainder, 3_400_000 - total_payout, "vault remainder = seeded - paid (conservation holds)");
 
     // ── Double-redeem guard still holds after split. ──
     env.svm.expire_blockhash();
@@ -858,23 +916,45 @@ fn conservation_with_earnings_partial_then_full_redeem() {
 
 #[test]
 fn lp_shares_held_at_resolution_can_redeem_and_teardown_vault() {
+    // BUG-2 / N7: `d` is this vault's TRUE genesis depositor, so it can only
+    // ever mint/redeem MINTED (999_000), not the full DEPOSIT — the
+    // LP_VAULT_MINIMUM_LIQUIDITY dead-share floor (1_000 atoms of BOTH shares
+    // AND the underlying collateral they represent) is permanently stranded.
+    // handle_close_lp_vault was updated to tolerate exactly the dead-share
+    // floor remaining outstanding (`> LP_VAULT_MINIMUM_LIQUIDITY`, not `!= 0`),
+    // so CloseLpVault still succeeds. handle_close_slab was NOT changed — it
+    // requires the market's `vault == 0` exactly, and the dead-share atoms are
+    // permanently un-withdrawable (their `backing_bucket_authority` is the
+    // registry PDA, which cannot sign a generic WithdrawBackingBucket outside
+    // the wrapper's own instruction-scoped `invoke_signed` calls) — so
+    // CloseSlab is now permanently unreachable for any market whose LP vault
+    // ever took a real deposit. This is the same trade-off as Uniswap V2 /
+    // ERC4626 minimum-liquidity pools, which also never fully drain again.
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64);
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64);
     assert_eq!(vault_balance(&env), DEPOSIT as u64);
 
     resolve_market(&mut env).expect("resolve empty market with LP backing");
 
-    request(&mut env, &d, DEPOSIT).expect("request still succeeds after resolution");
+    request(&mut env, &d, MINTED).expect("request still succeeds after resolution");
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares are escrowed");
     execute(&mut env, &d).expect("terminal resolved redemption should pay out");
-    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "LP receives collateral payout");
-    assert_eq!(vault_balance(&env), 0, "collateral leaves the program vault");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "LP receives collateral payout");
+    assert_eq!(
+        vault_balance(&env), (DEPOSIT - MINTED) as u64,
+        "dead-share floor's collateral stays permanently stranded in the vault"
+    );
 
     let admin_dest = Pubkey::new_unique();
     set_token(&mut env.svm, admin_dest, env.collateral_mint, env.admin.pubkey(), 0);
-    close_lp_vault(&mut env).expect("redeemed shares should no longer block CloseLpVault");
-    close_slab(&mut env, admin_dest).expect("redeemed backing should no longer block CloseSlab");
+    close_lp_vault(&mut env).expect("registry outstanding at the dead-share floor no longer blocks CloseLpVault");
+    let res = close_slab(&mut env, admin_dest);
+    assert!(
+        res.is_err(),
+        "CloseSlab must now stay permanently blocked — the dead-share floor's \
+         collateral can never reach vault == 0: {res:?}"
+    );
 }
 
 #[test]
@@ -883,7 +963,7 @@ fn lp_redemption_after_resolution_requires_terminal_flat_state() {
     let d = new_depositor(&mut env, DEPOSIT);
 
     resolve_market(&mut env).expect("resolve empty market with LP backing");
-    request(&mut env, &d, DEPOSIT).expect("request still succeeds after resolution");
+    request(&mut env, &d, MINTED).expect("request still succeeds after resolution");
     set_c_tot_for_test(&mut env, 1);
 
     let blocked = execute(&mut env, &d).expect_err("resolved redemption must wait for c_tot = 0");
@@ -903,38 +983,45 @@ fn lp_redemption_after_resolution_requires_terminal_flat_state() {
 #[test]
 fn liveness_not_blocked_when_earnings_exceed_principal() {
     // Single depositor with large earnings relative to deposit.
+    // BUG-2 / N7: `d` is this vault's TRUE genesis depositor, so a 100_000
+    // deposit mints only MINTED_LOCAL = 99_000 (LP_VAULT_MINIMUM_LIQUIDITY =
+    // 1_000 carved out); registry.total_lp_shares_outstanding still counts the
+    // full 100_000. All downstream numbers below are re-derived for 99_000
+    // real shares against a 100_000-share/100_000-principal denominator.
+    //
     // Deposit = 100_000, earnings = 300_000 (50% LP share = 150_000 lp_earnings).
-    // NAV = 100_000 + 150_000 = 250_000.
-    // atoms = floor(1 * 250_000 / 1) = 250_000 > total_principal_atoms (100_000).
+    // NAV = 100_000 + 150_000 = 250_000, total_shares (registry) = 100_000.
+    // atoms = floor(99_000 * 250_000 / 100_000) = 247_500 > total_principal_atoms (100_000).
     // Pre-fix: `atoms > total_principal_atoms` → EngineCounterUnderflow.
-    // Post-fix: `principal_portion (100_000) > total_principal_atoms (100_000)` → false → proceed.
+    // Post-fix: `principal_portion (99_000) > total_principal_atoms (100_000)` → false → proceed.
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, 100_000);
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 100_000);
+    const MINTED_LOCAL: u128 = 100_000 - 1_000; // LP_VAULT_MINIMUM_LIQUIDITY carved out
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED_LOCAL as u64, "genesis mint minus dead-share floor");
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 100_000, "registry counts the full genesis amount");
 
     seed_earnings(&mut env, 300_000);
     // NAV = 100_000 (principal) + 150_000 (50% of 300_000) = 250_000
-    // atoms = 250_000, principal_portion = 100_000, earnings_portion = 150_000
-    // total_principal_atoms = 100_000 — pre-fix guard would reject (250_000 > 100_000)
+    // atoms = 247_500, principal_portion = 99_000, earnings_portion = 148_500
+    // total_principal_atoms = 100_000 — pre-fix guard would reject (247_500 > 100_000)
 
-    request(&mut env, &d, 100_000).expect("request must succeed");
+    request(&mut env, &d, MINTED_LOCAL).expect("request must succeed");
     env.svm.expire_blockhash();
     // POST-FIX: this must succeed. Pre-fix: EngineCounterUnderflow (Custom 5).
     execute(&mut env, &d).expect("execute must succeed (liveness fix — earnings do not block redemption)");
 
-    // LP receives exactly NAV: 250_000
-    assert_eq!(tok(&env.svm, d.dest), 250_000, "LP paid full NAV (principal + earnings)");
-    // Vault remainder = insurance stub = 300_000 (gross) - 150_000 (LP payout) = 150_000
-    assert_eq!(vault_balance(&env), 150_000, "insurance stub stays in vault");
-    // Ledger: gross_consumed = ceil(150_000 * 10_000 / 5_000) = 300_000
-    // total_earnings_withdrawn_atoms = 300_000 (full gross chunk consumed).
+    // LP receives its pro-rata NAV slice: 247_500
+    assert_eq!(tok(&env.svm, d.dest), 247_500, "LP paid pro-rata NAV (principal + earnings)");
+    // Vault remainder = insurance stub + dead-share dust = 400_000 (100_000 + 300_000) - 247_500 = 152_500
+    assert_eq!(vault_balance(&env), 152_500, "insurance stub + dead-share dust stays in vault");
+    // Ledger: gross_consumed = ceil(148_500 * 10_000 / 5_000) = 297_000
     let led = ledger(&env);
-    assert_eq!(led.total_principal_atoms, 0, "principal zero");
+    assert_eq!(led.total_principal_atoms, 1_000, "dead-share principal remainder, not zero");
     assert_eq!(
-        led.total_earnings_withdrawn_atoms, 300_000,
-        "earnings_withdrawn = gross_consumed (300_000), not LP slice (150_000)"
+        led.total_earnings_withdrawn_atoms, 297_000,
+        "earnings_withdrawn = gross_consumed (297_000), not LP slice (148_500)"
     );
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "shares zero");
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 1_000, "dead-share floor remains, not zero");
 }
 
 /// RED CONTROL STRUCTURAL CHECK: if the old guard logic `atoms > total_principal`
@@ -1000,41 +1087,72 @@ fn guard_invariant_principal_portion_le_total_principal_by_construction() {
 ///   400_000, stub = 400_000 − 200_000 = 200_000 → credited to insurance.
 #[test]
 fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
+    // BUG-2 / N7 UPDATE: `d` is this vault's TRUE genesis depositor, so it can
+    // only mint/redeem MINTED (999_000, not the full DEPOSIT) —
+    // LP_VAULT_MINIMUM_LIQUIDITY (1_000) is permanently carved out of both the
+    // minted shares AND (as an unavoidable consequence) the backing collateral
+    // it represents, since `registry.total_lp_shares_outstanding` counts the
+    // FULL genesis amount so genesis-donation inflation stays unprofitable
+    // (see percolator/src/v16.rs lp_vault module design note). All downstream
+    // numbers below are re-derived for a 999_000-share redemption against the
+    // 1_000_000-share/1_000_000-principal denominator; verified with a
+    // reference script alongside conservation_with_earnings_partial_then_full_redeem.
+    //
+    // IMPORTANT: unlike the LPVAULT-359 earnings stub (which the fix below
+    // still correctly tracks into header.insurance and CAN be swept),
+    // LP_VAULT_MINIMUM_LIQUIDITY's stranded PRINCIPAL is NOT credited to
+    // insurance — crediting it there would double-book it against
+    // source_fresh_backing_total_num (which still claims the full genesis
+    // amount) and break validate_shape's senior+fresh_backing<=vault
+    // invariant. So this 1_000-atom principal remainder has NO withdrawal
+    // path at all (same as the dead shares themselves) and CloseSlab —
+    // which the original LPVAULT-359 test proved succeeds once the insurance
+    // stub is swept — is now PERMANENTLY unreachable for any market whose LP
+    // vault ever took a genesis deposit, even after the insurance stub is
+    // fully drained. This is the accepted Uniswap-V2/ERC4626
+    // minimum-liquidity trade-off (pools/markets with a dead-share floor
+    // never fully wind down again), not a regression of the LPVAULT-359 fix
+    // itself — the insurance-stub tracking it proved is still exercised and
+    // still correct below.
     let mut env = setup_vault(0); // fee_share_bps = 5_000, immediate cooldown, asset-1 operator = admin
     let d = new_depositor(&mut env, DEPOSIT);
     seed_earnings(&mut env, 400_000);
     assert_eq!(vault_balance(&env), 1_400_000, "vault after deposit + earnings seed");
 
-    // ── Full redeem → LP paid NAV; insurance stub credited (LPVAULT-359 fix). ──
-    request(&mut env, &d, DEPOSIT).expect("request");
+    // ── Full redeem of the real (MINTED) shares → LP paid its pro-rata NAV;
+    // insurance stub credited (LPVAULT-359 fix, still exercised here). ──
+    request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("execute");
-    assert_eq!(tok(&env.svm, d.dest), 1_200_000, "LP paid full NAV (principal + 50% of earnings)");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "all shares redeemed");
+    assert_eq!(tok(&env.svm, d.dest), 1_198_800, "LP paid pro-rata NAV (principal + earnings slice)");
+    assert_eq!(reg(&env).total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY, "dead-share floor remains");
 
-    // The 200_000 stub physically remains in the vault SPL account...
-    assert_eq!(vault_balance(&env), 200_000, "insurance stub physically present in the vault");
+    // The 199_800 stub (+ nothing else visible here) physically remains in the vault SPL account...
+    assert_eq!(vault_balance(&env), 201_200, "insurance stub + dead-share dust remains in the vault");
 
-    // ...and (THE FIX) is now TRACKED in header.insurance + the redemption domain's
-    // budget, rather than sitting as an un-owned residual.
+    // ...and (THE LPVAULT-359 FIX) the earnings stub IS tracked in header.insurance
+    // + the redemption domain's budget, rather than sitting as an un-owned residual.
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
-    assert_eq!(group.insurance, 200_000, "FIX: stub credited to header.insurance");
-    assert_eq!(group.insurance_domain_budget_remaining_total, 200_000,
+    assert_eq!(group.insurance, 199_800, "FIX: stub credited to header.insurance");
+    assert_eq!(group.insurance_domain_budget_remaining_total, 199_800,
         "FIX: stub credited to insurance_domain_budget_remaining_total");
-    assert_eq!(group.insurance_domain_budget[DOMAIN as usize], 200_000,
+    assert_eq!(group.insurance_domain_budget[DOMAIN as usize], 199_800,
         "FIX: stub credited to the redemption domain's per-domain budget");
     assert_eq!(group.insurance_domain_spent[DOMAIN as usize], 0, "no spend on the domain budget");
-    // RESIDUAL NEUTRALITY: vault minus every tracked claim is ZERO — nothing orphaned.
-    // (Pre-fix this difference equalled the 200_000 stub: vault 200_000, but insurance,
-    // c_tot, backing_provider_earnings_total, source_fresh_backing all 0.)
-    assert_eq!(group.vault, 200_000, "header.vault still holds the stub atoms");
+    // RESIDUAL NEUTRALITY still holds exactly: vault minus every tracked claim
+    // (including the BUG-2 dead-share principal, now nonzero) is ZERO.
+    assert_eq!(group.vault, 201_200, "header.vault still holds the stub + dead-share dust atoms");
     assert_eq!(group.c_tot, 0, "no counterparty capital");
-    assert_eq!(group.backing_provider_earnings_total, 0, "earnings pool fully consumed (gross_consumed)");
-    assert_eq!(group.source_fresh_backing_total_num, 0, "all principal backing withdrawn");
+    assert_eq!(group.backing_provider_earnings_total, 400, "small earnings dust from the dead-share floor");
+    assert_eq!(
+        group.source_fresh_backing_total_num,
+        LP_VAULT_MINIMUM_LIQUIDITY * percolator::BOUND_SCALE,
+        "dead-share floor's principal is still nominally 'fresh backing' — permanently unwithdrawable"
+    );
     let residual = group.vault
         - (group.c_tot + group.insurance + group.backing_provider_earnings_total
             + group.source_fresh_backing_total_num / percolator::BOUND_SCALE);
-    assert_eq!(residual, 0, "FIX: zero un-owned vault residual (stub is fully accounted)");
+    assert_eq!(residual, 0, "residual neutrality: every vault atom is accounted for by SOME counter");
 
     // ── Drain the stub via WithdrawInsuranceAsset (insurance_operator = admin). ──
     // Requires Live mode (asset 1, domain 2). The greedy long-first debit drains
@@ -1046,7 +1164,7 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
     set_token(&mut env.svm, admin_insurance_dest, env.collateral_mint, admin.pubkey(), 0);
     env.svm.expire_blockhash();
     send(&mut env.svm, pid, &payer, vec![(ProgInstruction::WithdrawInsuranceAsset {
-        asset_index: APPEND_ASSET_INDEX, amount: 200_000,
+        asset_index: APPEND_ASSET_INDEX, amount: 199_800,
     }, vec![
         AccountMeta::new(admin.pubkey(), true),                 // 0 operator (signer)
         AccountMeta::new(env.market, false),                    // 1 market
@@ -1054,16 +1172,21 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
         AccountMeta::new(env.vault_token, false),               // 3 vault token
         AccountMeta::new_readonly(env.vault_authority, false),  // 4 vault authority PDA
         AccountMeta::new_readonly(spl_token::ID, false),        // 5 token program
-    ])], &[&admin]).expect("WithdrawInsuranceAsset drains the stub (was undrainable pre-fix)");
+    ])], &[&admin]).expect("WithdrawInsuranceAsset drains the earnings stub (LPVAULT-359 fix still works)");
 
-    assert_eq!(tok(&env.svm, admin_insurance_dest), 200_000, "operator received the full stub");
-    assert_eq!(vault_balance(&env), 0, "vault SPL balance drained to zero");
+    assert_eq!(tok(&env.svm, admin_insurance_dest), 199_800, "operator received the full earnings stub");
+    // The dead-share floor's principal (1_000) + earnings dust (400) remain —
+    // NOT drained to zero, unlike the pre-BUG-2 LPVAULT-359 test.
+    assert_eq!(
+        vault_balance(&env), 1_400,
+        "dead-share floor's stranded principal + earnings dust remains after the insurance sweep"
+    );
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
     assert_eq!(group.insurance, 0, "header.insurance drained to zero");
-    assert_eq!(group.vault, 0, "header.vault drained to zero");
+    assert_eq!(group.vault, 1_400, "header.vault still holds the permanently-stranded dead-share dust");
     assert_eq!(group.insurance_domain_budget_remaining_total, 0, "domain budget drained to zero");
 
-    // ── ResolveMarket → terminal mode, then CloseSlab succeeds. ──
+    // ── ResolveMarket → terminal mode; CloseSlab is now PERMANENTLY blocked. ──
     env.svm.expire_blockhash();
     send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ResolveMarket, vec![
         AccountMeta::new(admin.pubkey(), true),
@@ -1072,21 +1195,28 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
     assert_eq!(group.mode, MarketModeV16::Resolved, "market resolved (terminal mode 1)");
 
-    // CloseSlab gates on vault==0 && insurance==0 && c_tot==0. Pre-fix the orphaned
-    // 200_000 stub kept vault != 0 forever → EngineLockActive. Post-fix it succeeds.
+    // CloseSlab gates on vault==0 && insurance==0 && c_tot==0. insurance is 0
+    // (fully swept above) but vault == 1_400 (dead-share principal + earnings
+    // dust) can NEVER reach 0 — no instruction can move it (its
+    // backing_bucket_authority is the registry PDA, which cannot sign a
+    // generic WithdrawBackingBucket outside the wrapper's own
+    // instruction-scoped invoke_signed calls). BUG-2's dead-share defense
+    // therefore permanently reverses the LPVAULT-359 fix's teardown guarantee
+    // for any market whose LP vault ever took a genesis deposit — an accepted
+    // trade-off of the anti-inflation floor, not a bug in either fix.
     let close_dest = Pubkey::new_unique();
     set_token(&mut env.svm, close_dest, env.collateral_mint, admin.pubkey(), 0);
     env.svm.expire_blockhash();
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CloseSlab, vec![
+    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CloseSlab, vec![
         AccountMeta::new(admin.pubkey(), true),                 // 0 admin (signer, writable, rent dest)
         AccountMeta::new(env.market, false),                    // 1 market
         AccountMeta::new(env.vault_token, false),               // 2 vault token
         AccountMeta::new_readonly(env.vault_authority, false),  // 3 vault authority PDA
         AccountMeta::new(close_dest, false),                    // 4 dest token (admin-owned)
         AccountMeta::new_readonly(spl_token::ID, false),        // 5 token program
-    ])], &[&admin]).expect("CloseSlab succeeds — teardown unbricked by the LPVAULT-359 fix");
-
-    // The market account is zeroed + lamports swept on a successful close.
-    assert_eq!(env.svm.get_account(&env.market).map(|a| a.lamports).unwrap_or(0), 0,
-        "market lamports swept — slab fully closed");
+    ])], &[&admin]);
+    assert!(
+        res.is_err(),
+        "CloseSlab must now stay permanently blocked by the dead-share floor's stranded vault dust: {res:?}"
+    );
 }

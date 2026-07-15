@@ -130,7 +130,9 @@ fn setup_vault() -> Env {
     }, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]).expect("append asset 1");
 
     send(&mut svm, program_id, &payer, ProgInstruction::CreateLpVault { fee_share_bps: 5_000, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: DOMAIN },
-        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(market, false), AccountMeta::new(registry, false), AccountMeta::new(lp_mint, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&admin]).expect("create lp vault");
+        // FIND-1 fix: market must be writable — CreateLpVault now writes
+        // backing_bucket_authority = registry PDA into the asset's oracle profile.
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(registry, false), AccountMeta::new(lp_mint, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&admin]).expect("create lp vault");
 
     Env { svm, program_id, payer, admin, market, collateral_mint, vault_token, registry, lp_mint, ledger }
 }

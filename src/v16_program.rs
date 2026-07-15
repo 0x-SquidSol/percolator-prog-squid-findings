@@ -150,6 +150,19 @@ pub mod constants {
     /// redeemed; large sentinel to avoid any future `expiry_slot + N` overflow.
     pub const LP_VAULT_BACKING_EXPIRY_SLOT: u64 = u64::MAX / 2;
 
+    /// BUG-2 / N7 hardening: dead-share floor locked at the LP vault's TRUE
+    /// genesis deposit (mirrors `percolator-stake::state::MINIMUM_LIQUIDITY`,
+    /// same canonical value). `handle_deposit_to_lp_vault` mints
+    /// `lp_to_mint - LP_VAULT_MINIMUM_LIQUIDITY` to the depositor but still
+    /// bumps `registry.total_lp_shares_outstanding` by the FULL `lp_to_mint`
+    /// — the difference is never minted to any account, so it becomes
+    /// permanently unredeemable "dead" supply. This is the PRIMARY defense
+    /// against the ERC4626-style first-depositor share-inflation attack (the
+    /// engine's `lp_vault::LP_VAULT_VIRTUAL_SHARES`/`VIRTUAL_ASSETS` offset is
+    /// deliberate defense-in-depth on top of this, not the sole mitigation —
+    /// see percolator/src/v16.rs lp_vault module doc).
+    pub const LP_VAULT_MINIMUM_LIQUIDITY: u128 = 1_000;
+
     /// LP Vault instruction tags (v17 renumbered from 65-71 → 74-80 to avoid
     /// collision with toly's UpdateAssetAuthority(65)/BatchTradeNoCpi(66)/
     /// BatchTradeCpi(67)/SetMatcherConfig(68)/RestartAssetOracle(69)).
@@ -280,6 +293,17 @@ pub mod error {
         /// so clients can display "insufficient margin" rather than a generic config error.
         /// SDK agent: add `EngineInsufficientInitialMargin = 49` to the client error map.
         EngineInsufficientInitialMargin,  // Custom(49)
+        // ── BUG-2 / N7: LP vault genesis dead-share floor ───────────────────
+        // Appended after EngineInsufficientInitialMargin (ordinal 49). Do NOT reorder.
+        /// The LP vault's TRUE first deposit (`registry.total_lp_shares_outstanding
+        /// == 0` before this call) must exceed `LP_VAULT_MINIMUM_LIQUIDITY` so a
+        /// permanent dead-share floor can be locked (N7 anti-inflation hardening,
+        /// mirrors percolator-stake's `DepositBelowMinimumLiquidity`). Deposits at
+        /// or below the floor are rejected rather than minting 0 (or negative)
+        /// real shares to the depositor while still taking their collateral.
+        /// SDK agent: add `LpVaultDepositBelowMinimumLiquidity = 50` to the client
+        /// error map.
+        LpVaultDepositBelowMinimumLiquidity, // Custom(50)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -12327,6 +12351,7 @@ pub mod processor {
 
         expect_signer(admin)?;
         expect_writable(admin)?;
+        expect_writable(market_ai)?;
         expect_writable(registry_ai)?;
         expect_writable(mint_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -12365,6 +12390,24 @@ pub mod processor {
             || !mint_ai.data_is_empty()
         {
             return Err(PercolatorError::AlreadyInitialized.into());
+        }
+
+        // FIND-1 fix: bind the registry PDA as the vault domain's backing-bucket
+        // authority *here*, atomically with vault creation. DepositToLpVault
+        // (tag 75) requires `backing_bucket_authority == registry_pda` for the
+        // asset (see domain_authorities_from_profile), but the registry PDA can
+        // never co-sign an UpdateAssetAuthority (tag 65) rotation from a client
+        // (the non-zero incoming authority must sign to prove control) — so that
+        // path is permanently unreachable. Writing it directly during
+        // CreateLpVault is the only way to reach a working state; it is safe
+        // because CreateLpVault is already gated to cfg.marketauth (the market's
+        // top-level authority) and Live mode, above.
+        let asset_index = domain as usize / 2;
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
+            profile.backing_bucket_authority = registry_pda.to_bytes();
+            state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
         }
 
         let rent = Rent::get()?;
@@ -12589,8 +12632,27 @@ pub mod processor {
         if shares == 0 {
             return Err(PercolatorError::LpVaultZeroSharesMinted.into());
         }
-        let shares_u64 =
-            u64::try_from(shares).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        // BUG-2 / N7: dead-share floor on the vault's TRUE genesis deposit.
+        // `shares` above is the FULL pro-rata amount (1:1 at genesis, since
+        // `lp_shares_for_deposit` returns `amount` verbatim when
+        // `registry.total_lp_shares_outstanding == 0`). That pre-deposit
+        // outstanding count is the "is this genesis" signal. The floor is
+        // carved out of the MINTED amount only: Phase 5 below still bumps
+        // `registry.total_lp_shares_outstanding` by the FULL `shares`, so the
+        // `LP_VAULT_MINIMUM_LIQUIDITY` difference is never minted to any
+        // account and becomes permanently unredeemable dead supply — mirrors
+        // percolator-stake's `apply_minimum_liquidity_lock`. Non-genesis
+        // deposits are unaffected (mint the full computed amount, as before).
+        let shares_to_mint = if registry.total_lp_shares_outstanding == 0 {
+            shares
+                .checked_sub(crate::constants::LP_VAULT_MINIMUM_LIQUIDITY)
+                .filter(|&s| s != 0)
+                .ok_or(PercolatorError::LpVaultDepositBelowMinimumLiquidity)?
+        } else {
+            shares
+        };
+        let shares_u64 = u64::try_from(shares_to_mint)
+            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
 
         // ── Phase 2: move depositor collateral into the backing vault. ──
         transfer_tokens(token_program, source_token, vault_token, depositor, amount_u64)?;
@@ -13598,7 +13660,20 @@ pub mod processor {
         expect_owner(registry_ai, program_id)?;
 
         let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
-        if registry.total_lp_shares_outstanding != 0 {
+        // BUG-2 / N7: a vault that ever took a genesis deposit permanently carries
+        // LP_VAULT_MINIMUM_LIQUIDITY of "outstanding" shares that were counted in
+        // total_lp_shares_outstanding at genesis but never minted to any account
+        // (see handle_deposit_to_lp_vault) — they can never be redeemed/burned back
+        // out, by design (the dead-share anti-inflation floor). So "fully redeemed"
+        // now means outstanding <= LP_VAULT_MINIMUM_LIQUIDITY (the irreducible
+        // floor), not strictly `== 0`. A vault that never received any deposit has
+        // outstanding == 0, which still satisfies this bound. The SPL mint's live
+        // `supply` check below is UNCHANGED and remains a strict `!= 0` reject: the
+        // dead-share floor was never minted, so real supply still returns to
+        // exactly 0 once every actual depositor has redeemed — that check alone
+        // would NOT have caught a vault with only-dead-shares-outstanding, which is
+        // why both checks are still needed together.
+        if registry.total_lp_shares_outstanding > crate::constants::LP_VAULT_MINIMUM_LIQUIDITY {
             return Err(PercolatorError::LpVaultSharesOutstanding.into());
         }
         let market_key = Pubkey::new_from_array(registry.market_group);
@@ -15766,7 +15841,7 @@ pub mod processor {
             assert!(!state::backing_trade_fee_policy_shape_ok(1, 10_001));
         }
 
-        /// Sweep NET-NEW: PercolatorError fork ordinals 30-46 must not change.
+        /// Sweep NET-NEW: PercolatorError fork ordinals 30-50 must not change.
         ///
         /// These ordinals are part of the IDL wire format and are consumed by the
         /// keeper, indexer, and SDK error decoders. Any shift in ordinal = a
@@ -15811,6 +15886,8 @@ pub mod processor {
             assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCeilingExceeded), 48);
             // FIX-2: distinct initial-margin error — ordinal 49.
             assert_eq!(custom_code(PercolatorError::EngineInsufficientInitialMargin),  49);
+            // BUG-2 / N7: LP vault genesis dead-share floor — ordinal 50.
+            assert_eq!(custom_code(PercolatorError::LpVaultDepositBelowMinimumLiquidity), 50);
         }
 
         // ── F-1 cooldown gate (check_insurance_withdraw_cooldown) ────────────

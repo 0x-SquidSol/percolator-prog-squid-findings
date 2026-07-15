@@ -191,7 +191,10 @@ fn send(
 fn create_lp_vault_accounts(market: Pubkey, registry: Pubkey, mint: Pubkey, admin: Pubkey) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(admin, true),
-        AccountMeta::new_readonly(market, false),
+        // FIND-1 fix: market must be writable — CreateLpVault now writes
+        // backing_bucket_authority = registry PDA into the asset's oracle
+        // profile as part of vault creation.
+        AccountMeta::new(market, false),
         AccountMeta::new(registry, false),
         AccountMeta::new(mint, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
@@ -240,6 +243,18 @@ fn create_lp_vault_happy_path() {
     assert_eq!(m.decimals, 0, "LP shares are integer atoms");
     assert_eq!(m.freeze_authority, COption::None, "no freeze authority");
     let _ = env.collateral_mint;
+
+    // FIND-1: CreateLpVault must bind the registry PDA as the asset's
+    // backing_bucket_authority directly — no separate UpdateAssetAuthority
+    // co-sign step (which is unreachable from a client for a PDA target).
+    let market_acct = env.svm.get_account(&env.market).expect("market account exists");
+    let profile = state::read_asset_oracle_profile(&market_acct.data, 0)
+        .expect("asset 0 oracle profile decodes");
+    assert_eq!(
+        profile.backing_bucket_authority,
+        registry.to_bytes(),
+        "CreateLpVault must set backing_bucket_authority = registry PDA"
+    );
 }
 
 #[test]

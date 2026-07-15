@@ -75,6 +75,7 @@
 
 use litesvm::LiteSVM;
 use percolator::MarketModeV16;
+use percolator_prog::constants::LP_VAULT_MINIMUM_LIQUIDITY;
 use percolator_prog::ix::Instruction as ProgInstruction;
 use percolator_prog::processor::ASSET_ACTION_ACTIVATE;
 use percolator_prog::state::{
@@ -98,6 +99,16 @@ const MAX_PORTFOLIO_ASSETS: u16 = 1;
 const APPEND_ASSET_INDEX: u16 = 1;
 const DOMAIN: u16 = 2;
 const DEPOSIT: u128 = 1_000_000;
+// BUG-2 / N7: `new_depositor` below is always the vault's TRUE genesis
+// depositor (each test builds a fresh vault via `setup_vault`), so the
+// wrapper's LP_VAULT_MINIMUM_LIQUIDITY dead-share carve-out applies — the
+// depositor's LP ATA holds DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY, NOT DEPOSIT
+// (registry.total_lp_shares_outstanding is still DEPOSIT; the difference is
+// permanently unminted dead supply). Use MINTED wherever a REAL token
+// balance (LP ATA / escrow / redemption.shares / redeemed collateral) is
+// asserted or requested; DEPOSIT stays correct only for
+// total_lp_shares_outstanding and the collateral vault balance.
+const MINTED: u128 = DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY;
 
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -259,7 +270,9 @@ fn setup_vault(cooldown_slots: u64) -> Env {
         fee_share_bps: 5_000, redemption_cooldown_slots: cooldown_slots, oi_reservation_threshold_bps: 0, domain: DOMAIN,
     }, vec![
         AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new_readonly(market, false),
+        // FIND-1 fix: market must be writable — CreateLpVault now writes
+        // backing_bucket_authority = registry PDA into the asset's oracle profile.
+        AccountMeta::new(market, false),
         AccountMeta::new(registry, false),
         AccountMeta::new(lp_mint, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
@@ -444,19 +457,22 @@ fn redemption_executes_in_terminal_flat_resolved() {
     // this test is the mode gate — not the cooldown gate.
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "depositor holds LP shares pre-request");
+    // BUG-2 / N7: genesis deposit mints MINTED (DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY)
+    // to the depositor; registry.total_lp_shares_outstanding still counts the FULL
+    // DEPOSIT (the dead-share floor is permanently unminted, not un-tracked).
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "depositor holds LP shares pre-request");
     assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT, "shares outstanding after deposit");
 
     // ── 2. RequestRedeemLpShares: shares escrowed, total_outstanding UNCHANGED. ──
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     // (a) redeemer's LP ATA drained to 0 — they no longer hold the shares.
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "PROOF(2a): redeemer LP ATA drained — shares escrowed out");
     // (b) escrow now holds exactly the escrowed shares.
-    assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64, "PROOF(2b): escrow holds the redeemer's shares");
+    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "PROOF(2b): escrow holds the redeemer's shares");
     // (c) the LpRedemption request PDA exists.
     let pending = state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data)
         .expect("PROOF(2c): LpRedemption PDA written — request is pending");
-    assert_eq!(pending.shares, DEPOSIT, "pending request records the escrowed share count");
+    assert_eq!(pending.shares, MINTED, "pending request records the escrowed share count");
     assert_eq!(pending.redeemer, d.kp.pubkey().to_bytes(), "pending request bound to the redeemer");
     // (d) total_lp_shares_outstanding UNCHANGED by the request (shares escrowed, not burned).
     assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT,
@@ -484,15 +500,19 @@ fn redemption_executes_in_terminal_flat_resolved() {
         "PROOF(5a): redeemer received pro-rata collateral on execute");
     // (b) The escrow was drained — the escrowed shares were consumed.
     assert_eq!(tok(&env.svm, env.escrow), 0, "PROOF(5b): escrow drained on execute");
-    // (c) total_lp_shares_outstanding burned back to 0 (this was the sole depositor).
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 0,
-        "PROOF(5c): shares burned on execute — outstanding == 0");
+    // (c) total_lp_shares_outstanding burned back down to the LP_VAULT_MINIMUM_LIQUIDITY
+    // dead-share floor (this was the sole real depositor; BUG-2 / N7: the floor
+    // was counted at genesis but never minted to anyone, so it can never burn
+    // below that — see handle_close_lp_vault's matching `> LP_VAULT_MINIMUM_LIQUIDITY`
+    // gate below).
+    assert_eq!(reg(&env).total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
+        "PROOF(5c): shares burned on execute — outstanding == dead-share floor");
     // (d) The pending request PDA is consumed by execute.
     assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
         "PROOF(5d): LpRedemption PDA consumed by execute");
-    // (e) CloseLpVault can now run — shares outstanding are 0 and the stub-credit
-    //     teardown (#359/#381) leaves no un-owned residual, so the vault winds down
-    //     cleanly instead of being stuck forever.
+    // (e) CloseLpVault can now run — outstanding is at (not above) the dead-share
+    //     floor and the stub-credit teardown (#359/#381) leaves no un-owned
+    //     residual, so the vault winds down cleanly instead of being stuck forever.
     env.svm.expire_blockhash();
     close_vault(&mut env)
         .expect("PROOF(5e): CloseLpVault succeeds once shares are redeemed and the vault is flat");
@@ -510,18 +530,21 @@ fn control_redemption_executes_while_market_stays_live() {
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
 
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares escrowed");
-    assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64, "escrow holds shares");
+    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "escrow holds shares");
     assert_eq!(market_mode(&env), MarketModeV16::Live, "market still Live (no resolve)");
 
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("execute succeeds while Live");
 
-    // Redeemer paid 1:1 (no earnings); escrow burned to 0; outstanding -> 0.
-    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "redeemer paid pro-rata");
+    // Redeemer paid 1:1 (no earnings) for the shares they actually held (MINTED,
+    // not DEPOSIT — BUG-2 / N7 dead-share floor); escrow burned to 0; outstanding
+    // -> the dead-share floor, not 0.
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow burned to zero");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "outstanding back to zero");
+    assert_eq!(reg(&env).total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
+        "outstanding back to the dead-share floor");
     assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
         "redemption PDA consumed on successful execute");
 }
@@ -536,9 +559,9 @@ fn control_redemption_executes_while_market_stays_live() {
 fn cancel_recovers_stranded_redemption() {
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares escrowed");
-    assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64, "escrow holds shares");
+    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "escrow holds shares");
 
     // Resolve the market. (Post-#377/#378, ExecuteRedemption would now SUCCEED here
     // in the terminal-flat state — that path is covered by the headline test. This
@@ -550,7 +573,7 @@ fn cancel_recovers_stranded_redemption() {
     // CancelRedemption recovers the shares regardless of market mode.
     env.svm.expire_blockhash();
     cancel(&mut env, &d).expect("cancel must succeed when not Live");
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "exact shares returned to redeemer");
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "exact shares returned to redeemer");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow drained");
     assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT,
         "total_lp_shares_outstanding UNCHANGED by cancel");
@@ -563,14 +586,14 @@ fn cancel_recovers_stranded_redemption() {
 fn cancel_twice_second_rejects() {
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     cancel(&mut env, &d).expect("first cancel");
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "first cancel returned the shares");
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "first cancel returned the shares");
 
     env.svm.expire_blockhash();
     let res = cancel(&mut env, &d);
     assert!(res.is_err(), "second cancel MUST reject (redemption PDA already consumed): {res:?}");
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "no double-return");
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "no double-return");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow stays drained");
 }
 
@@ -580,11 +603,11 @@ fn cancel_twice_second_rejects() {
 fn cancel_while_live_succeeds() {
     let mut env = setup_vault(1000); // long cooldown — market stays Live
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
     assert_eq!(market_mode(&env), MarketModeV16::Live, "market Live");
 
     cancel(&mut env, &d).expect("cancel while Live must succeed");
-    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "shares returned to redeemer while Live");
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "shares returned to redeemer while Live");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow drained");
     assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT, "outstanding unchanged");
 }
@@ -595,7 +618,7 @@ fn cancel_while_live_succeeds() {
 fn cancel_wrong_signer_rejected() {
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, DEPOSIT);
-    request(&mut env, &d, DEPOSIT).expect("request");
+    request(&mut env, &d, MINTED).expect("request");
 
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
@@ -605,5 +628,5 @@ fn cancel_wrong_signer_rejected() {
     let payer = env.payer.insecure_clone();
     let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CancelRedemption, accts)], &[&attacker]);
     assert!(res.is_err(), "a non-redeemer signer must not be able to cancel: {res:?}");
-    assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64, "escrow untouched by the rejected cancel");
+    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "escrow untouched by the rejected cancel");
 }

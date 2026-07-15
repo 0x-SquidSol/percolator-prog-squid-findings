@@ -271,7 +271,7 @@ fn create_lp_vault(env: &mut Env, registry: Pubkey, mint: Pubkey) {
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(env.market, false),
             AccountMeta::new(registry, false),
             AccountMeta::new(mint, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
@@ -347,8 +347,77 @@ fn token_amount(svm: &LiteSVM, key: Pubkey) -> u64 {
     TokenAccount::unpack(&acct.data).expect("token decode").amount
 }
 
+/// FIND-1 regression test: DepositToLpVault must succeed immediately after
+/// CreateLpVault with NO separate authority-handover step. Before the fix,
+/// `handle_create_lp_vault` never wrote `backing_bucket_authority`, so the
+/// asset's authority stayed whatever it was set to at activation (here,
+/// deliberately the admin's own key — the realistic default, NOT the
+/// registry PDA) and DepositToLpVault failed with LpVaultAuthorityMismatch.
+/// The only other way to rotate it (UpdateAssetAuthority, tag 65) requires
+/// the NEW authority to co-sign, which is impossible for a PDA from a
+/// client. This test proves CreateLpVault alone now completes the wiring.
 #[test]
-fn deposit_happy_first_is_one_to_one() {
+fn create_lp_vault_then_deposit_immediately_no_authority_step() {
+    let mut env = setup();
+    let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
+    let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
+    let (ledger, _) = derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN);
+    let admin = env.admin.insecure_clone();
+
+    // Activate asset 1 with backing authority = admin (NOT the registry PDA) —
+    // the realistic on-chain default. No pre-set "two-step handover" workaround.
+    activate(&mut env, admin.pubkey()).expect("append asset 1 with admin authority");
+
+    // Sanity: before CreateLpVault, the profile's backing authority is admin, not
+    // the (not-yet-existing) registry PDA.
+    {
+        let market_acct = env.svm.get_account(&env.market).unwrap();
+        let profile = state::read_asset_oracle_profile(&market_acct.data, 1).unwrap();
+        assert_eq!(profile.backing_bucket_authority, admin.pubkey().to_bytes());
+    }
+
+    create_lp_vault(&mut env, registry, mint);
+
+    // CreateLpVault alone must have flipped the authority to the registry PDA.
+    {
+        let market_acct = env.svm.get_account(&env.market).unwrap();
+        let profile = state::read_asset_oracle_profile(&market_acct.data, 1).unwrap();
+        assert_eq!(
+            profile.backing_bucket_authority,
+            registry.to_bytes(),
+            "CreateLpVault must bind registry PDA as backing_bucket_authority"
+        );
+    }
+
+    let depositor = Keypair::new();
+    env.svm.airdrop(&depositor.pubkey(), 100_000_000_000).unwrap();
+    let source = Pubkey::new_unique();
+    set_token(&mut env.svm, source, env.collateral_mint, depositor.pubkey(), 10_000_000);
+    let lp_ata = Pubkey::new_unique();
+    set_token(&mut env.svm, lp_ata, mint, depositor.pubkey(), 0);
+
+    // The deposit — with NO intervening UpdateAssetAuthority call — must succeed.
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT },
+        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        &[&depositor],
+    )
+    .expect("deposit must succeed immediately after CreateLpVault, no separate authority step");
+
+    assert!(token_amount(&env.svm, lp_ata) > 0, "depositor received LP shares");
+    assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64, "vault received collateral");
+}
+
+#[test]
+fn deposit_happy_first_mints_amount_minus_dead_shares() {
+    // BUG-2 / N7: the vault's TRUE genesis deposit is no longer 1:1 — the
+    // wrapper carves LP_VAULT_MINIMUM_LIQUIDITY (1_000) out of the minted
+    // amount and locks it as permanently-unredeemable dead supply (mints it
+    // to nobody, but still counts it in registry.total_lp_shares_outstanding).
+    // See percolator-prog::constants::LP_VAULT_MINIMUM_LIQUIDITY.
     let mut env = setup();
     let (registry, mint, ledger, depositor, lp_ata, source) = ready_vault(&mut env);
 
@@ -362,20 +431,98 @@ fn deposit_happy_first_is_one_to_one() {
     )
     .expect("deposit");
 
-    // First deposit mints 1:1.
-    assert_eq!(token_amount(&env.svm, lp_ata), DEPOSIT as u64, "first deposit mints amount shares");
-    // Collateral moved into the vault.
+    const MINIMUM_LIQUIDITY: u64 = 1_000;
+    let expected_minted = DEPOSIT as u64 - MINIMUM_LIQUIDITY;
+
+    // First deposit mints amount - MINIMUM_LIQUIDITY to the depositor, NOT 1:1.
+    assert_eq!(
+        token_amount(&env.svm, lp_ata),
+        expected_minted,
+        "genesis deposit mints amount - MINIMUM_LIQUIDITY shares to the depositor"
+    );
+    // Collateral moved into the vault (full amount — the dead-share floor is a
+    // share-accounting concept only, it doesn't reduce the collateral taken).
     assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64, "vault received collateral");
     assert_eq!(token_amount(&env.svm, source), 10_000_000 - DEPOSIT as u64, "source debited");
 
-    // Registry supply mirrors the mint.
+    // Registry outstanding-shares counts the FULL amount (dead shares included) —
+    // the mint's on-chain supply (expected_minted) is now permanently LESS than
+    // registry.total_lp_shares_outstanding by MINIMUM_LIQUIDITY; that gap is the
+    // dead-share lock and is intentional (never redeemable by anyone).
     let reg = state::read_lp_vault_registry(&env.svm.get_account(&registry).unwrap().data).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, DEPOSIT, "registry shares == minted");
+    assert_eq!(
+        reg.total_lp_shares_outstanding, DEPOSIT,
+        "registry shares == full genesis amount (mint supply is DEPOSIT - MINIMUM_LIQUIDITY)"
+    );
+    let mint_acct = env.svm.get_account(&mint).unwrap();
+    let m = Mint::unpack(&mint_acct.data).unwrap();
+    assert_eq!(
+        m.supply, expected_minted,
+        "on-chain mint supply == minted amount, strictly less than registry.total_lp_shares_outstanding"
+    );
 
-    // Backing ledger recorded the principal.
+    // Backing ledger recorded the FULL principal — the dead-share lock affects
+    // share accounting only, never the collateral/backing side.
     let led = state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
     assert_eq!(led.total_principal_atoms, DEPOSIT);
     assert_eq!(led.total_deposited_atoms, DEPOSIT);
+}
+
+/// BUG-2 / N7 regression: a genesis deposit at or below
+/// LP_VAULT_MINIMUM_LIQUIDITY must be rejected outright (not silently mint 0
+/// or underflow) — mirrors percolator-stake's
+/// `DepositBelowMinimumLiquidity` guard. This closes the "first depositor
+/// deposits a dust amount, then donates/inflates NAV to grief every
+/// subsequent depositor" attack at its cheapest entry point: the attacker
+/// can no longer become the vault's sole holder for less than
+/// LP_VAULT_MINIMUM_LIQUIDITY + 1 atoms.
+#[test]
+fn deposit_genesis_at_or_below_minimum_liquidity_is_rejected() {
+    let mut env = setup();
+    let (registry, mint, ledger, depositor, lp_ata, source) = ready_vault(&mut env);
+
+    const MINIMUM_LIQUIDITY: u128 = 1_000;
+
+    // Exactly at the floor: would carve out to 0 real shares minted while
+    // still taking the depositor's collateral — must be rejected.
+    let res_exact = send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY },
+        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        &[&depositor],
+    );
+    assert!(res_exact.is_err(), "genesis deposit == MINIMUM_LIQUIDITY must be rejected: {res_exact:?}");
+
+    // Below the floor: checked_sub underflows — must also be rejected, not panic.
+    let res_below = send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY - 1 },
+        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        &[&depositor],
+    );
+    assert!(res_below.is_err(), "genesis deposit < MINIMUM_LIQUIDITY must be rejected: {res_below:?}");
+
+    // No shares minted, no collateral taken, no dust left behind by the reject.
+    assert_eq!(token_amount(&env.svm, lp_ata), 0, "rejected deposit mints nothing");
+    assert_eq!(token_amount(&env.svm, source), 10_000_000, "rejected deposit takes no collateral");
+    let reg = state::read_lp_vault_registry(&env.svm.get_account(&registry).unwrap().data).unwrap();
+    assert_eq!(reg.total_lp_shares_outstanding, 0, "registry untouched by a rejected genesis deposit");
+
+    // A deposit just ABOVE the floor succeeds and mints exactly 1 real share.
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY + 1 },
+        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        &[&depositor],
+    )
+    .expect("genesis deposit of MINIMUM_LIQUIDITY + 1 must succeed, minting 1 real share");
+    assert_eq!(token_amount(&env.svm, lp_ata), 1, "MINIMUM_LIQUIDITY + 1 mints exactly 1 real share");
 }
 
 #[test]
@@ -394,15 +541,24 @@ fn deposit_rejects_zero_amount() {
 }
 
 #[test]
-fn deposit_rejects_before_authority_handover() {
-    // Note 5: after CreateLpVault but BEFORE the operator's UpdateAssetLifecycle
-    // sets backing_bucket_authority = registry PDA, deposits fail closed.
+fn deposit_succeeds_with_no_separate_authority_handover() {
+    // FIND-1 fix (was "deposit_rejects_before_authority_handover" / Note 5):
+    // pre-fix, CreateLpVault never wrote backing_bucket_authority, so a deposit
+    // right after CreateLpVault + an admin-authority activation would fail closed
+    // with LpVaultAuthorityMismatch, and there was no client-reachable way to
+    // rotate it (UpdateAssetAuthority requires the new authority — a PDA — to
+    // co-sign). CreateLpVault now writes backing_bucket_authority = registry PDA
+    // itself, so this exact scenario (asset activated with a NON-registry backing
+    // authority, then CreateLpVault, then an immediate deposit) now SUCCEEDS with
+    // no separate handover step at all. See also
+    // create_lp_vault_then_deposit_immediately_no_authority_step for the
+    // sanity-checked, assertion-rich version of this regression test.
     let mut env = setup();
     let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
     let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
     let (ledger, _) = derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN);
     // Append asset 1 with admin (NOT registry) as the backing authority, then
-    // create the vault on domain 2. The registry is never made the authority.
+    // create the vault on domain 2. CreateLpVault itself flips the authority.
     let admin_pk = env.admin.pubkey();
     activate(&mut env, admin_pk).expect("append asset 1 with admin authority");
     create_lp_vault(&mut env, registry, mint);
@@ -422,8 +578,11 @@ fn deposit_rejects_before_authority_handover() {
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     );
-    assert!(res.is_err(), "deposit before authority handover must fail closed (Note 5): {res:?}");
-    assert_eq!(token_amount(&env.svm, env.vault_token), 0, "no collateral moved on rejected deposit");
+    assert!(res.is_ok(), "FIND-1: deposit must succeed with no separate authority handover: {res:?}");
+    assert_eq!(
+        token_amount(&env.svm, env.vault_token), DEPOSIT as u64,
+        "collateral moved on the now-successful deposit"
+    );
 }
 
 #[test]
@@ -448,8 +607,12 @@ fn lp_deposit_twice_no_expiry_overflow() {
         // rejected as AlreadyProcessed.
         env.svm.expire_blockhash();
     }
-    // 1:1 each time, no earnings → 2x shares.
-    assert_eq!(token_amount(&env.svm, lp_ata), 2 * DEPOSIT as u64);
+    // BUG-2 / N7: the FIRST deposit is genesis (mints DEPOSIT - MINIMUM_LIQUIDITY,
+    // per the dead-share carve-out); the SECOND deposit is not genesis (total
+    // shares outstanding is already nonzero), so it mints 1:1 with no carve-out.
+    // Total minted == 2*DEPOSIT - MINIMUM_LIQUIDITY, not 2*DEPOSIT.
+    const MINIMUM_LIQUIDITY: u64 = 1_000;
+    assert_eq!(token_amount(&env.svm, lp_ata), 2 * DEPOSIT as u64 - MINIMUM_LIQUIDITY);
     let led = state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
     assert_eq!(led.total_principal_atoms, 2 * DEPOSIT);
 }
