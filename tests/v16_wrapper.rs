@@ -18214,3 +18214,80 @@ fn v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers() {
         assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_727);
     }
 }
+
+#[test]
+fn v16_wrapper_fee_split_floor_update_trade_fee_policy_checks_every_asset_not_just_asset0() {
+    // W11: UpdateTradeFeePolicy mutates trade_fee_base_bps, a SINGLE
+    // market-wide field that is a shared term of T = trade_fee_base_bps +
+    // backing_fee_bps for EVERY asset's domains, not only asset 0's. Before
+    // the fix, the handler validated the floor only against asset 0's
+    // cfg-mirrored domains -- with asset 0's own backing fee left
+    // unconfigured (bf==0, which trivially skips fee_split_floor_ok), a
+    // caller could raise trade_fee_base_bps to ANY value while a real,
+    // already-configured higher-index asset's stored split silently falls
+    // below the floor.
+    let mut admin = signer();
+    let mut market = market_account_with_capacity(2);
+    init_market(&mut admin, &mut market);
+
+    // Activate asset 1 (admin doubles as marketauth + all three domain
+    // authorities here, so this needs no fee-payment accounts).
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+    )
+    .unwrap();
+
+    // Configure asset 1's LONG backing-fee domain (domain=2) while
+    // trade_fee_base_bps is still 0 (the InitMarket default): bf=1000bps,
+    // isb=2000bps -> insurance%=20%, LP%=80%, creator%=0% -- comfortably
+    // within all three floors, so this legitimately succeeds.
+    run_ix(
+        Instruction::UpdateBackingFeePolicy {
+            domain: 2,
+            fee_bps: 1_000,
+            insurance_share_bps: 2_000,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .expect("asset 1's 10%-backing/20%-insurance-share split must be accepted at tfb=0");
+
+    let (cfg_before, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_before.backing_trade_fee_bps_long, 0);
+    assert_eq!(cfg_before.backing_trade_fee_bps_short, 0);
+    assert_eq!(cfg_before.trade_fee_base_bps, 0);
+
+    // Raise trade_fee_base_bps to 9000bps. Combined with asset 1's untouched
+    // bf=1000, T=10000 for asset 1's domain and creator%=90%bps -- more than
+    // double the 45% cap, decisively (creator_lhs=900_000 vs
+    // creator_rhs=45*10000+50=450_050, not a rounding-boundary case). Asset
+    // 0's domains are unaffected (bf==0 skips), so the pre-fix code sees
+    // nothing to reject.
+    let before = market.data.clone();
+    let result = run_ix(
+        Instruction::UpdateTradeFeePolicy {
+            trade_fee_base_bps: 9_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(result, &market, &before);
+
+    // Non-vacuity control: a trade_fee_base_bps that keeps asset 1 within
+    // the floor (tfb=100 -> T=1100, creator%~9.09%, insurance%~18.18%,
+    // LP%~72.7%, all comfortably clear of floor+tolerance by hand
+    // computation) is still ACCEPTED -- the fix does not degenerate into
+    // "always reject".
+    run_ix(
+        Instruction::UpdateTradeFeePolicy {
+            trade_fee_base_bps: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .expect("a trade_fee_base_bps that keeps every configured asset within the floor must still be accepted");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.trade_fee_base_bps, 100);
+}
