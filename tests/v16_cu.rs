@@ -9442,6 +9442,67 @@ fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_m
         "matcher context must be untouched -- proves the real matcher CPI was never invoked");
 }
 
+// security.md sweep - unrelated-refresh masks loss-stale insurance gate (W8, upstream fddbdc19):
+// loss_stale_active reflects only the LAST-cranked asset (engine-intentional accrual bookkeeping,
+// not a market-wide aggregate), so an authorized withdrawer could crank an UNRELATED cheap/fresh
+// asset to reset the global staleness flag and then withdraw per-asset live insurance for an asset
+// that itself was never freshly cranked -- even though that asset still has open exposure. Proves
+// the asset-LOCAL loss-stale gate blocks the withdrawal regardless of an unrelated refresh.
+#[test]
+fn v16_attack_unrelated_refresh_cannot_mask_loss_stale_insurance_gate() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 1_000, 1_000, 500);
+    env.enable_live_insurance_withdrawal();
+    let admin = env.admin.insecure_clone();
+    env.top_up_insurance_domain_with_authority(&admin, 2, 100);
+
+    let stale_long_owner = Keypair::new();
+    let stale_short_owner = Keypair::new();
+    let stale_long = env.create_portfolio(&stale_long_owner);
+    let stale_short = env.create_portfolio(&stale_short_owner);
+    env.deposit(&stale_long_owner, stale_long, 1_000_000_000);
+    env.deposit(&stale_short_owner, stale_short, 1_000_000_000);
+    env.trade_asset_with_cu(1, &stale_long_owner, stale_long, &stale_short_owner, stale_short,
+        (10 * POS_SCALE) as i128, 100, 0);
+
+    let cranker_owner = Keypair::new();
+    let cranker = env.create_portfolio(&cranker_owner);
+    env.svm.warp_to_slot(3);
+    for _ in 0..3 {
+        env.svm.expire_blockhash();
+        env.crank(cranker, ProgInstruction::PermissionlessCrank {
+            action: 0, asset_index: 0, now_slot: 3, funding_rate_e9: 0,
+            recovery_reason: 0,
+        });
+    }
+    env.svm.expire_blockhash();
+    env.crank(cranker, ProgInstruction::PermissionlessCrank {
+        action: 0, asset_index: 1, now_slot: 3, funding_rate_e9: 0,
+        recovery_reason: 0,
+    });
+
+    let before_mask = env.market_state().1;
+    assert!(before_mask.loss_stale_active);
+    assert!(before_mask.assets[1].slot_last < before_mask.current_slot);
+    assert!(env.try_withdraw_insurance_domain_with_authority(&admin, 2, 10).is_err(),
+        "asset-1 live insurance is initially locked by its loss-stale exposure");
+
+    env.svm.expire_blockhash();
+    env.crank(cranker, ProgInstruction::PermissionlessCrank {
+        action: 0, asset_index: 0, now_slot: 3, funding_rate_e9: 0,
+        recovery_reason: 0,
+    });
+    let after_unrelated_refresh = env.market_state().1;
+    assert!(after_unrelated_refresh.assets[1].slot_last < after_unrelated_refresh.current_slot,
+        "asset 1 remains locally loss-stale after the unrelated asset-0 refresh");
+
+    let withdraw = env.try_withdraw_insurance_domain_with_authority(&admin, 2, 10);
+    assert!(withdraw.is_err(),
+        "an unrelated refresh must not make asset-1 insurance withdrawable while asset 1 is loss-stale");
+    let after_withdraw_attempt = env.market_state().1;
+    assert_eq!(after_withdraw_attempt.insurance_domain_budget[2], after_unrelated_refresh.insurance_domain_budget[2]);
+    assert_eq!(after_withdraw_attempt.insurance, after_unrelated_refresh.insurance);
+}
+
 // FIX W1 (upstream 4b8bb9fa, #152, CRITICAL): validate_matcher_tail rejected key-aliasing
 // tail accounts but never checked `is_signer`, so a hostile matcher received tail AccountInfos
 // with the caller's own is_signer flags forwarded verbatim -- letting a malicious LP-registered
