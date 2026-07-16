@@ -8586,6 +8586,129 @@ fn v16_attack_resolved_backing_withdraw_requires_full_user_wind_down() {
     assert!(g_after.vault >= g_after.c_tot + g_after.insurance, "senior conservation intact");
 }
 
+// W10 (upstream wrapper a1a3ecb6, "Block drain-only backing fee batch gate"): the RETIRED-only
+// guard in handle_update_backing_fee_policy leaves DrainOnly/Recovery assets able to install a
+// NEW nonzero backing-fee policy. backing_trade_fee_policy_count is a MARKET-WIDE counter that
+// handle_batch_execute_zero_copy checks and rejects BatchTradeNoCpi/matcher-batch entirely whenever
+// it is nonzero (v1 scope: batch legs don't split per-domain backing fees yet). So a permissionless
+// asset creator can move their OWN dead asset to DrainOnly/Recovery and then set a fresh nonzero fee
+// on it, bumping the counter 0->1 and silently DoS-ing BatchTrade for every OTHER asset in the
+// market too -- a self-inflicted, market-wide griefing vector. Non-vacuous: proves BOTH that the
+// policy update on a non-ACTIVE asset is rejected (the fix) AND that an unrelated asset's
+// BatchTradeNoCpi still executes normally afterward (the counter never got bumped).
+#[test]
+fn v16_attack_non_active_asset_cannot_enable_backing_fee_batch_gate() {
+    for (label, action, now_slot, expected_lifecycle) in [
+        (
+            "DrainOnly",
+            percolator_prog::processor::ASSET_ACTION_DRAIN_ONLY,
+            0u64,
+            AssetLifecycleV16::DrainOnly,
+        ),
+        (
+            "Recovery",
+            percolator_prog::processor::ASSET_ACTION_SHUTDOWN,
+            2u64,
+            AssetLifecycleV16::Recovery,
+        ),
+    ] {
+        let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 1_000, 1_000, 500);
+        env.configure_auth_mark_for_asset_as_admin(0, 1, 100);
+        if action == percolator_prog::processor::ASSET_ACTION_SHUTDOWN {
+            env.configure_permissionless_resolve_with_cu(100, 5);
+        }
+        env.update_market_init_fee_policy_with_cu(1);
+
+        let creator = Keypair::new();
+        env.svm.warp_to_slot(1);
+        env.activate_permissionless_asset_with_fee(
+            &creator,
+            1,
+            1,
+            100,
+            creator.pubkey(),
+            creator.pubkey(),
+            creator.pubkey(),
+            creator.pubkey(),
+            1,
+        );
+        // Both DrainOnly (marketauth-gated) and Recovery/SHUTDOWN (marketauth-OR-asset_admin
+        // gated) accept the market admin as signer, so a single admin-driven helper covers both
+        // legs of the loop -- see handle_update_asset_lifecycle's SHUTDOWN branch (accepts
+        // marketauth_authorized || asset_admin_authorized) and its "gated solely on marketauth"
+        // fallthrough for DRAIN_ONLY/ACTIVATE/RETIRE.
+        env.update_asset_lifecycle_as_admin_with_cu(action, 1, now_slot, 0);
+        let (cfg_after_lifecycle, group_after_lifecycle) = env.market_state();
+        assert_eq!(group_after_lifecycle.assets[1].lifecycle, expected_lifecycle);
+        assert_eq!(cfg_after_lifecycle.backing_trade_fee_policy_count, 0);
+
+        env.svm.expire_blockhash();
+        let policy = send_tx(
+            &mut env.svm,
+            env.program_id,
+            &env.payer,
+            ProgInstruction::UpdateBackingFeePolicy {
+                domain: 2,
+                fee_bps: 77,
+                insurance_share_bps: 5_000,
+            },
+            vec![
+                AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&creator],
+        );
+        assert!(
+            policy.is_err(),
+            "{label} asset must not install a new backing-fee policy that globally gates batch trades"
+        );
+        assert_eq!(
+            env.market_state().0.backing_trade_fee_policy_count,
+            0,
+            "rejected {label} policy update must not enable the global batch gate"
+        );
+
+        let taker = Keypair::new();
+        let lp = Keypair::new();
+        let ta = env.create_portfolio(&taker);
+        let la = env.create_portfolio(&lp);
+        env.deposit(&taker, ta, 1_000_000);
+        env.deposit(&lp, la, 1_000_000);
+        let sz = (5 * POS_SCALE) as i128;
+        env.svm.expire_blockhash();
+        let batch = env.send(
+            ProgInstruction::BatchTradeNoCpi {
+                legs: vec![percolator_prog::ix::BatchTradeLeg {
+                    asset_index: 0,
+                    size_q: sz,
+                    exec_price: 100,
+                    fee_bps: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(ta, false),
+                AccountMeta::new(la, false),
+            ],
+            &[&taker, &lp],
+        );
+        assert!(
+            batch.is_ok(),
+            "rejected {label} asset policy must leave unrelated asset-0 batch trading live: {batch:?}"
+        );
+        assert_eq!(
+            active_leg_for_asset(&env.portfolio_state(ta), 0).basis_pos_q,
+            sz
+        );
+        assert_eq!(
+            active_leg_for_asset(&env.portfolio_state(la), 0).basis_pos_q,
+            -sz
+        );
+    }
+}
+
 // security.md sweep — CloseResolved caller-supplied fee_rate_per_slot must be IGNORED (Copenhagen
 // SOL-001-class spoofed-param / SOL-023 fee-rounding-away-from-user): CloseResolved is permissionless
 // after the exit window (force_close_delay_slots==0 -> always permissionless), and it carries a
