@@ -17976,6 +17976,102 @@ fn v16_wrapper_withdraw_protocol_fee_rejects_amount_exceeding_accrued_claim() {
     assert_eq!(market.data, before);
 }
 
+#[test]
+fn v16_wrapper_withdraw_protocol_fee_succeeds_after_resolve_when_fully_wound_down() {
+    // W12: ResolveMarket is one-way (no path back to Live). Before the fix,
+    // WithdrawProtocolFee was gated Live-only, so any outstanding
+    // protocol-fee backlog on a market with NO open portfolios (the common
+    // case: fully wound-down before or immediately after resolution) was
+    // permanently stranded the instant the market resolved. This proves the
+    // new bounded Resolved-mode exit actually pays out in exactly that case.
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_protocol_fee_fixture(&mut market, admin.key.to_bytes(), 100, 0, 100, 100);
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        group.mode = MarketModeV16::Resolved;
+        group.resolved_slot = group.current_slot;
+        assert_eq!(group.materialized_portfolio_count, 0);
+        assert_eq!(group.c_tot, 0);
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 100);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    run_ix(
+        Instruction::WithdrawProtocolFee { amount: 0 },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    )
+    .expect("bounded surplus withdraw must succeed once Resolved AND fully wound down");
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.protocol_fee_withdrawn_atoms, 100);
+    assert_eq!(group_after.insurance, 0);
+    assert_eq!(group_after.vault, 0);
+}
+
+#[test]
+fn v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed() {
+    // W12 non-over-widening control: Resolved mode must NOT become an
+    // unconditional pass-through. While ANY portfolio remains open
+    // (materialized_portfolio_count != 0) or there is outstanding committed
+    // capital (c_tot != 0), the protocol sweep must stay rejected -- exactly
+    // mirroring the wind-down precondition tag 41 (WithdrawInsurance) already
+    // enforces. The surplus (200) and accrued claim (100) are deliberately
+    // generous/non-limiting here so the wind-down guard -- not the
+    // engine_available/vault clamp -- is what's actually standing between
+    // the request and success.
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    let mint = init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 10);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    {
+        // Seed the protocol-fee ledger + a generous unbudgeted surplus
+        // directly (NOT via seed_protocol_fee_fixture, which unconditionally
+        // zeroes c_tot -- this test needs c_tot/materialized_portfolio_count
+        // to remain exactly as the real deposit+resolve sequence above left
+        // them, since that's the precondition under test).
+        let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+        assert_ne!(group.materialized_portfolio_count, 0, "init_portfolio must have materialized one portfolio");
+        assert_ne!(group.c_tot, 0, "deposit(10) must have raised c_tot");
+        cfg.protocol_fee_authority = admin.key.to_bytes();
+        cfg.protocol_fee_accrued_atoms = 100;
+        cfg.protocol_fee_withdrawn_atoms = 0;
+        group.insurance = 200;
+        group.vault = group.vault.checked_add(200).unwrap();
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 210);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+    let rejected = run_ix(
+        Instruction::WithdrawProtocolFee { amount: 1 },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert_err_and_market_unchanged(rejected, &market, &before);
+}
+
 /// Raw `UpgradeableLoaderState::ProgramData` bytes matching the manual parse
 /// in `read_program_data_upgrade_authority` (45-byte metadata: 4-byte LE
 /// discriminant=3, 8-byte slot, 1-byte Option tag, 32-byte pubkey).

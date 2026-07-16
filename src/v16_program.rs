@@ -10050,6 +10050,21 @@ pub mod processor {
     /// budgets; the protocol's claim is a separately-accounted, non-domain
     /// balance and `protocol_fee_authority` is not an adversary this design
     /// defends against).
+    ///
+    /// W12: ResolveMarket is one-way (no path back to Live), so a Live-only
+    /// gate here would permanently strand any outstanding
+    /// `protocol_fee_accrued_atoms` backlog the instant a market resolves --
+    /// forever, since there is no other exit for it. Mirrors
+    /// `handle_withdraw_insurance`'s (tag 41) bounded terminal exit: Resolved
+    /// is allowed once the market is fully wound down
+    /// (`materialized_portfolio_count == 0 && c_tot == 0`, i.e. every
+    /// portfolio has closed with no unfinalized resolved-payout receipt and
+    /// no outstanding capital claim -- see
+    /// `is_empty_for_dematerialization`/`deregister_empty_materialized_portfolio_not_atomic`
+    /// in the engine). At that point `vault` has no other claimant, so the
+    /// existing `engine_available`/`vault` clamp below is exactly as safe as
+    /// it is in Live mode -- this does not weaken the reserve invariant, it
+    /// only widens *when* the already-bounded surplus withdraw is reachable.
     #[inline(never)]
     fn handle_withdraw_protocol_fee<'a>(
         program_id: &Pubkey,
@@ -10075,7 +10090,15 @@ pub mod processor {
         let (transfer_amount_u64, cfg_after) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
-            if group.header.mode != 0 {
+            let live_mode = group.header.mode == 0;
+            let resolved_mode = group.header.mode == 1;
+            if !live_mode && !resolved_mode {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            if resolved_mode
+                && (group.header.materialized_portfolio_count.get() != 0
+                    || group.header.c_tot.get() != 0)
+            {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             if !live_authority_matches(&cfg.protocol_fee_authority, authority.key) {
