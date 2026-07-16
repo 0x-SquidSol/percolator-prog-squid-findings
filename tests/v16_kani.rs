@@ -2191,3 +2191,88 @@ fn kani_set_protocol_fee_authority_requires_upgrade_authority() {
         assert!(!would_authorize, "a non-upgrade-authority signer must never satisfy the gate");
     }
 }
+
+// (e) fee_split_floor_ok (policy_v16): on-chain enforcement of the launch
+// wizard's (feeSplit.ts) fee-split floors -- creator at most 45%, LP at
+// least 40%, insurance at least 15%, all as a share of
+// `T = trade_fee_base_bps + backing_fee_bps` -- applied by
+// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy` so a raw instruction
+// can't bypass the client-side-only wizard check. For any input in the
+// on-chain-reachable wire-width range that the function ACCEPTS, the
+// derived percentages of T satisfy each floor within the documented,
+// proven-worst-case tolerance (FEE_SPLIT_CREATOR_TOLERANCE / the T-scaled
+// share tolerance built from FEE_SPLIT_SHARE_TOLERANCE_FLAT, see their doc
+// comments for the derivation).
+// Also proves the wizard's default 20/60/20 example is always accepted,
+// and (non-vacuity) that both an accept and a reject are reachable.
+#[kani::proof]
+fn kani_fee_split_floor_ok_matches_tolerant_percentage_floors() {
+    let trade_fee_base_bps: u64 = kani::any();
+    let backing_fee_bps: u64 = kani::any();
+    let insurance_share_bps: u64 = kani::any();
+    // Exactly the wire-width bounds `handle_update_backing_fee_policy` /
+    // `handle_update_trade_fee_policy` already enforce before ever calling
+    // `fee_split_floor_ok`: `fee_bps`/`insurance_share_bps` are u16 fields
+    // capped at 10_000 by the pre-existing `backing_trade_fee_policy_shape_ok`
+    // check, and `trade_fee_base_bps` is additionally capped by
+    // `MAX_DYNAMIC_TRADE_FEE_BPS == 10_000`. This is the full adversarial
+    // space a malicious creator can actually reach on-chain -- not a
+    // narrowing relative to production.
+    kani::assume(trade_fee_base_bps <= 10_000);
+    kani::assume(backing_fee_bps <= 10_000);
+    kani::assume(insurance_share_bps <= 10_000);
+
+    let accepted = policy_v16::fee_split_floor_ok(
+        trade_fee_base_bps,
+        backing_fee_bps,
+        insurance_share_bps,
+    );
+
+    kani::cover!(accepted, "fee_split_floor_ok covers an accepted split");
+    kani::cover!(!accepted, "fee_split_floor_ok covers a rejected split");
+    kani::cover!(
+        backing_fee_bps == 0,
+        "fee_split_floor_ok covers the backing_fee_bps==0 skip path"
+    );
+    kani::cover!(
+        backing_fee_bps > 0 && accepted,
+        "fee_split_floor_ok covers a nonzero-backing-fee split that is accepted"
+    );
+
+    if backing_fee_bps == 0 {
+        assert!(accepted, "backing_fee_bps==0 must always skip the floor check");
+        return;
+    }
+
+    if accepted {
+        let t = trade_fee_base_bps + backing_fee_bps; // no overflow: both <=10_000
+        assert!(t > 0);
+        // creator% <= 45 within tolerance: tfb*100 <= 45*T + CREATOR_TOLERANCE
+        assert!(
+            trade_fee_base_bps * 100 <= 45 * t + policy_v16::FEE_SPLIT_CREATOR_TOLERANCE,
+            "accepted split must satisfy the creator floor within tolerance"
+        );
+        // T-scaled share tolerance: (t+1)/2 + FEE_SPLIT_SHARE_TOLERANCE_FLAT.
+        // t:u64 here, <=20_000, so t+1 and the final sum cannot overflow.
+        let share_tolerance = (t + 1) / 2 + policy_v16::FEE_SPLIT_SHARE_TOLERANCE_FLAT as u64;
+        // insurance% >= 15 within tolerance: bf*isb >= 15*T*100 - share_tolerance
+        let insurance_rhs = (15 * t * 100).saturating_sub(share_tolerance);
+        assert!(
+            backing_fee_bps * insurance_share_bps >= insurance_rhs,
+            "accepted split must satisfy the insurance floor within tolerance"
+        );
+        // lp% >= 40 within tolerance: bf*(10000-isb) >= 40*T*100 - share_tolerance
+        let lp_share = 10_000 - insurance_share_bps;
+        let lp_rhs = (40 * t * 100).saturating_sub(share_tolerance);
+        assert!(
+            backing_fee_bps * lp_share >= lp_rhs,
+            "accepted split must satisfy the LP floor within tolerance"
+        );
+    }
+
+    // Wizard-default example (T=20bps, creatorPct=20/lpPct=60/insurancePct=20):
+    // tfb=4, bf=16, isb=2500 -- must always be accepted.
+    if trade_fee_base_bps == 4 && backing_fee_bps == 16 && insurance_share_bps == 2_500 {
+        assert!(accepted, "the wizard's default 20/60/20 split must be accepted");
+    }
+}

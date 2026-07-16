@@ -304,6 +304,17 @@ pub mod error {
         /// SDK agent: add `LpVaultDepositBelowMinimumLiquidity = 50` to the client
         /// error map.
         LpVaultDepositBelowMinimumLiquidity, // Custom(50)
+        // ── Fee-split floor enforcement (on-chain mirror of the launch
+        // wizard's `feeSplit.ts` floors) ────────────────────────────────
+        // Appended after LpVaultDepositBelowMinimumLiquidity (ordinal 50). Do NOT reorder.
+        /// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy` would produce a
+        /// stored split that violates the non-protocol-remainder floors
+        /// (creator <=45%, LP >=40%, insurance >=15% of
+        /// `trade_fee_base_bps + backing_fee_bps`), outside the documented
+        /// rounding tolerance. See `policy_v16::fee_split_floor_ok`.
+        /// SDK agent: add `FeeSplitFloorViolation = 51` to the client error
+        /// map.
+        FeeSplitFloorViolation, // Custom(51)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1374,6 +1385,16 @@ pub mod state {
         }
     }
 
+    // NOTE: this runs at LOAD time (every `read_wrapper_config_from_bytes` /
+    // `read_wrapper_config_boxed_from_bytes` call, i.e. every instruction
+    // that deserializes an existing market's config). The fee-split floor
+    // (creator<=45%/LP>=40%/insurance>=15%, `policy_v16::fee_split_floor_ok`)
+    // is deliberately NOT checked here: doing so would retroactively brick
+    // every market created before that floor existed, since their stored
+    // split may not satisfy it. The floor is enforced only in the setter
+    // handlers (`handle_update_backing_fee_policy` /
+    // `handle_update_trade_fee_policy`), at the moment a NEW split is
+    // written -- see those functions' comments.
     #[inline]
     fn validate_wrapper_config(config: &WrapperConfigV16) -> Result<(), ProgramError> {
         if config.collateral_mint == [0u8; 32]
@@ -1491,6 +1512,17 @@ pub mod state {
         max_bps < 10_000 && cooldown_slots != 0
     }
 
+    // NOTE: called from BOTH `read_asset_oracle_profile`/`validate_wrapper_config`
+    // (load time) AND `write_asset_oracle_profile` (set time) via
+    // `validate_asset_oracle_profile` -- i.e. on every deserialize of an
+    // existing market's config/profile, not only when a setter runs. Only
+    // basic shape (bounds + the fee==0-implies-share==0 pairing) belongs
+    // here. The fee-split FLOOR (creator<=45%/LP>=40%/insurance>=15%,
+    // `policy_v16::fee_split_floor_ok`) must never be added to this
+    // function: it would retroactively brick every market whose
+    // already-stored split doesn't satisfy the new floor. That floor is
+    // enforced only in the setter handlers themselves
+    // (`handle_update_backing_fee_policy` / `handle_update_trade_fee_policy`).
     #[inline]
     pub(crate) fn backing_trade_fee_policy_shape_ok(
         fee_bps: u16,
@@ -5512,6 +5544,222 @@ pub mod policy_v16 {
         }
         None
     }
+
+    /// Fee-split floor tolerance derivation for `fee_split_floor_ok` below
+    /// (house requirement: on-chain enforcement of the launch wizard's
+    /// non-protocol-remainder floors: creator at most 45%, LP at least 40%,
+    /// insurance at least 15%, all of `T = trade_fee_base_bps +
+    /// backing_fee_bps`; so a raw instruction can't bypass the
+    /// client-side-only check in `feeSplit.ts`).
+    ///
+    /// The wizard computes `trade_fee_base_bps = round(T * creatorPct /
+    /// 100)` and `insurance_share_bps = round(insurancePct * 10000 /
+    /// (insurancePct plus lpPct))`. Both are standard round-half-up
+    /// roundings of a real value, so each individual rounding error is
+    /// bounded in magnitude by exactly 0.5 (in the rounded field's own
+    /// units: 0.5 bps for `trade_fee_base_bps`, 0.5/10000 of the backing fee
+    /// for `insurance_share_bps`). Because `backing_fee_bps` equals `T`
+    /// minus `trade_fee_base_bps` as an exact integer subtraction on the
+    /// client (not an independent rounding), its error is exactly the
+    /// negative of `trade_fee_base_bps`'s error, also bounded by 0.5, and
+    /// `T` itself (`trade_fee_base_bps + backing_fee_bps` reconstructed
+    /// on-chain) is therefore always exactly the client's original integer
+    /// `T`, with no accumulated error of its own.
+    ///
+    /// Propagating those two independent, bounded errors through each
+    /// integer inequality gives worst-case constants that do NOT depend on
+    /// `T` (this is a proven bound, not a value merely sized to pass one
+    /// example):
+    ///
+    /// Creator check (`tfb times 100 <= 45 times T`): the only error source
+    /// is `trade_fee_base_bps`'s own rounding, contributing at most `0.5
+    /// times 100 = 50` to the LHS, giving `CREATOR_TOLERANCE = 50`.
+    ///
+    /// Insurance/LP checks (`bf times isb >= 15 times T times 100` and `bf
+    /// times (10000 minus isb) >= 40 times T times 100`): two independent
+    /// error sources. `insurance_share_bps`'s error (at most 0.5) multiplied
+    /// by `backing_fee_bps` -- bounded not by its 10_000 wire-width cap but
+    /// by the TIGHTER, structural `backing_fee_bps <= T` (it falls straight
+    /// out of `bf = T - tfb` with `tfb` unsigned, true for ANY reachable
+    /// input, not merely a caller precondition) -- contributes at most `0.5
+    /// times T = T/2`, computed inline per-call as the ceiling `(t+1)/2`.
+    /// `backing_fee_bps`'s error (at most 0.5) multiplied by the OTHER
+    /// factor (`insurance_share_bps` or its complement, genuinely bounded by
+    /// its own 10_000 range, not a looseness artifact) contributes at most
+    /// `0.5 times 10000 = 5000`, folded with the negligible `0.5 times 0.5`
+    /// cross term into the flat `FEE_SPLIT_SHARE_TOLERANCE_FLAT = 5_001`.
+    /// The combined, T-scaled tolerance is therefore `ceil(T/2) + 5_001`
+    /// (see `FEE_SPLIT_SHARE_TOLERANCE_FLAT`'s doc comment for the full
+    /// derivation and the proven residual min-T carve-out this leaves: the
+    /// check is a structural no-op only for insurance at T in {1,2,3} bps
+    /// and LP at T=1 bps, versus T<=6/T<=2 for the old flat-10_000 bound,
+    /// which incorrectly used `bf <= 10_000` -- the GLOBAL wire-width cap --
+    /// in place of the tight, structural `bf <= T`).
+    ///
+    /// Worked edge case that exercises both tolerances at once (see
+    /// `tests::fee_split_floor_*` for the executable version): the wizard's
+    /// own simultaneous boundary point (creatorPct=45, lpPct=40,
+    /// insurancePct=15, all three floors hit at once) at a low but
+    /// realistic total fee `T=10` bps rounds to `trade_fee_base_bps=5`
+    /// (ideal 4.5, rounds up: the exact 0.5 worst case), `backing_fee_bps=5`,
+    /// `insurance_share_bps=2727` (ideal 2727.27...). The resulting on-chain
+    /// split is ACTUALLY 50% creator, 36.365% LP, 13.635% insurance: all
+    /// three floors technically violated by the rounding, yet this is
+    /// exactly what the wizard's own UI produced for a legitimate boundary
+    /// selection. A tolerance-free check would reject it; these proven
+    /// worst-case tolerances accept it (see `fee_split_floor_ok`'s doc
+    /// comment for the pass/reject values on this exact input). The
+    /// wizard's default 20/60/20 example (T=20, creatorPct=20) needs no
+    /// tolerance at all (passes with wide margin) and is not the case that
+    /// determined these constants.
+    pub const FEE_SPLIT_CREATOR_TOLERANCE: u64 = 50;
+
+    /// T-INDEPENDENT half of the insurance/LP share tolerance (replaces the
+    /// old flat `FEE_SPLIT_SHARE_TOLERANCE = 10_000`, which incorrectly
+    /// bounded `backing_fee_bps`'s rounding-error contribution by its global
+    /// wire-width cap (10_000) instead of by `T` -- since `bf = T - tfb`
+    /// with `tfb` unsigned, `bf <= T` ALWAYS, structurally, independent of
+    /// any caller precondition. Using the loose 10_000 bound made the check
+    /// degenerate to a no-op at low T: `15*T*100 <= 10_000` for T<=6, so the
+    /// insurance floor was fully vacuous there (`10_000 <= 40*T*100` doing
+    /// the same to the LP floor for T<=2). This constant covers only the
+    /// OTHER error term, `isb_ideal * e_bf` (resp. `lp_share_ideal * e_bf`),
+    /// which stays flat at <=10_000*0.5=5000 regardless of T because `isb` /
+    /// `lp_share = 10_000 - isb` are share-of-10_000 values independent of
+    /// T's magnitude by construction (not a looseness artifact -- tightening
+    /// this further requires coupling to the wizard's specific percentage
+    /// floors, deliberately avoided here for robustness against future
+    /// floor-value changes). +1 covers the negligible e_bf*e_isb cross term.
+    /// The OTHER (T-dependent) half of the tolerance, covering
+    /// `bf_ideal * e_isb` now bounded via the structural `bf_ideal <= T`
+    /// instead of `bf_ideal <= 10_000`, is computed inline as `(t + 1) / 2`
+    /// at each call site below -- integer ceiling-division by the
+    /// compile-time constant 2, never by `t`, so no div-by-zero guard is
+    /// needed (t==0 is already short-circuited above this code).
+    ///
+    /// Residual carve-out (proven, not incidental): even with this tighter,
+    /// T-scaled tolerance, the check is still a structural no-op for
+    /// insurance at T in {1,2,3} bps and for LP at T=1 bps -- down from the
+    /// old bug's T<=6 / T<=2, but not eliminable further without coupling to
+    /// the wizard's specific percentage floors: at T=1..3 bps, `isb`'s own
+    /// rounding error alone (<=0.5*10_000=5000) already exceeds the entire
+    /// target quantity (`1500*T <= 4500` at T=3). This mirrors the
+    /// function's own pre-existing, deliberate `backing_fee_bps==0` skip,
+    /// just at a narrower boundary; closing it fully would require a
+    /// frontend-side minimum-T guard in the wizard, out of scope here.
+    pub const FEE_SPLIT_SHARE_TOLERANCE_FLAT: u128 = 5_001;
+
+    /// Joint on-chain floor check for the launch wizard's fee-split
+    /// invariant (creator <=45%, LP >=40%, insurance >=15% of `T =
+    /// trade_fee_base_bps + backing_fee_bps`), applied by both
+    /// `UpdateBackingFeePolicy` and `UpdateTradeFeePolicy`'s handlers.
+    ///
+    /// Skips entirely (returns `true`) when `backing_fee_bps == 0` --
+    /// backing fee not yet configured (e.g. immediately after `InitMarket`,
+    /// or a legitimate all-creator config) -- the three-way split isn't
+    /// complete yet, so no floor applies. Callers must separately keep
+    /// enforcing any pre-existing `insurance_share_bps == 0` requirement for
+    /// that state (see `backing_trade_fee_policy_shape_ok`); this function
+    /// does not duplicate that check.
+    ///
+    /// Deliberately NOT wired into `validate_wrapper_config` /
+    /// `backing_trade_fee_policy_shape_ok` / `validate_asset_oracle_profile`
+    /// (the load-time shape validators run on every deserialize of an
+    /// existing market's config/profile -- see call sites at
+    /// `read_wrapper_config_from_bytes` /
+    /// `read_wrapper_config_boxed_from_bytes` / wherever
+    /// `validate_asset_oracle_profile` is invoked). Putting a floor check
+    /// there would retroactively brick every market created before this
+    /// change whose stored split doesn't satisfy the new floor -- this
+    /// function is called ONLY from the two setter handlers, at the moment
+    /// a new split is being written.
+    ///
+    /// All inputs are raw on-chain bps fields; callers must already
+    /// range-check them to <=10_000 (`trade_fee_base_bps` additionally
+    /// <=`MAX_DYNAMIC_TRADE_FEE_BPS`) before calling this -- it does not
+    /// re-validate that shape, only the joint floor. Pure, no side effects,
+    /// safe to call from Kani proofs and unit tests.
+    pub fn fee_split_floor_ok(
+        trade_fee_base_bps: u64,
+        backing_fee_bps: u64,
+        insurance_share_bps: u64,
+    ) -> bool {
+        if backing_fee_bps == 0 {
+            return true;
+        }
+        let tfb = trade_fee_base_bps as u128;
+        let bf = backing_fee_bps as u128;
+        let isb = insurance_share_bps as u128;
+        let lp_share = match 10_000u128.checked_sub(isb) {
+            Some(v) => v,
+            None => return false,
+        };
+        let t = match tfb.checked_add(bf) {
+            Some(v) => v,
+            None => return false,
+        };
+        if t == 0 {
+            return true;
+        }
+
+        // creator% <= 45  <=>  tfb*100 <= 45*T (+ tolerance)
+        let creator_lhs = match tfb.checked_mul(100) {
+            Some(v) => v,
+            None => return false,
+        };
+        let creator_rhs = match t
+            .checked_mul(45)
+            .and_then(|v| v.checked_add(FEE_SPLIT_CREATOR_TOLERANCE as u128))
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        if creator_lhs > creator_rhs {
+            return false;
+        }
+
+        // T-scaled tolerance shared by the insurance and LP checks below
+        // (both use the same bound: bf<=T structural + isb/lp_share<=10_000
+        // structural -- see FEE_SPLIT_SHARE_TOLERANCE_FLAT's doc comment).
+        let t_half_ceil = match t.checked_add(1) {
+            Some(v) => v / 2, // safe: divides by the constant 2, not by t
+            None => return false,
+        };
+        let share_tolerance = match t_half_ceil.checked_add(FEE_SPLIT_SHARE_TOLERANCE_FLAT) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // insurance% >= 15  <=>  bf*isb >= 15*T*100 (- tolerance)
+        let insurance_lhs = match bf.checked_mul(isb) {
+            Some(v) => v,
+            None => return false,
+        };
+        let insurance_rhs_exact = match t.checked_mul(1_500) {
+            Some(v) => v,
+            None => return false,
+        };
+        let insurance_rhs = insurance_rhs_exact.saturating_sub(share_tolerance);
+        if insurance_lhs < insurance_rhs {
+            return false;
+        }
+
+        // lp% >= 40  <=>  bf*(10000-isb) >= 40*T*100 (- tolerance)
+        let lp_lhs = match bf.checked_mul(lp_share) {
+            Some(v) => v,
+            None => return false,
+        };
+        let lp_rhs_exact = match t.checked_mul(4_000) {
+            Some(v) => v,
+            None => return false,
+        };
+        let lp_rhs = lp_rhs_exact.saturating_sub(share_tolerance);
+        if lp_lhs < lp_rhs {
+            return false;
+        }
+
+        true
+    }
 }
 
 pub mod processor {
@@ -6700,6 +6948,15 @@ pub mod processor {
             secondary_collateral_mint: [0u8; 32],
             maintenance_fee_per_slot,
             permissionless_market_init_fee: 0,
+            // No fee-split floor check applies here (unlike
+            // `handle_update_trade_fee_policy` / `handle_update_backing_fee_policy`,
+            // see `policy_v16::fee_split_floor_ok`): at InitMarket the backing
+            // fee is unconditionally zero (set below), so the three-way split
+            // isn't complete yet -- creator is momentarily 100% of a
+            // not-yet-finished config by construction, not a violation.
+            // Blocking on the floor here would make InitMarket itself
+            // unusable; the floor is enforced once backing/insurance shares
+            // are actually configured, via the two setters.
             trade_fee_base_bps,
             permissionless_resolve_stale_slots: 0,
             force_close_delay_slots: 0,
@@ -11173,6 +11430,22 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // Fee-split floor (house requirement) -- see
+        // `policy_v16::fee_split_floor_ok`'s doc comment for the integer
+        // inequalities + rounding-tolerance derivation, and for why this is
+        // NOT enforced in the load-time shape validators. Validated against
+        // the ALREADY-STORED `trade_fee_base_bps` (this handler never
+        // changes it, regardless of `asset_index`, since it's a single
+        // market-wide field); `UpdateTradeFeePolicy` is the symmetric setter
+        // that validates a new `trade_fee_base_bps` against the
+        // already-stored backing-fee state instead.
+        if !policy_v16::fee_split_floor_ok(
+            cfg.trade_fee_base_bps,
+            fee_bps as u64,
+            insurance_share_bps as u64,
+        ) {
+            return Err(PercolatorError::FeeSplitFloorViolation.into());
+        }
         let long_side = domain % 2 == 0;
         let adjust_policy_count =
             |cfg: &mut WrapperConfigV16, old_fee: u16, new_fee: u16| -> ProgramResult {
@@ -11262,6 +11535,32 @@ pub mod processor {
             || trade_fee_base_bps > constants::MAX_DYNAMIC_TRADE_FEE_BPS
         {
             return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // Fee-split floor (house requirement) -- see
+        // `policy_v16::fee_split_floor_ok`'s doc comment for the integer
+        // inequalities + rounding-tolerance derivation, and for why this is
+        // NOT enforced in the load-time shape validators. Validated against
+        // BOTH domains' already-stored backing-fee state: long AND short
+        // share this single `trade_fee_base_bps` per the shipped mapping,
+        // and both domains' backing-fee fields for asset 0 live in this
+        // `cfg` (the market-wide struct). Deliberately NOT extended to
+        // asset_index>0 profiles here -- those are validated at the moment
+        // THEIR backing fee is set, in `handle_update_backing_fee_policy`,
+        // against whatever `trade_fee_base_bps` is stored at that time;
+        // re-validating every asset's profile against a NEW
+        // `trade_fee_base_bps` here would require an unbounded per-asset
+        // scan of this single instruction and was out of scope for this
+        // validation-only change (no routing/math/struct-size change).
+        if !policy_v16::fee_split_floor_ok(
+            trade_fee_base_bps,
+            cfg.backing_trade_fee_bps_long as u64,
+            cfg.backing_trade_fee_insurance_share_bps_long as u64,
+        ) || !policy_v16::fee_split_floor_ok(
+            trade_fee_base_bps,
+            cfg.backing_trade_fee_bps_short as u64,
+            cfg.backing_trade_fee_insurance_share_bps_short as u64,
+        ) {
+            return Err(PercolatorError::FeeSplitFloorViolation.into());
         }
         cfg.trade_fee_base_bps = trade_fee_base_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
@@ -15661,6 +15960,93 @@ pub mod processor {
                 Some(0)
             );
             assert_eq!(policy_v16::premium_funding_rate_e9(150, 100, 0), Some(0));
+        }
+
+        // fee_split_floor_ok: on-chain enforcement of the launch wizard's
+        // (feeSplit.ts) creator<=45%/LP>=40%/insurance>=15% floors. See the
+        // function's doc comment in `policy_v16` for the integer
+        // inequalities and the rounding-tolerance derivation.
+
+        #[test]
+        fn fee_split_floor_accepts_wizard_default_20_60_20() {
+            // T=20bps, creatorPct=20/lpPct=60/insurancePct=20 ->
+            // trade_fee_base_bps=round(20*0.20)=4, backing_fee_bps=16,
+            // insurance_share_bps=round(20/80*10000)=2500. Passes with wide
+            // margin, no tolerance needed.
+            assert!(policy_v16::fee_split_floor_ok(4, 16, 2_500));
+        }
+
+        #[test]
+        fn fee_split_floor_rejects_insurance_below_floor() {
+            // T=1000bps, tfb=100 (10% creator, well within the 45% cap),
+            // bf=900, isb=1000 -> insurance% = 0.9 * 10% = 9% < 15%.
+            assert!(!policy_v16::fee_split_floor_ok(100, 900, 1_000));
+        }
+
+        #[test]
+        fn fee_split_floor_rejects_lp_below_floor() {
+            // T=1000bps, tfb=100 (10% creator), bf=900, isb=8000 -> LP share
+            // is only 2000bps of the backing fee, so LP% = 0.9 * 20% = 18% < 40%.
+            assert!(!policy_v16::fee_split_floor_ok(100, 900, 8_000));
+        }
+
+        #[test]
+        fn fee_split_floor_rejects_creator_above_cap() {
+            // T=1000bps, tfb=600 -> creator% = 60% > 45%, regardless of the
+            // backing-fee split (isb=5000 is otherwise a perfectly valid 50/50
+            // insurance/LP split of the backing fee).
+            assert!(!policy_v16::fee_split_floor_ok(600, 400, 5_000));
+        }
+
+        #[test]
+        fn fee_split_floor_accepts_zero_creator_share() {
+            // tfb=0 (all-to-backing): creator%=0 (<=45% trivially satisfied),
+            // bf=1000, isb=2000 -> insurance%=20% (>=15%), LP%=80% (>=40%).
+            assert!(policy_v16::fee_split_floor_ok(0, 1_000, 2_000));
+        }
+
+        #[test]
+        fn fee_split_floor_skips_check_when_backing_fee_is_zero() {
+            // backing_fee_bps==0 means the three-way split isn't configured
+            // yet (e.g. right after InitMarket) -- the floor check is skipped
+            // entirely regardless of trade_fee_base_bps/insurance_share_bps.
+            // Any pre-existing `insurance_share_bps==0` requirement for this
+            // state is a SEPARATE, already-enforced check
+            // (`backing_trade_fee_policy_shape_ok`, exercised below) that
+            // this function does not duplicate and does not change.
+            assert!(policy_v16::fee_split_floor_ok(0, 0, 0));
+            assert!(policy_v16::fee_split_floor_ok(10_000, 0, 9_999));
+            // The pre-existing shape check (unaffected by this change) still
+            // rejects a nonzero insurance share paired with a zero fee.
+            assert!(!state::backing_trade_fee_policy_shape_ok(0, 1));
+        }
+
+        #[test]
+        fn fee_split_floor_accepts_wizard_boundary_point_with_rounding() {
+            // The tightest realistic edge case: the wizard's own
+            // *simultaneous* boundary selection (creatorPct=45, lpPct=40,
+            // insurancePct=15 -- all three floors at once) at a low total fee
+            // T=10bps. Ideal (unrounded) trade_fee_base_bps = 10*0.45 = 4.5,
+            // which Math.round()'s round-half-up rounds to 5 -- the exact 0.5
+            // worst case that motivated FEE_SPLIT_CREATOR_TOLERANCE.
+            // backing_fee_bps = 10-5 = 5. insurance_share_bps =
+            // round(15/55*10000) = round(2727.27) = 2727. The resulting
+            // ACTUAL on-chain split is 50% creator / 36.365% LP / 13.635%
+            // insurance -- all three floors technically violated by the
+            // rounding -- yet this is exactly what the wizard produced for a
+            // legitimate boundary input, so it must be accepted.
+            assert!(policy_v16::fee_split_floor_ok(5, 5, 2_727));
+        }
+
+        #[test]
+        fn fee_split_floor_still_rejects_a_genuinely_bad_split_at_the_same_scale() {
+            // Non-vacuity companion to the boundary-point test above: at the
+            // same small T=10bps scale, a split that is genuinely (not just
+            // rounding-noise) off the floors is still rejected -- confirms
+            // the tolerance doesn't degenerate into "always accept" at small T.
+            // tfb=9 (90% creator, nowhere near the 45% cap even accounting
+            // for the 50-unit tolerance: 900 > 450+50=500).
+            assert!(!policy_v16::fee_split_floor_ok(9, 1, 5_000));
         }
 
         #[test]

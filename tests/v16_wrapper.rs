@@ -3443,7 +3443,14 @@ fn v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
         Instruction::UpdateBackingFeePolicy {
             domain: 1,
             fee_bps: 25,
-            insurance_share_bps: 0,
+            // Fee-split floor enforcement (policy_v16::fee_split_floor_ok):
+            // insurance_share_bps=0 with a nonzero fee_bps is now rejected
+            // (0% insurance < the 15% floor). Use a floor-compliant share;
+            // this test's assertions only depend on the TOTAL backing-fee
+            // rate (no fee is ever actually charged in this scenario, since
+            // no trade here locks new counterparty backing), not on how
+            // that fee would split between insurance and LP.
+            insurance_share_bps: 2_500,
         },
         &mut [&mut admin, &mut market],
     )
@@ -3491,7 +3498,12 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
         Instruction::UpdateBackingFeePolicy {
             domain: 1,
             fee_bps: 1_000,
-            insurance_share_bps: 0,
+            // Fee-split floor enforcement (policy_v16::fee_split_floor_ok):
+            // see the sibling test above for why 0 -> 2_500 here doesn't
+            // change this test's behavior (total backing-fee rate is
+            // unaffected; only the insurance/LP split of any fee actually
+            // charged changes, and this scenario never charges one).
+            insurance_share_bps: 2_500,
         },
         &mut [&mut admin, &mut market],
     )
@@ -3538,7 +3550,8 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
         Instruction::UpdateBackingFeePolicy {
             domain: 1,
             fee_bps: 100,
-            insurance_share_bps: 0,
+            // Fee-split floor enforcement, see note above.
+            insurance_share_bps: 2_500,
         },
         &mut [&mut admin, &mut market],
     )
@@ -3605,7 +3618,8 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
         Instruction::UpdateBackingFeePolicy {
             domain: 1,
             fee_bps: 100,
-            insurance_share_bps: 0,
+            // Fee-split floor enforcement, see note above.
+            insurance_share_bps: 2_500,
         },
         &mut [&mut admin, &mut cpi_market],
     )
@@ -18080,4 +18094,181 @@ fn v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority() {
     .unwrap();
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_after.protocol_fee_authority, new_authority.to_bytes());
+}
+
+// =============================================================================
+// Fee-split floor enforcement (policy_v16::fee_split_floor_ok), end-to-end
+// through the real `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy`
+// handlers -- not just the pure-function unit tests in v16_program.rs.
+// Covers the T-scaling fix: the flat `FEE_SPLIT_SHARE_TOLERANCE = 10_000`
+// bound made the insurance floor a structural no-op for backing_fee_bps<=6
+// and the LP floor a no-op for backing_fee_bps<=2, independent of how
+// egregious the actual split was, because it bounded `backing_fee_bps`'s
+// rounding-error contribution by its global 10_000 wire-width cap instead
+// of by the tight, structural `backing_fee_bps <= T`. The fix scales the
+// tolerance with T (`ceil(T/2) + FEE_SPLIT_SHARE_TOLERANCE_FLAT`), shrinking
+// the vacuous window to backing_fee_bps in {1,2,3} for insurance and
+// backing_fee_bps==1 for LP -- a proven-irreducible residual (see
+// `FEE_SPLIT_SHARE_TOLERANCE_FLAT`'s doc comment), not a leftover bug.
+// =============================================================================
+
+#[test]
+fn v16_wrapper_fee_split_floor_enforced_at_wizard_default_t20() {
+    // T=20bps (the wizard's default trading-fee dial value), tfb=0 so the
+    // entire T is backing fee: creator%=0 trivially clears the 45% cap, so
+    // this isolates the insurance/LP floors specifically.
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+
+    // 0% insurance (isb=0) at T=20 must be REJECTED -- the old flat-10_000
+    // tolerance was already non-vacuous here (its vacuous window was
+    // backing_fee_bps<=6), so this also guards against a regression on the
+    // part of the check that was already correct.
+    let rejected_zero_insurance = run_ix(
+        Instruction::UpdateBackingFeePolicy {
+            domain: 1,
+            fee_bps: 20,
+            insurance_share_bps: 0,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert!(
+        rejected_zero_insurance.is_err(),
+        "0% insurance at T=20 must be rejected (floor=15%)"
+    );
+
+    // 0% LP (isb=10_000) at T=20 must also be REJECTED.
+    let rejected_zero_lp = run_ix(
+        Instruction::UpdateBackingFeePolicy {
+            domain: 1,
+            fee_bps: 20,
+            insurance_share_bps: 10_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert!(
+        rejected_zero_lp.is_err(),
+        "0% LP at T=20 must be rejected (floor=40%)"
+    );
+
+    // Confirm the market was left untouched by both rejected attempts (no
+    // policy_count bump, no stored split) -- domain 1 was never configured.
+    let (cfg, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg.backing_trade_fee_policy_count, 0);
+    assert_eq!(cfg.backing_trade_fee_bps_short, 0);
+}
+
+#[test]
+fn v16_wrapper_fee_split_floor_low_t_vacuity_shrinks_to_proven_residual() {
+    // Insurance floor: old flat tolerance was a structural no-op through
+    // backing_fee_bps==6; the T-scaled fix narrows that to {1,2,3}. Prove
+    // both ends: T=3 still (documented, irreducible) accepts 0% insurance,
+    // and T=4 -- previously also vacuous under the bug -- now REJECTS it.
+    for (t, expect_ok) in [(3u16, true), (4u16, false)] {
+        let mut admin = signer();
+        let mut market = market_account();
+        init_market(&mut admin, &mut market);
+        let result = run_ix(
+            Instruction::UpdateBackingFeePolicy {
+                domain: 1,
+                fee_bps: t,
+                insurance_share_bps: 0,
+            },
+            &mut [&mut admin, &mut market],
+        );
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "T={t} bps, 0% insurance: expected is_ok()={expect_ok}, got {result:?}"
+        );
+    }
+
+    // LP floor: old flat tolerance was a no-op through backing_fee_bps==2;
+    // the fix narrows that to {1}. T=1 still (documented) accepts 0% LP,
+    // and T=2 -- previously vacuous under the bug -- now REJECTS it.
+    for (t, expect_ok) in [(1u16, true), (2u16, false)] {
+        let mut admin = signer();
+        let mut market = market_account();
+        init_market(&mut admin, &mut market);
+        let result = run_ix(
+            Instruction::UpdateBackingFeePolicy {
+                domain: 1,
+                fee_bps: t,
+                insurance_share_bps: 10_000,
+            },
+            &mut [&mut admin, &mut market],
+        );
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "T={t} bps, 0% LP: expected is_ok()={expect_ok}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers() {
+    // The T-scaled tolerance must never false-reject a genuine wizard
+    // output, at both the wizard's default and its own tightest
+    // simultaneous-boundary selection (creator=45%/lp=40%/insurance=15% at
+    // once), exercised through the real setter handlers end to end (not
+    // just the pure-function unit tests).
+
+    // Wizard default: T=20bps, creatorPct=20/lpPct=60/insurancePct=20 ->
+    // trade_fee_base_bps=4, backing_fee_bps=16, insurance_share_bps=2_500.
+    {
+        let mut admin = signer();
+        let mut market = market_account();
+        init_market(&mut admin, &mut market);
+        run_ix(
+            Instruction::UpdateTradeFeePolicy { trade_fee_base_bps: 4 },
+            &mut [&mut admin, &mut market],
+        )
+        .unwrap();
+        run_ix(
+            Instruction::UpdateBackingFeePolicy {
+                domain: 1,
+                fee_bps: 16,
+                insurance_share_bps: 2_500,
+            },
+            &mut [&mut admin, &mut market],
+        )
+        .expect("wizard default 20/60/20 split must be accepted");
+        let (cfg, _) = state::read_market(&market.data).unwrap();
+        assert_eq!(cfg.trade_fee_base_bps, 4);
+        assert_eq!(cfg.backing_trade_fee_bps_short, 16);
+        assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_500);
+    }
+
+    // Wizard's tightest simultaneous boundary: creatorPct=45/lpPct=40/
+    // insurancePct=15 at T=10bps -> trade_fee_base_bps=5 (ideal 4.5, rounds
+    // up), backing_fee_bps=5, insurance_share_bps=2_727 (ideal 2727.27).
+    // The resulting on-chain split is ACTUALLY 50% creator / 36.365% LP /
+    // 13.635% insurance -- all three floors technically violated by
+    // rounding alone, yet this is exactly what the wizard's own UI produces
+    // for a legitimate boundary input, so it must be accepted.
+    {
+        let mut admin = signer();
+        let mut market = market_account();
+        init_market(&mut admin, &mut market);
+        run_ix(
+            Instruction::UpdateTradeFeePolicy { trade_fee_base_bps: 5 },
+            &mut [&mut admin, &mut market],
+        )
+        .unwrap();
+        run_ix(
+            Instruction::UpdateBackingFeePolicy {
+                domain: 1,
+                fee_bps: 5,
+                insurance_share_bps: 2_727,
+            },
+            &mut [&mut admin, &mut market],
+        )
+        .expect("wizard's own 45/40/15 boundary split at T=10 must be accepted");
+        let (cfg, _) = state::read_market(&market.data).unwrap();
+        assert_eq!(cfg.trade_fee_base_bps, 5);
+        assert_eq!(cfg.backing_trade_fee_bps_short, 5);
+        assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_727);
+    }
 }

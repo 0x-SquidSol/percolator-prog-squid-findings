@@ -7936,10 +7936,20 @@ fn v16_bpf_policy_authority_and_base_unit_tags_are_bounded_and_persist() {
     assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 5_000);
     assert_eq!(cfg.backing_trade_fee_policy_count, 1);
 
-    let trade_fee_cu = env.update_trade_fee_policy_with_cu(88);
+    // Fee-split floor enforcement (policy_v16::fee_split_floor_ok): with
+    // backing_trade_fee_bps_long=77 / insurance_share_bps_long=5_000 already
+    // stored above, trade_fee_base_bps=88 would make creator's share of
+    // T=165 equal to 53.3% (> the 45% cap) and is now rejected on-chain.
+    // 88 -> 20 keeps T small enough (T=97) that creator (20.6%), insurance
+    // (~39.7%), and LP (~39.7%) shares of T all clear their floors with
+    // margin; this test only cares that the field persists + CU is
+    // bounded, not the specific magnitude. (Minimal fixture fix applied
+    // per STEP 1's fixture-fix carve-out; SENTINEL scaffolding around it
+    // was discarded.)
+    let trade_fee_cu = env.update_trade_fee_policy_with_cu(20);
     assert_cu_within("UpdateTradeFeePolicy", trade_fee_cu, CUSTODY_CU_LIMIT);
     let (cfg, _) = env.market_state();
-    assert_eq!(cfg.trade_fee_base_bps, 88);
+    assert_eq!(cfg.trade_fee_base_bps, 20);
 
     let redirect_cu = env.update_fee_redirect_policy_with_cu(2_500);
     assert_cu_within("UpdateFeeRedirectPolicy", redirect_cu, CUSTODY_CU_LIMIT);
