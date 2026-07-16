@@ -9039,3 +9039,129 @@ fn v16_hlock_stays_set_while_any_negative_pnl_account_remains() {
     env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
         .expect("insurance withdrawal must succeed after all accounts are settled and hlock clears");
 }
+
+// FIX W1 (upstream 4b8bb9fa, #152, CRITICAL): validate_matcher_tail rejected key-aliasing
+// tail accounts but never checked `is_signer`, so a hostile matcher received tail AccountInfos
+// with the caller's own is_signer flags forwarded verbatim -- letting a malicious LP-registered
+// matcher program re-list e.g. the taker's wallet in its tail and use that forwarded signer
+// privilege in a nested CPI (wallet-drain-grade, zero extra privilege needed beyond routing a
+// trade through a hostile matcher). This test proves the wrapper now rejects BEFORE the matcher
+// CPI ever runs, for both TradeCpi and BatchTradeCpi, using the REAL percolator-match reference
+// matcher (not a stub) so the discriminator is genuinely "was the matcher CPI reached" and not
+// an artifact of a purpose-built hostile fixture.
+#[test]
+fn v16_fix_w1_matcher_tail_rejects_signer_account() {
+    for route_is_batch in [false, true] {
+        let mut env = V16CuEnv::new();
+        let matcher_program = Pubkey::new_unique();
+        let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+        env.svm.add_program(matcher_program, &matcher_bytes);
+
+        let taker = Keypair::new();
+        let lp = Keypair::new();
+        let taker_account = env.create_portfolio(&taker);
+        let lp_account = env.create_portfolio(&lp);
+        env.deposit(&taker, taker_account, 1_000_000);
+        env.deposit(&lp, lp_account, 1_000_000);
+        let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+        // The "hostile" element: an extra tail account that IS a transaction signer. A correct
+        // matcher would never need this; the point is the wrapper must reject its mere presence
+        // in the tail before the matcher is ever invoked, regardless of what the matcher does
+        // with it.
+        let tail_signer = Keypair::new();
+        let matcher_key_str = matcher_program.to_string();
+
+        let hostile_accounts = vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+            AccountMeta::new_readonly(tail_signer.pubkey(), true),
+        ];
+
+        let market_before = env.svm.get_account(&env.market).unwrap();
+        let taker_before = env.svm.get_account(&taker_account).unwrap();
+        let lp_before = env.svm.get_account(&lp_account).unwrap();
+        let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+        let leg = percolator_prog::ix::BatchTradeCpiLeg {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            fee_bps: 0,
+            limit_price: 0,
+        };
+        let err = if route_is_batch {
+            env.send(
+                ProgInstruction::BatchTradeCpi { legs: vec![leg] },
+                hostile_accounts.clone(),
+                &[&taker, &tail_signer],
+            )
+        } else {
+            env.send(
+                ProgInstruction::TradeCpi {
+                    asset_index: 0,
+                    size_q: POS_SCALE as i128,
+                    fee_bps: 0,
+                    limit_price: 0,
+                },
+                hostile_accounts.clone(),
+                &[&taker, &tail_signer],
+            )
+        }
+        .expect_err(
+            "matcher tail carrying an is_signer account must be rejected before the matcher CPI",
+        );
+
+        assert!(
+            err.contains("Custom(9)"),
+            "route_is_batch={route_is_batch} expected InvalidInstruction(9), got {err}"
+        );
+        assert!(
+            !err.contains(&matcher_key_str),
+            "route_is_batch={route_is_batch} rejection must NOT show the matcher program {matcher_key_str} in the tx error/logs -- the matcher CPI must never be invoked when the tail carries a signer: {err}"
+        );
+        assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+        assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+        assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+        assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
+
+        // Positive control: the identical call with the hostile tail-signer account simply
+        // dropped must succeed through a real matcher CPI. This proves the rejection above is
+        // specifically about the forwarded is_signer flag, not some unrelated fixture mistake.
+        env.svm.expire_blockhash();
+        let mut ok_accounts = hostile_accounts;
+        ok_accounts.pop();
+        let leg = percolator_prog::ix::BatchTradeCpiLeg {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            fee_bps: 0,
+            limit_price: 0,
+        };
+        let ok_result = if route_is_batch {
+            env.send(
+                ProgInstruction::BatchTradeCpi { legs: vec![leg] },
+                ok_accounts,
+                &[&taker],
+            )
+        } else {
+            env.send(
+                ProgInstruction::TradeCpi {
+                    asset_index: 0,
+                    size_q: POS_SCALE as i128,
+                    fee_bps: 0,
+                    limit_price: 0,
+                },
+                ok_accounts,
+                &[&taker],
+            )
+        };
+        assert!(
+            ok_result.is_ok(),
+            "route_is_batch={route_is_batch} control call without the signer tail account must succeed through the real matcher: {ok_result:?}"
+        );
+    }
+}

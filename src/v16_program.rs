@@ -8024,20 +8024,38 @@ pub mod processor {
         Ok(7)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_matcher_tail<'a>(
         tail: &'a [AccountInfo<'a>],
+        signer_a_ai: &AccountInfo,
         market_ai: &AccountInfo,
         account_a_ai: &AccountInfo,
         account_b_ai: &AccountInfo,
+        matcher_prog: &AccountInfo,
+        matcher_ctx: &AccountInfo,
+        matcher_delegate: &AccountInfo,
         program_id: &Pubkey,
     ) -> ProgramResult {
         if tail.len() > constants::MAX_MATCHER_TAIL_ACCOUNTS {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         for ai in tail {
-            if ai.key == market_ai.key
+            // FIX W1 (upstream #152, CRITICAL): a tail account forwarded to the untrusted
+            // external matcher previously carried its `is_signer` flag verbatim. A hostile
+            // matcher could re-list the taker's own wallet (or any other signer) in the tail
+            // and use its forwarded signer privilege in a nested CPI (e.g. a System Program
+            // transfer) before returning an otherwise-valid fill -- wallet-drain-grade, zero
+            // privilege required beyond routing a trade through a malicious LP-registered
+            // matcher. Reject any tail entry that is a signer, and (matching upstream) also
+            // reject aliasing any of the trusted accounts this call already knows about.
+            if ai.is_signer
+                || ai.key == signer_a_ai.key
+                || ai.key == market_ai.key
                 || ai.key == account_a_ai.key
                 || ai.key == account_b_ai.key
+                || ai.key == matcher_prog.key
+                || ai.key == matcher_ctx.key
+                || ai.key == matcher_delegate.key
                 || ai.key == program_id
                 || ai.owner == program_id
             {
@@ -8153,7 +8171,17 @@ pub mod processor {
         let tail = accounts
             .get(tail_start..)
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
-        validate_matcher_tail(tail, market_ai, account_a_ai, account_b_ai, program_id)?;
+        validate_matcher_tail(
+            tail,
+            signer_a,
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            matcher_prog,
+            matcher_ctx,
+            matcher_delegate,
+            program_id,
+        )?;
         if size_q == 0 || size_q == i128::MIN {
             return Err(PercolatorError::InvalidInstruction.into());
         }
@@ -8612,7 +8640,17 @@ pub mod processor {
         let tail = accounts
             .get(tail_start..)
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
-        validate_matcher_tail(tail, market_ai, account_a_ai, account_b_ai, program_id)?;
+        validate_matcher_tail(
+            tail,
+            signer_a,
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            matcher_prog,
+            matcher_ctx,
+            matcher_delegate,
+            program_id,
+        )?;
 
         let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
