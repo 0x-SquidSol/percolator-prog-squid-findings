@@ -9187,6 +9187,261 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
     assert_eq!(env.market_state().1.mode, MarketModeV16::Resolved);
 }
 
+// security.md sweep - non-base staleness masking (W7, upstream 959d8de6): staleness was either/or
+// at 3 call sites -- price-managed (per-asset) profiles checked only their own local staleness,
+// base checked only the global anchor. Once the BASE oracle passed permissionless_resolve_stale_slots
+// only base trades froze; a non-base asset with its own recently-cranked profile could keep trading
+// forever even though the market as a whole is already eligible for ResolveStalePermissionless.
+// This test crafts exactly that split (base cfg.last_good_oracle_slot old, asset-1 profile fresh)
+// via direct account writes -- necessary because ConfigureAuthMark/PushAuthMark unconditionally
+// bump the shared cfg.last_good_oracle_slot regardless of which asset_index is targeted in this
+// fork, so the split cannot be produced through ordinary instruction sequences alone.
+#[test]
+fn v16_attack_non_base_trade_rejects_after_base_resolve_matured() {
+    const PRICE: u64 = 100;
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.configure_permissionless_resolve_with_cu(5, 5);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, PRICE);
+    env.configure_auth_mark_for_asset_as_admin(1, 1, PRICE);
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let ta = env.create_portfolio(&taker);
+    let la = env.create_portfolio(&lp);
+    env.deposit(&taker, ta, 1_000_000_000);
+    env.deposit(&lp, la, 1_000_000_000);
+    let sz = (5 * POS_SCALE) as i128;
+
+    // Non-vacuous fresh control: non-base TradeNoCpi succeeds before any staleness exists.
+    env.trade_asset_with_cu(1, &taker, ta, &lp, la, sz, PRICE, 0);
+    assert_eq!(active_leg_for_asset(&env.portfolio_state(ta), 1).basis_pos_q, sz);
+    assert_eq!(active_leg_for_asset(&env.portfolio_state(la), 1).basis_pos_q, -sz);
+
+    // Craft the split-stale state directly: base anchor pinned old (age 6 >= stale_slots 5 ->
+    // globally matured); asset-1's own profile anchor fresh (age 1 < 5 -> not locally stale).
+    env.mutate_market(|cfg, _group| {
+        cfg.last_good_oracle_slot = 2;
+    });
+    {
+        let mut account = env.svm.get_account(&env.market).unwrap();
+        let mut profile = state::read_asset_oracle_profile(&account.data, 1).unwrap();
+        profile.last_good_oracle_slot = 7;
+        state::write_asset_oracle_profile(&mut account.data, 1, &profile).unwrap();
+        env.svm.set_account(env.market, account).unwrap();
+    }
+    env.svm.warp_to_slot(8);
+    let (stale_cfg, _stale_group) = env.market_state();
+    assert!(
+        oracle_v16::permissionless_stale_matured(&stale_cfg, 8),
+        "test setup must make the base anchor resolve-matured"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&ta).unwrap();
+    let lp_before = env.svm.get_account(&la).unwrap();
+
+    env.svm.expire_blockhash();
+    let stale = env.try_trade_asset_with_cu(1, &taker, ta, &lp, la, sz, PRICE, 0);
+    assert!(
+        stale.is_err(),
+        "non-base TradeNoCpi must reject once the base market is resolve-matured: {stale:?}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before,
+        "rejected stale non-base trade leaves the market unchanged");
+    assert_eq!(env.svm.get_account(&ta).unwrap(), taker_before,
+        "rejected stale non-base trade leaves the taker account unchanged");
+    assert_eq!(env.svm.get_account(&la).unwrap(), lp_before,
+        "rejected stale non-base trade leaves the LP account unchanged");
+
+    env.svm.expire_blockhash();
+    let resolve = env.send(
+        ProgInstruction::ResolveStalePermissionless { now_slot: 0 },
+        vec![AccountMeta::new(env.market, false)],
+        &[],
+    );
+    assert!(resolve.is_ok(), "permissionless resolve remains live after the rejected stale trade: {resolve:?}");
+    assert_eq!(env.market_state().1.mode, MarketModeV16::Resolved);
+}
+
+// security.md sweep - non-base TradeCpi rejects before matcher CPI (W7, upstream 959d8de6): the
+// same split-staleness bug had its own inline (buggy) copy in handle_trade_cpi, not routed through
+// the shared helper. Proves the stale TradeCpi is rejected BEFORE the external matcher is ever
+// invoked, using a REAL percolator-match matcher (not a stub) so "matcher context bytes unchanged"
+// is genuine proof of pre-CPI rejection (an actual fill mutates the matcher context).
+#[test]
+fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_matured() {
+    const PRICE: u64 = 100;
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    env.configure_permissionless_resolve_with_cu(5, 5);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, PRICE);
+    env.configure_auth_mark_for_asset_as_admin(1, 1, PRICE);
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000_000);
+    env.deposit(&lp, lp_account, 1_000_000_000);
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+    let accounts = vec![
+        AccountMeta::new(taker.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(taker_account, false),
+        AccountMeta::new(lp_account, false),
+        AccountMeta::new_readonly(matcher_program, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(delegate, false),
+    ];
+    let sz = (5 * POS_SCALE) as i128;
+
+    // Non-vacuous fresh control: the real matcher fills a non-base TradeCpi before any staleness.
+    env.svm.expire_blockhash();
+    let fresh = env.send(
+        ProgInstruction::TradeCpi { asset_index: 1, size_q: sz, fee_bps: 0, limit_price: PRICE },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(fresh.is_ok(), "fresh non-base TradeCpi through the real matcher must succeed: {fresh:?}");
+    assert_eq!(active_leg_for_asset(&env.portfolio_state(taker_account), 1).basis_pos_q, sz);
+
+    env.mutate_market(|cfg, _group| {
+        cfg.last_good_oracle_slot = 2;
+    });
+    {
+        let mut account = env.svm.get_account(&env.market).unwrap();
+        let mut profile = state::read_asset_oracle_profile(&account.data, 1).unwrap();
+        profile.last_good_oracle_slot = 7;
+        state::write_asset_oracle_profile(&mut account.data, 1, &profile).unwrap();
+        env.svm.set_account(env.market, account).unwrap();
+    }
+    env.svm.warp_to_slot(8);
+    let (stale_cfg, _stale_group) = env.market_state();
+    assert!(oracle_v16::permissionless_stale_matured(&stale_cfg, 8),
+        "test setup must make the base anchor resolve-matured");
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    env.svm.expire_blockhash();
+    let stale = env.send(
+        ProgInstruction::TradeCpi { asset_index: 1, size_q: sz, fee_bps: 0, limit_price: PRICE },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(
+        stale.is_err(),
+        "base-stale non-base TradeCpi must reject before matcher CPI: {stale:?}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before,
+        "matcher context must be untouched -- proves the real matcher CPI was never invoked");
+}
+
+// security.md sweep - non-base BatchTradeCpi rejects before matcher CPI (W7, upstream 959d8de6):
+// unlike the other two sites, handle_batch_trade_cpi's preflight had NO staleness gate at all --
+// staleness was only ever caught AFTER invoke_matcher_batch returned, inside
+// handle_batch_execute_zero_copy. So a stale market (base OR non-base) could reach and invoke an
+// untrusted matcher program before any rejection. Proves the new pre-CPI gate fires.
+#[test]
+fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_matured() {
+    const PRICE: u64 = 100;
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    env.configure_permissionless_resolve_with_cu(5, 5);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, PRICE);
+    env.configure_auth_mark_for_asset_as_admin(1, 1, PRICE);
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000_000);
+    env.deposit(&lp, lp_account, 1_000_000_000);
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+    let accounts = vec![
+        AccountMeta::new(taker.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(taker_account, false),
+        AccountMeta::new(lp_account, false),
+        AccountMeta::new_readonly(matcher_program, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(delegate, false),
+    ];
+    let sz = (5 * POS_SCALE) as i128;
+    let leg = percolator_prog::ix::BatchTradeCpiLeg {
+        asset_index: 1,
+        size_q: sz,
+        fee_bps: 0,
+        limit_price: PRICE,
+    };
+
+    // Non-vacuous fresh control: the real matcher fills a non-base BatchTradeCpi leg before any
+    // staleness. We only assert this does NOT fail with OracleStale specifically -- whatever else
+    // the real matcher's batch fill does with a single leg is orthogonal to this fix.
+    env.svm.expire_blockhash();
+    let fresh = env.send(
+        ProgInstruction::BatchTradeCpi { legs: vec![leg.clone()] },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(
+        !matches!(&fresh, Err(e) if e.contains("Custom(27)")),
+        "fresh non-base BatchTradeCpi must not fail with OracleStale before any staleness exists: {fresh:?}"
+    );
+
+    env.mutate_market(|cfg, _group| {
+        cfg.last_good_oracle_slot = 2;
+    });
+    {
+        let mut account = env.svm.get_account(&env.market).unwrap();
+        let mut profile = state::read_asset_oracle_profile(&account.data, 1).unwrap();
+        profile.last_good_oracle_slot = 7;
+        state::write_asset_oracle_profile(&mut account.data, 1, &profile).unwrap();
+        env.svm.set_account(env.market, account).unwrap();
+    }
+    env.svm.warp_to_slot(8);
+    let (stale_cfg, _stale_group) = env.market_state();
+    assert!(oracle_v16::permissionless_stale_matured(&stale_cfg, 8),
+        "test setup must make the base anchor resolve-matured");
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    env.svm.expire_blockhash();
+    let stale = env.send(
+        ProgInstruction::BatchTradeCpi { legs: vec![leg] },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(
+        stale.is_err() && stale.as_ref().unwrap_err().contains("Custom(27)"),
+        "base-stale non-base BatchTradeCpi must reject with OracleStale before matcher CPI: {stale:?}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before,
+        "matcher context must be untouched -- proves the real matcher CPI was never invoked");
+}
+
 // FIX W1 (upstream 4b8bb9fa, #152, CRITICAL): validate_matcher_tail rejected key-aliasing
 // tail accounts but never checked `is_signer`, so a hostile matcher received tail AccountInfos
 // with the caller's own is_signer flags forwarded verbatim -- letting a malicious LP-registered

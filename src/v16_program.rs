@@ -2935,11 +2935,12 @@ pub mod state {
     pub fn read_asset_effective_prices(
         data: &[u8],
         asset_indices: &[u16],
-    ) -> Result<(MarketModeV16, u64, alloc::vec::Vec<u64>), ProgramError> {
+    ) -> Result<(WrapperConfigV16, MarketModeV16, u64, alloc::vec::Vec<u64>), ProgramError> {
         if data.len() < MIN_MARKET_ACCOUNT_LEN {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         check_header(data, KIND_MARKET)?;
+        let config = read_wrapper_config_from_bytes(data)?;
         let wire = market_header(data)?;
         let engine_config = wire
             .config
@@ -2954,6 +2955,7 @@ pub mod state {
             prices.push(slot.asset.effective_price.get());
         }
         Ok((
+            config,
             decode_market_mode(wire.mode)?,
             wire.current_slot.get(),
             prices,
@@ -5837,16 +5839,17 @@ pub mod processor {
         )
     }
 
-    fn permissionless_resolve_matured_for_profile_view(
+    fn global_or_profile_resolve_matured_at_slot(
         cfg: &WrapperConfigV16,
         profile: &state::AssetOracleProfileV16,
-        group: &state::MarketViewMutV16<'_>,
+        now_slot: u64,
     ) -> bool {
-        cfg.permissionless_resolve_stale_slots != 0
-            && profile.last_good_oracle_slot != 0
-            && authenticated_market_slot_or_fallback_view(group)
-                .saturating_sub(profile.last_good_oracle_slot)
-                >= cfg.permissionless_resolve_stale_slots
+        oracle_v16::permissionless_stale_matured(cfg, now_slot)
+            || (oracle_v16::profile_is_price_managed(profile)
+                && cfg.permissionless_resolve_stale_slots != 0
+                && profile.last_good_oracle_slot != 0
+                && now_slot.saturating_sub(profile.last_good_oracle_slot)
+                    >= cfg.permissionless_resolve_stale_slots)
     }
 
     fn reject_permissionless_resolve_matured_live_view(
@@ -5864,11 +5867,12 @@ pub mod processor {
         profile: &state::AssetOracleProfileV16,
         group: &state::MarketViewMutV16<'_>,
     ) -> ProgramResult {
-        if !oracle_v16::profile_is_price_managed(profile) {
-            return reject_permissionless_resolve_matured_live_view(cfg, group);
-        }
         if group.header.mode == 0
-            && permissionless_resolve_matured_for_profile_view(cfg, profile, group)
+            && global_or_profile_resolve_matured_at_slot(
+                cfg,
+                profile,
+                authenticated_market_slot_or_fallback_view(group),
+            )
         {
             return Err(PercolatorError::OracleStale.into());
         }
@@ -8117,17 +8121,11 @@ pub mod processor {
             &cfg_pre,
             asset_index as usize,
         )?;
-        let stale_matured = if oracle_v16::profile_is_price_managed(&oracle_profile_pre) {
-            cfg_pre.permissionless_resolve_stale_slots != 0
-                && authenticated_slot_or_fallback(current_slot_pre)
-                    .saturating_sub(oracle_profile_pre.last_good_oracle_slot)
-                    >= cfg_pre.permissionless_resolve_stale_slots
-        } else {
-            oracle_v16::permissionless_stale_matured(
-                &cfg_pre,
-                authenticated_slot_or_fallback(current_slot_pre),
-            )
-        };
+        let stale_matured = global_or_profile_resolve_matured_at_slot(
+            &cfg_pre,
+            &oracle_profile_pre,
+            authenticated_slot_or_fallback(current_slot_pre),
+        );
         if stale_matured {
             return Err(PercolatorError::OracleStale.into());
         }
@@ -8606,13 +8604,37 @@ pub mod processor {
             asset_indices.push(leg.asset_index);
         }
         // One header/config parse for mode + slot + every leg's oracle price (avoids O(N^2)
-        // re-parsing the market once per leg).
-        let (mode_pre, _current_slot_pre, oracle_prices) = {
+        // re-parsing the market once per leg). W7: also gate the whole batch on base-or-profile
+        // permissionless-resolve stale maturity BEFORE the matcher CPI -- same predicate as the
+        // single-leg TradeCpi preflight and the shared trade/crank helper, so a stale base oracle
+        // freezes non-base legs too and a hostile matcher is never invoked once the market has
+        // matured stale (previously this preflight had NO staleness gate at all; staleness was
+        // only caught after the CPI returned, inside handle_batch_execute_zero_copy).
+        let (mode_pre, oracle_prices, stale_matured) = {
             let market_data = market_ai.try_borrow_data()?;
-            state::read_asset_effective_prices(&market_data, &asset_indices)?
+            let (cfg_pre, mode_pre, current_slot_pre, oracle_prices) =
+                state::read_asset_effective_prices(&market_data, &asset_indices)?;
+            let authenticated_slot = authenticated_slot_or_fallback(current_slot_pre);
+            let mut stale_matured = false;
+            for &asset_index in &asset_indices {
+                let oracle_profile_pre =
+                    read_oracle_profile_for_asset(&market_data, &cfg_pre, asset_index as usize)?;
+                if global_or_profile_resolve_matured_at_slot(
+                    &cfg_pre,
+                    &oracle_profile_pre,
+                    authenticated_slot,
+                ) {
+                    stale_matured = true;
+                    break;
+                }
+            }
+            (mode_pre, oracle_prices, stale_matured)
         };
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
+        }
+        if stale_matured {
+            return Err(PercolatorError::OracleStale.into());
         }
         let (account_a_header, account_a_owner) =
             state::read_portfolio_owner_preflight(&account_a_ai.try_borrow_data()?)?;
