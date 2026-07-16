@@ -8224,6 +8224,77 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
+// FIX W9 (upstream 0b5e3baa): CloseSlab must reject admin_dest aliasing market_ai. A market
+// account can be a signing system-created keypair; if marketauth is rotated to that same key,
+// admin_dest (the lamport destination) and market_ai (the slab being zeroed) become the SAME
+// AccountInfo. The zero-then-credit sequence at the end of handle_close_slab nets back to the
+// pre-close lamport balance (same underlying cell), but the intervening data-zero step still
+// destroys the slab contents -- leaving a program-owned, non-zero-lamport account with all-zero
+// data that the runtime will not purge (it never reaches an exit balance of 0).
+#[test]
+fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
+    let mut svm = LiteSVM::new();
+    let program_id = percolator_prog::id();
+    svm.add_program(program_id, &std::fs::read(program_path()).expect("read BPF"));
+    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("read token BPF"));
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let market = Keypair::new();
+    let mint = Pubkey::new_unique();
+    let params = V16CuMarketParams::default();
+    let (vault_authority, _) =
+        Pubkey::find_program_address(&[b"vault", market.pubkey().as_ref()], &program_id);
+    let vault = canonical_vault_ata(&vault_authority, &mint);
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_account(mint, Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(market.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; state::market_account_len_for_capacity(1).unwrap()], owner: program_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(vault, Account { lamports: 1_000_000_000, data: make_token_data(mint, vault_authority, 0), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+
+    send_tx(&mut svm, program_id, &payer, ProgInstruction::InitMarket {
+        max_portfolio_assets: params.max_portfolio_assets, h_min: params.h_min, h_max: params.h_max,
+        initial_price: params.initial_price, min_nonzero_mm_req: params.min_nonzero_mm_req,
+        min_nonzero_im_req: params.min_nonzero_im_req, maintenance_margin_bps: params.maintenance_margin_bps,
+        initial_margin_bps: params.initial_margin_bps, max_trading_fee_bps: params.max_trading_fee_bps,
+        trade_fee_base_bps: params.trade_fee_base_bps, liquidation_fee_bps: params.liquidation_fee_bps,
+        liquidation_fee_cap: params.liquidation_fee_cap, min_liquidation_abs: params.min_liquidation_abs,
+        max_price_move_bps_per_slot: params.max_price_move_bps_per_slot, max_accrual_dt_slots: params.max_accrual_dt_slots,
+        max_abs_funding_e9_per_slot: params.max_abs_funding_e9_per_slot, min_funding_lifetime_slots: params.min_funding_lifetime_slots,
+        max_account_b_settlement_chunks: params.max_account_b_settlement_chunks, max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
+        max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots, public_b_chunk_atoms: params.public_b_chunk_atoms,
+        maintenance_fee_per_slot: params.maintenance_fee_per_slot,
+    }, vec![
+        AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market.pubkey(), false), AccountMeta::new_readonly(mint, false),
+    ], &[&admin]).expect("init market");
+
+    svm.expire_blockhash();
+    send_tx(&mut svm, program_id, &payer, ProgInstruction::UpdateAuthority { new_pubkey: market.pubkey().to_bytes() }, vec![
+        AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market.pubkey(), true), AccountMeta::new(market.pubkey(), false),
+    ], &[&admin, &market]).expect("rotate marketauth to signing market key");
+
+    svm.expire_blockhash();
+    send_tx(&mut svm, program_id, &payer, ProgInstruction::ResolveMarket, vec![
+        AccountMeta::new(market.pubkey(), true), AccountMeta::new(market.pubkey(), false),
+    ], &[&market]).expect("market key can resolve after handoff");
+
+    let dest = Pubkey::new_unique();
+    svm.set_account(dest, Account { lamports: 1_000_000_000, data: make_token_data(mint, market.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    let market_before = svm.get_account(&market.pubkey()).unwrap();
+    let vault_before = svm.get_account(&vault).unwrap();
+    let dest_before = svm.get_account(&dest).unwrap();
+
+    svm.expire_blockhash();
+    let rejected = send_tx(&mut svm, program_id, &payer, ProgInstruction::CloseSlab, vec![
+        AccountMeta::new(market.pubkey(), true), AccountMeta::new(market.pubkey(), false), AccountMeta::new(vault, false),
+        AccountMeta::new_readonly(vault_authority, false), AccountMeta::new(dest, false), AccountMeta::new_readonly(spl_token::ID, false),
+    ], &[&market]);
+    assert!(rejected.is_err(), "CloseSlab must reject market-as-destination alias");
+    assert_eq!(svm.get_account(&market.pubkey()).unwrap(), market_before, "market-as-destination rejection leaves the slab initialized");
+    assert_eq!(svm.get_account(&vault).unwrap(), vault_before, "market-as-destination rejection leaves the vault open");
+    assert_eq!(svm.get_account(&dest).unwrap(), dest_before, "market-as-destination rejection pays no dust");
+}
+
 #[test]
 fn v16_audit_permissionless_reuse_rejects_zero_insurance_authority() {
     // W4 Finding F (F-REUSE-ZERO-AUTH): the retired-slot REUSE path must reject a zero domain
