@@ -540,8 +540,52 @@ fn kani_v16_matcher_return_accepts_only_bound_echoed_fills() {
     kani::cover!(result.is_ok());
 }
 
+// FIX W3 (upstream #206, pairs with engine E3 / #92): the wire format no
+// longer carries caller-supplied close_q/fee_bps -- liquidation size and fee
+// are fully engine-selected (v16.rs liquidate_account_not_atomic). The
+// payload shrinks from 53 to 29 bytes (1 tag + 1 action + 2 asset_index +
+// 8 now_slot + 16 funding_rate_e9 + 1 recovery_reason).
 #[kani::proof]
 fn kani_v16_permissionless_crank_decode_preserves_wire_fields() {
+    let action: u8 = kani::any();
+    let asset_index: u16 = kani::any();
+    let recovery_reason: u8 = kani::any();
+    let now_slot: u64 = kani::any();
+    let funding_rate_e9: i128 = kani::any();
+
+    let mut data = [0u8; 29];
+    data[0] = 5;
+    data[1] = action;
+    data[2..4].copy_from_slice(&asset_index.to_le_bytes());
+    data[4..12].copy_from_slice(&now_slot.to_le_bytes());
+    data[12..28].copy_from_slice(&funding_rate_e9.to_le_bytes());
+    data[28] = recovery_reason;
+
+    match Instruction::decode(&data).unwrap() {
+        Instruction::PermissionlessCrank {
+            action: got_action,
+            asset_index: got_asset,
+            now_slot: got_slot,
+            funding_rate_e9: got_rate,
+            recovery_reason: got_recovery,
+        } => {
+            assert_eq!(got_action, action);
+            assert_eq!(got_asset, asset_index);
+            assert_eq!(got_slot, now_slot);
+            assert_eq!(got_rate, funding_rate_e9);
+            assert_eq!(got_recovery, recovery_reason);
+        }
+        _ => unreachable!(),
+    }
+}
+
+// FIX W3 non-vacuity companion: proves the OLD (pre-fix, 53-byte) wire
+// payload -- the exact shape a keeper would have sent to control close_q/
+// fee_bps -- is now REJECTED by decode as trailing bytes, not silently
+// accepted with the extra 24 bytes ignored. This is the concrete "the
+// keeper-controlled-sizing attack surface is gone at the wire level" proof.
+#[kani::proof]
+fn kani_v16_permissionless_crank_rejects_legacy_close_q_fee_bps_wire_payload() {
     let action: u8 = kani::any();
     let asset_index: u16 = kani::any();
     let recovery_reason: u8 = kani::any();
@@ -550,36 +594,18 @@ fn kani_v16_permissionless_crank_decode_preserves_wire_fields() {
     let close_q: u128 = kani::any();
     let fee_bps: u64 = kani::any();
 
-    let mut data = [0u8; 53];
-    data[0] = 5;
-    data[1] = action;
-    data[2..4].copy_from_slice(&asset_index.to_le_bytes());
-    data[4..12].copy_from_slice(&now_slot.to_le_bytes());
-    data[12..28].copy_from_slice(&funding_rate_e9.to_le_bytes());
-    data[28..44].copy_from_slice(&close_q.to_le_bytes());
-    data[44..52].copy_from_slice(&fee_bps.to_le_bytes());
-    data[52] = recovery_reason;
+    // Reconstruct the OLD 53-byte layout byte-for-byte.
+    let mut legacy = [0u8; 53];
+    legacy[0] = 5;
+    legacy[1] = action;
+    legacy[2..4].copy_from_slice(&asset_index.to_le_bytes());
+    legacy[4..12].copy_from_slice(&now_slot.to_le_bytes());
+    legacy[12..28].copy_from_slice(&funding_rate_e9.to_le_bytes());
+    legacy[28..44].copy_from_slice(&close_q.to_le_bytes());
+    legacy[44..52].copy_from_slice(&fee_bps.to_le_bytes());
+    legacy[52] = recovery_reason;
 
-    match Instruction::decode(&data).unwrap() {
-        Instruction::PermissionlessCrank {
-            action: got_action,
-            asset_index: got_asset,
-            now_slot: got_slot,
-            funding_rate_e9: got_rate,
-            close_q: got_close,
-            fee_bps: got_fee,
-            recovery_reason: got_recovery,
-        } => {
-            assert_eq!(got_action, action);
-            assert_eq!(got_asset, asset_index);
-            assert_eq!(got_slot, now_slot);
-            assert_eq!(got_rate, funding_rate_e9);
-            assert_eq!(got_close, close_q);
-            assert_eq!(got_fee, fee_bps);
-            assert_eq!(got_recovery, recovery_reason);
-        }
-        _ => unreachable!(),
-    }
+    assert!(Instruction::decode(&legacy).is_err());
 }
 
 // v17 auth overhaul: UpdateAuthority (tag 32) now rotates ONLY the single
@@ -1068,8 +1094,6 @@ fn kani_v16_trade_and_crank_payloads_reject_trailing_byte() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         extra,

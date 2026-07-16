@@ -3216,8 +3216,6 @@ fn v16_bpf_resolved_terminal_insurance_drains_dynamic_domain_after_positions_clo
             asset_index: 1,
             now_slot: 10,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -3402,8 +3400,6 @@ fn v16_bpf_permissionless_append_activation_uses_authenticated_slot() {
             asset_index: 0,
             now_slot: 100,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -3470,8 +3466,6 @@ fn v16_bpf_permissionless_reuse_activation_uses_authenticated_slot() {
             asset_index: 0,
             now_slot: 4,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -3506,8 +3500,6 @@ fn v16_bpf_privileged_retire_uses_authenticated_slot() {
             asset_index: 0,
             now_slot: 3,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -3549,8 +3541,6 @@ fn v16_bpf_privileged_reactivate_uses_authenticated_slot() {
             asset_index: 0,
             now_slot: 4,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -3629,8 +3619,6 @@ fn v16_bpf_permissionless_oracle_liquidation_uses_only_its_own_domain_insurance(
                 asset_index: 3,
                 now_slot,
                 funding_rate_e9: 0,
-                close_q: 0,
-                fee_bps: 0,
                 recovery_reason: 0,
             },
         );
@@ -3652,8 +3640,6 @@ fn v16_bpf_permissionless_oracle_liquidation_uses_only_its_own_domain_insurance(
             asset_index: 3,
             now_slot: 7,
             funding_rate_e9: 0,
-            close_q: 2 * POS_SCALE,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -4229,8 +4215,6 @@ fn v16_bpf_perps_positive_smoke_cross_margin_pnl_convert_close_and_withdraw() {
                 asset_index,
                 now_slot: 2,
                 funding_rate_e9: 0,
-                close_q: 0,
-                fee_bps: 0,
                 recovery_reason: 0,
             },
         );
@@ -4390,8 +4374,6 @@ fn v16_bpf_cross_margin_positive_pnl_allows_trading_negative_leg_before_convert(
                 asset_index,
                 now_slot: 2,
                 funding_rate_e9: 0,
-                close_q: 0,
-                fee_bps: 0,
                 recovery_reason: 0,
             },
         );
@@ -4582,8 +4564,6 @@ fn run_source_credit_watermark_trade_case(
                 asset_index,
                 now_slot: 2,
                 funding_rate_e9: 0,
-                close_q: 0,
-                fee_bps: 0,
                 recovery_reason: 0,
             },
         );
@@ -4797,8 +4777,6 @@ fn v16_bpf_cross_margin_positive_pnl_allows_backed_risk_increase_on_negative_leg
                 asset_index,
                 now_slot: 2,
                 funding_rate_e9: 0,
-                close_q: 0,
-                fee_bps: 0,
                 recovery_reason: 0,
             },
         );
@@ -5023,8 +5001,6 @@ fn v16_bpf_permissionless_crank_computes_funding_from_internal_mark_premium() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5035,8 +5011,6 @@ fn v16_bpf_permissionless_crank_computes_funding_from_internal_mark_premium() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5058,8 +5032,6 @@ fn v16_bpf_permissionless_crank_computes_funding_from_internal_mark_premium() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5118,8 +5090,6 @@ fn v16_bpf_existing_funding_ledger_refreshes_and_converts_between_sides() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5139,8 +5109,6 @@ fn v16_bpf_existing_funding_ledger_refreshes_and_converts_between_sides() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5222,8 +5190,6 @@ fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
                 asset_index: 0,
                 now_slot: 3 + nonce,
                 funding_rate_e9: 0,
-                close_q: 0,
-                fee_bps: 0,
                 recovery_reason: 0,
             },
         );
@@ -5236,8 +5202,6 @@ fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
             asset_index: 1,
             now_slot: 3,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5378,8 +5342,6 @@ fn v16_bpf_underfunded_flat_sync_sweeps_remaining_capital_once() {
             asset_index: 0,
             now_slot: 10,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5712,8 +5674,6 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: POS_SCALE,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5766,8 +5726,6 @@ fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5779,8 +5737,6 @@ fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
             asset_index: 0,
             now_slot: 3,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5855,8 +5811,6 @@ fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5868,8 +5822,6 @@ fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
             asset_index: 0,
             now_slot: 3,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -5944,8 +5896,6 @@ fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6021,8 +5971,6 @@ fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6105,8 +6053,6 @@ fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6117,8 +6063,6 @@ fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6245,8 +6189,6 @@ fn v16_bpf_liquidatable_solvent_account_can_risk_reduce_without_insurance_drain(
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6258,8 +6200,6 @@ fn v16_bpf_liquidatable_solvent_account_can_risk_reduce_without_insurance_drain(
             asset_index: 0,
             now_slot: 3,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6340,8 +6280,6 @@ fn v16_bpf_no_cranker_liquidation_rejects_invalid_final_market_shape() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: POS_SCALE,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         vec![
@@ -6412,8 +6350,6 @@ fn v16_bpf_cranker_reward_liquidation_rejects_invalid_shape_without_paying_rewar
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: POS_SCALE,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         vec![
@@ -6470,8 +6406,6 @@ fn v16_bpf_full_14_leg_refresh_crank_is_under_tx_limit() {
             asset_index: 0,
             now_slot: 16,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6516,8 +6450,6 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
             asset_index: 0,
             now_slot: 16,
             funding_rate_e9: 0,
-            close_q: 10 * POS_SCALE,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6909,8 +6841,6 @@ fn v16_cu_permissionless_crank_refresh_is_bounded() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -6935,8 +6865,6 @@ fn v16_bpf_permissionless_crank_uses_authenticated_clock_slot_not_caller_slot() 
             asset_index: 0,
             now_slot: spoofed_slot,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -7098,8 +7026,6 @@ fn run_hybrid_fresh_oracle_trade_case(dt: u64, oracle_leg_count: u8, invert: u8)
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         &fresh_oracles,
@@ -7414,8 +7340,6 @@ fn run_hybrid_fresh_oracle_production_risk_trade_case(
             asset_index,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         &[fresh_leg0, fresh_leg1, fresh_leg2],
@@ -7600,8 +7524,6 @@ fn v16_bpf_hybrid_mark_uses_ewma_after_hours_then_oracle_when_fresh() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         &[fresh_leg0, fresh_leg1, fresh_leg2],
@@ -7675,8 +7597,6 @@ fn v16_bpf_hybrid_mark_uses_ewma_after_hours_then_oracle_when_fresh() {
             asset_index: 0,
             now_slot: 11,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
         &[normal_leg0, normal_leg1, normal_leg2],
@@ -7817,8 +7737,6 @@ fn v16_bpf_auth_mark_target_effective_lag_counts_toward_liquidation_health() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -7854,8 +7772,6 @@ fn v16_bpf_auth_mark_target_effective_lag_counts_toward_liquidation_health() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: POS_SCALE,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -7880,8 +7796,6 @@ fn v16_cu_crank_cost_is_account_local_after_many_portfolios() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -7900,8 +7814,6 @@ fn v16_cu_crank_cost_is_account_local_after_many_portfolios() {
             asset_index: 0,
             now_slot: 2,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -8051,8 +7963,6 @@ fn v16_bpf_accounting_ledger_tags_are_bounded_and_update_state() {
             asset_index: 0,
             now_slot: 0,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -8805,8 +8715,7 @@ fn v16_fzs1_real_partial_adl_flat_accrual_mints_under_asymmetric_a() {
         env.crank(
             acct,
             ProgInstruction::PermissionlessCrank {
-                action: 0, asset_index: 0, now_slot: 1, funding_rate_e9: 0,
-                close_q: 0, fee_bps: 0, recovery_reason: 0,
+                action: 0, asset_index: 0, now_slot: 1, funding_rate_e9: 0, recovery_reason: 0,
             },
         );
     }
@@ -8819,8 +8728,7 @@ fn v16_fzs1_real_partial_adl_flat_accrual_mints_under_asymmetric_a() {
         env.crank(
             acct,
             ProgInstruction::PermissionlessCrank {
-                action: 0, asset_index: 0, now_slot: 2, funding_rate_e9: 0,
-                close_q: 0, fee_bps: 0, recovery_reason: 0,
+                action: 0, asset_index: 0, now_slot: 2, funding_rate_e9: 0, recovery_reason: 0,
             },
         );
     }
@@ -9030,8 +8938,6 @@ fn v16_hlock_auto_clears_when_last_negative_pnl_account_settles() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -9092,8 +8998,6 @@ fn v16_hlock_stays_set_while_any_negative_pnl_account_remains() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );
@@ -9120,8 +9024,6 @@ fn v16_hlock_stays_set_while_any_negative_pnl_account_remains() {
             asset_index: 0,
             now_slot: 1,
             funding_rate_e9: 0,
-            close_q: 0,
-            fee_bps: 0,
             recovery_reason: 0,
         },
     );

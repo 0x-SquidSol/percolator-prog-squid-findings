@@ -3540,13 +3540,17 @@ pub mod ix {
         Withdraw {
             amount: u128,
         },
+        /// FIX W3 (upstream #206, pairs with engine E3 / upstream #92): liquidation
+        /// size and fee are engine-selected (`liquidation_engine_close_request_q` +
+        /// config-only `fee_bps`, v16.rs `liquidate_account_not_atomic`) -- the wire
+        /// format no longer accepts caller-supplied `close_q`/`fee_bps`, closing the
+        /// "min-fee chunking" exploit where a keeper could pick a tiny close_q to
+        /// under-pay the liquidation fee while still making forward progress.
         PermissionlessCrank {
             action: u8,
             asset_index: u16,
             now_slot: u64,
             funding_rate_e9: i128,
-            close_q: u128,
-            fee_bps: u64,
             recovery_reason: u8,
         },
         TradeNoCpi {
@@ -3866,8 +3870,6 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     funding_rate_e9: read_i128(&mut rest)?,
-                    close_q: read_u128(&mut rest)?,
-                    fee_bps: read_u64(&mut rest)?,
                     recovery_reason: read_u8(&mut rest)?,
                 },
                 6 => Self::TradeNoCpi {
@@ -4211,8 +4213,6 @@ pub mod ix {
                     asset_index,
                     now_slot,
                     funding_rate_e9,
-                    close_q,
-                    fee_bps,
                     recovery_reason,
                 } => {
                     out.push(5);
@@ -4220,8 +4220,6 @@ pub mod ix {
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, now_slot);
                     push_i128(&mut out, funding_rate_e9);
-                    push_u128(&mut out, close_q);
-                    push_u64(&mut out, fee_bps);
                     out.push(recovery_reason);
                 }
                 Self::TradeNoCpi {
@@ -6535,8 +6533,6 @@ pub mod processor {
                 asset_index,
                 now_slot,
                 funding_rate_e9,
-                close_q,
-                fee_bps,
                 recovery_reason,
             } => handle_permissionless_crank(
                 program_id,
@@ -6545,8 +6541,6 @@ pub mod processor {
                 asset_index,
                 now_slot,
                 funding_rate_e9,
-                close_q,
-                fee_bps,
                 recovery_reason,
             ),
             Instruction::TradeNoCpi {
@@ -12330,15 +12324,10 @@ pub mod processor {
         asset_index: u16,
         now_slot: u64,
         funding_rate_e9: i128,
-        close_q: u128,
-        fee_bps: u64,
         recovery_reason: u8,
         max_market_slots: usize,
     ) -> ProgramResult {
         if funding_rate_e9 != 0 || recovery_reason != 0 {
-            return Err(PercolatorError::InvalidInstruction.into());
-        }
-        if action == 1 && fee_bps != 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         if action > 2 {
@@ -12356,10 +12345,12 @@ pub mod processor {
             }
             let crank_action = match action {
                 0 => PermissionlessCrankActionV16::Refresh,
+                // FIX W3 (upstream #206, pairs with engine E3 / #92): close_q and
+                // fee_bps are no longer caller-supplied -- the engine selects the
+                // liquidation size (liquidation_engine_close_request_q) and always
+                // reads the fee rate from config inside liquidate_account_not_atomic.
                 1 => PermissionlessCrankActionV16::Liquidate(percolator::LiquidationRequestV16 {
                     asset_index: asset_index_usize,
-                    close_q,
-                    fee_bps: group.header.config.liquidation_fee_bps.get(),
                 }),
                 2 => PermissionlessCrankActionV16::SettleB {
                     asset_index: asset_index_usize,
@@ -12582,8 +12573,6 @@ pub mod processor {
         asset_index: u16,
         now_slot: u64,
         funding_rate_e9: i128,
-        close_q: u128,
-        fee_bps: u64,
         recovery_reason: u8,
     ) -> ProgramResult {
         let owner = account(accounts, 0)?;
@@ -12605,8 +12594,6 @@ pub mod processor {
             asset_index,
             now_slot,
             funding_rate_e9,
-            close_q,
-            fee_bps,
             recovery_reason,
             max_market_slots,
         )

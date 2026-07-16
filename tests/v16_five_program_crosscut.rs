@@ -837,7 +837,9 @@ impl CrosscutEnv {
     }
 
     /// PermissionlessCrank on CROSSCUT_ASSET (action 0 = refresh, 1 = liquidate).
-    fn crank(&mut self, portfolio: Pubkey, action: u8, now_slot: u64, close_q: u128) -> Result<(), TransactionError> {
+    /// FIX W3 (upstream #206, pairs with engine E3 / #92): no caller-supplied
+    /// close_q -- the engine selects the liquidation size.
+    fn crank(&mut self, portfolio: Pubkey, action: u8, now_slot: u64) -> Result<(), TransactionError> {
         let wix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -850,8 +852,6 @@ impl CrosscutEnv {
                 asset_index: CROSSCUT_ASSET,
                 now_slot,
                 funding_rate_e9: 0,
-                close_q,
-                fee_bps: 0,
                 recovery_reason: 0,
             }
             .encode(),
@@ -1988,8 +1988,8 @@ fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i1
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         env.accrue_mark(slot, price);
-        let _ = env.crank(wa, 0, slot, 0);
-        let _ = env.crank(la, 0, slot, 0);
+        let _ = env.crank(wa, 0, slot);
+        let _ = env.crank(la, 0, slot);
     }
 
     let ctx = env.setup_stake_pool(flush_amount);
@@ -1997,9 +1997,9 @@ fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i1
 
     if flush_first {
         env.stake_flush(&ctx, flush_amount).expect("flush");
-        env.crank(wa, 1, 30, POS_SCALE).expect("liquidate bankrupt short");
+        env.crank(wa, 1, 30).expect("liquidate bankrupt short");
     } else {
-        env.crank(wa, 1, 30, POS_SCALE).expect("liquidate bankrupt short");
+        env.crank(wa, 1, 30).expect("liquidate bankrupt short");
         env.stake_flush(&ctx, flush_amount).expect("flush");
     }
 

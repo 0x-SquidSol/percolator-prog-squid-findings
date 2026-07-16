@@ -325,7 +325,7 @@ impl Env {
 
     fn crank(&mut self, portfolio: Pubkey, action: u8, now_slot: u64) -> Result<(), TransactionError> {
         self.try_send(
-            ProgInstruction::PermissionlessCrank { action, asset_index: ASSET, now_slot, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 },
+            ProgInstruction::PermissionlessCrank { action, asset_index: ASSET, now_slot, funding_rate_e9: 0, recovery_reason: 0 },
             vec![AccountMeta::new(self.payer.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(portfolio, false)],
             &[],
         )
@@ -374,16 +374,6 @@ impl Env {
         )
     }
 
-    /// Generic permissionless crank with explicit action/fee_bps/close_q (for the
-    /// keeper-branch matrix: bad action tag, action-1-with-fee reject, SettleB no-op).
-    fn try_crank_full(&mut self, portfolio: Pubkey, action: u8, now_slot: u64, fee_bps: u64, close_q: u128) -> Result<(), TransactionError> {
-        self.try_send(
-            ProgInstruction::PermissionlessCrank { action, asset_index: ASSET, now_slot, funding_rate_e9: 0, close_q, fee_bps, recovery_reason: 0 },
-            vec![AccountMeta::new(self.payer.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(portfolio, false)],
-            &[],
-        )
-    }
-
     fn resolve(&mut self) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
         self.try_send(
@@ -393,10 +383,12 @@ impl Env {
         )
     }
 
-    /// Permissionless liquidation crank (action 1) on `victim`, closing `close_q`.
-    fn try_liquidate(&mut self, victim: Pubkey, close_q: u128, now_slot: u64) -> Result<(), TransactionError> {
+    /// Permissionless liquidation crank (action 1) on `victim`. FIX W3 (upstream
+    /// #206, pairs with engine E3 / #92): the close size is no longer a caller
+    /// argument -- the engine selects it (liquidation_engine_close_request_q).
+    fn try_liquidate(&mut self, victim: Pubkey, now_slot: u64) -> Result<(), TransactionError> {
         self.try_send(
-            ProgInstruction::PermissionlessCrank { action: 1, asset_index: ASSET, now_slot, funding_rate_e9: 0, close_q, fee_bps: 0, recovery_reason: 0 },
+            ProgInstruction::PermissionlessCrank { action: 1, asset_index: ASSET, now_slot, funding_rate_e9: 0, recovery_reason: 0 },
             vec![AccountMeta::new(self.payer.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(victim, false)],
             &[],
         )
@@ -974,7 +966,7 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
         let _ = env.crank(wa, 0, slot);
         let _ = env.crank(la, 0, slot);
     }
-    env.try_liquidate(wa, size as u128, 30).expect("liquidation of the bankrupt short must succeed");
+    env.try_liquidate(wa, 30).expect("liquidation of the bankrupt short must succeed");
 
     // EXECUTED-GUARD (load-bearing): the liquidation actually fired — the toxic
     // leg is CLOSED (not merely "not grown"). Without this a silent no-op would
@@ -1026,7 +1018,7 @@ fn adv_zero_insurance_self_liquidation_no_net_extraction() {
         let _ = env.crank(wa, 0, slot);
         let _ = env.crank(la, 0, slot);
     }
-    env.try_liquidate(wa, size as u128, 30).expect("liquidation of the bankrupt short must succeed");
+    env.try_liquidate(wa, 30).expect("liquidation of the bankrupt short must succeed");
 
     // EXECUTED-GUARD: liquidation fired — toxic leg CLOSED. With zero insurance the
     // uncovered loss is socialized via the source-credit haircut / ADL path (never
@@ -1248,8 +1240,15 @@ fn adv_unmatured_pnl_public_interface_matrix_no_extraction() {
 // PnL, and the policy/action tag is validated.
 // v12: test_attack_unmatured_pnl_keeper_branch_matrix_no_extraction (archive L1204-1319).
 // v16 maps v12 policy tags onto crank actions 0=Refresh, 1=Liquidate, 2=SettleB;
-// action>2 and action==1-with-fee are rejected at InvalidInstruction(9)
-// (v16_program.rs:11184-11188).
+// action>2 is rejected at InvalidInstruction(9) (v16_program.rs:11184-11188).
+// FIX W3 (upstream #206, pairs with engine E3 / #92): the v12-derived
+// "action==1-with-caller-fee is rejected at runtime" sub-case is gone -- the
+// wire format no longer HAS a caller-supplied fee_bps/close_q field for
+// PermissionlessCrank, so that shape of instruction cannot be constructed at
+// all now (a compile-time guarantee, strictly stronger than the old runtime
+// InvalidInstruction check). See v16_wrapper_permissionless_crank_rejects_w3_legacy_wire_fields
+// in tests/v16_wrapper.rs for the non-vacuous proof that the OLD (wider) wire
+// payload is now rejected as a trailing-bytes decode error.
 // ===========================================================================
 #[test]
 fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
@@ -1268,21 +1267,15 @@ fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
         let (mut env, _user, ua, _, _) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
         env.warp(20);
-        assert_custom(env.try_crank_full(ua, 3, 20, 0, 0), E_INVALID_INSTRUCTION, "crank with bad action tag (>2)");
+        assert_custom(env.crank(ua, 3, 20), E_INVALID_INSTRUCTION, "crank with bad action tag (>2)");
         assert_eq!(env.portfolio(ua).capital, cap, "rejected bad-tag crank moved capital");
     }
-    // (3) Liquidate (action 1) with a non-zero fee_bps -> InvalidInstruction(9).
-    {
-        let (mut env, _user, ua, _, _) = unmatured_fixture();
-        env.warp(20);
-        assert_custom(env.try_crank_full(ua, 1, 20, 5, POS_SCALE), E_INVALID_INSTRUCTION, "liquidate crank with non-zero fee_bps");
-    }
-    // (4) SettleB (action 2) with close_q == 0 decodes and no-ops; unlocks nothing.
+    // (3) SettleB (action 2) with no B-state decodes and no-ops; unlocks nothing.
     {
         let (mut env, _user, ua, _, _) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
         env.warp(20);
-        let _ = env.try_crank_full(ua, 2, 20, 0, 0); // no-op branch (close_q == 0)
+        let _ = env.crank(ua, 2, 20); // no-op branch (no pending B-settlement state)
         assert_eq!(env.portfolio(ua).capital, cap, "SettleB no-op unlocked capital");
     }
     // (5) Resolved-market crank: after ResolveMarket the market is no longer Live;
