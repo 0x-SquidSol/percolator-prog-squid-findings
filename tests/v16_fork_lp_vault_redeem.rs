@@ -1220,3 +1220,113 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
         "CloseSlab must now stay permanently blocked by the dead-share floor's stranded vault dust: {res:?}"
     );
 }
+
+// ── ExecuteRedemption proportional solvency gate (fixes the over-broad
+// positive_claim_bound_num!=0 / exact_positive_claim_num!=0 hard-reject) ────
+//
+// Before the fix, handle_execute_redemption's inline withdraw gate rejected
+// ANY redemption on a domain carrying a live source-credit lien outright,
+// regardless of whether that lien stayed fully covered afterward -- so once
+// any lien existed on an LP-vault domain (e.g. from real trading activity
+// against that backing), EVERY redemption on it was permanently bricked,
+// even though the domain's own already-present, already-correct proportional
+// check (mirroring handle_withdraw_backing_bucket's admin-path watermark
+// gate -- see the "RESYNC 5ebd136 DUAL withdraw-gate" block) would have
+// allowed it. The fix deletes the two over-broad clauses so that proportional
+// check becomes the real (and only) solvency gate, matching the admin path
+// byte-for-byte.
+//
+// Hand-crafts a source-credit lien directly on the market account (same
+// technique as `seed_earnings`/`set_c_tot_for_test` above, and the same
+// pattern already used for the admin-path equivalent in
+// tests/v16_wrapper.rs::v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing)
+// since no instruction in this build can open a real position against LP
+// vault backing; the lien fields themselves are exactly what the gate reads,
+// so this exercises the real gate logic precisely.
+
+/// Sets a source-credit lien on `domain`: `positive_claim_bound_num` =
+/// `exact_positive_claim_num` = `claim_atoms * BOUND_SCALE`, `credit_rate_num`
+/// = `CREDIT_RATE_SCALE` (i.e. a claim that is, at the moment it's set, fully
+/// covered by whatever `fresh_reserved_backing_num` already holds), and bumps
+/// the header's `pnl_pos_bound_tot_num` / `pnl_pos_bound_tot` aggregate to
+/// stay consistent with `validate_shape`'s `derived_bound ==
+/// pnl_pos_bound_tot` check (mirrors the admin-path test's RESYNC comment).
+fn set_source_credit_lien_for_test(env: &mut Env, domain: u16, claim_atoms: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    let claim_num = claim_atoms * percolator::BOUND_SCALE;
+    group.source_credit[domain as usize].positive_claim_bound_num = claim_num;
+    group.source_credit[domain as usize].exact_positive_claim_num = claim_num;
+    group.source_credit[domain as usize].credit_rate_num = percolator::CREDIT_RATE_SCALE;
+    group.pnl_pos_bound_tot_num = claim_num;
+    group.pnl_pos_bound_tot = claim_atoms;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+fn source_credit_fresh_reserved_atoms(env: &Env, domain: u16) -> u128 {
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    group.source_credit[domain as usize].fresh_reserved_backing_num / percolator::BOUND_SCALE
+}
+
+#[test]
+fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_redemption() {
+    // Two depositors share the vault's DOMAIN backing pool:
+    //   D1 (genesis): deposits DEPOSIT (1_000_000), mints MINTED (999_000).
+    //   D2: deposits 2*DEPOSIT (2_000_000), mints 2_000_000 (1:1, not genesis).
+    // Total pool backing = 3_000_000 atoms (no earnings seeded, so 1:1 with
+    // deposited atoms).
+    let mut env = setup_vault(0); // immediate cooldown
+    let d1 = new_depositor(&mut env, DEPOSIT);
+    let d2 = new_depositor(&mut env, 2 * DEPOSIT);
+    let total_backing = source_credit_fresh_reserved_atoms(&env, DOMAIN);
+    assert_eq!(total_backing, DEPOSIT + 2 * DEPOSIT, "sanity: pool backing == sum of deposits (no earnings)");
+
+    // Hand-craft a live lien for 2_000_000 atoms -- fully covered right now
+    // (3_000_000 available >= 2_000_000 claimed), but leaves only 1_000_000
+    // atoms of headroom for redemptions before the domain would go
+    // under-backed.
+    let claim_atoms: u128 = 2 * DEPOSIT;
+    set_source_credit_lien_for_test(&mut env, DOMAIN, claim_atoms);
+
+    // D1 redeems its full MINTED (999_000) balance. Post-redemption backing:
+    // 3_000_000 - 999_000 = 2_001_000, still >= the 2_000_000 claim bound
+    // (1_000 atoms of margin) -- fully covered, so this MUST SUCCEED even
+    // though positive_claim_bound_num != 0 on this domain. Before the fix,
+    // this redemption would have been rejected outright by the over-broad
+    // `positive_claim_bound_num != 0` clause regardless of coverage.
+    request(&mut env, &d1, MINTED).expect("request d1");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d1).expect(
+        "ExecuteRedemption against a fully-covered lien must succeed (proportional gate, not a hard lien-exists reject)",
+    );
+    assert_eq!(tok(&env.svm, d1.dest), MINTED as u64, "d1 paid in full");
+    let after_d1 = source_credit_fresh_reserved_atoms(&env, DOMAIN);
+    assert_eq!(after_d1, total_backing - MINTED, "backing decremented by exactly d1's principal");
+    assert!(after_d1 >= claim_atoms, "domain must remain fully covered after d1's redemption");
+
+    // D2 now tries to redeem 100_000 of its 2_000_000 shares. Post-redemption
+    // backing would be 2_001_000 - 100_000 = 1_901_000 < the 2_000_000 claim
+    // bound -- UNDER-BACKED -- so this MUST be REJECTED. This proves the
+    // proportional gate still protects solvency: the fix only removed the
+    // over-broad "any lien exists" reject, not the actual coverage check.
+    request(&mut env, &d2, 100_000).expect("request d2 (partial)");
+    env.svm.expire_blockhash();
+    let res = execute(&mut env, &d2);
+    assert!(
+        res.is_err(),
+        "ExecuteRedemption that would leave the domain under-backed relative to its claim must be rejected: {res:?}"
+    );
+    assert_eq!(tok(&env.svm, d2.dest), 0, "no payout on the rejected under-backed redemption");
+    let after_rejected = source_credit_fresh_reserved_atoms(&env, DOMAIN);
+    assert_eq!(after_rejected, after_d1, "rejected redemption must not mutate backing state (atomic rollback)");
+
+    // Sanity: the SAME 100_000 request, once the lien is relaxed back to 0,
+    // executes cleanly -- confirms the D2 rejection above was specifically
+    // the solvency gate (not some unrelated account/setup issue) and that
+    // the pending redemption request survives a prior rejected execute.
+    set_source_credit_lien_for_test(&mut env, DOMAIN, 0);
+    env.svm.expire_blockhash();
+    execute(&mut env, &d2).expect("same request executes once the lien no longer makes it under-backed");
+    assert_eq!(tok(&env.svm, d2.dest), 100_000, "d2 paid once solvency is restored");
+}

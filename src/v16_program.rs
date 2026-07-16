@@ -13428,11 +13428,21 @@ pub mod processor {
             if principal_portion > ledger.total_principal_atoms {
                 return Err(PercolatorError::EngineCounterUnderflow.into());
             }
-            // Same withdrawability gate as handle_withdraw_backing_bucket.
-            // backing_num is derived from principal_portion; vault check uses full atoms.
-            if source.positive_claim_bound_num != 0
-                || source.exact_positive_claim_num != 0
-                || bucket.status != BackingBucketStatusV16::Fresh
+            // Same withdrawability gate as handle_withdraw_backing_bucket
+            // (percolator::v16::withdraw_fresh_counterparty_backing_not_atomic /
+            // prepare_counterparty_backing_withdraw_delta, v16.rs): Fresh
+            // status + availability only. A live source-credit lien
+            // (positive_claim_bound_num != 0) does NOT itself block a
+            // redemption -- it is the PROPORTIONAL stay-fully-backed check
+            // below (the "RESYNC 5ebd136 DUAL withdraw-gate" block, which
+            // recomputes credit_rate_num on the POST-decrement source and
+            // requires it stay == CREDIT_RATE_SCALE) that enforces solvency,
+            // exactly mirroring the admin withdraw path. Only a withdrawal
+            // that would leave the domain under-backed relative to its
+            // outstanding claim is rejected; a withdrawal against a
+            // fully-covered lien is not. backing_num is derived from
+            // principal_portion; vault check uses full atoms.
+            if bucket.status != BackingBucketStatusV16::Fresh
                 || bucket.fresh_unliened_backing_num < backing_num
                 || source.fresh_reserved_backing_num < backing_num
                 || atoms > group.header.vault.get()
