@@ -9165,3 +9165,224 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         );
     }
 }
+
+// FIX W2 (upstream #147 + #160): TradeCpi/BatchTradeCpi invoked the untrusted external matcher
+// with NO per-asset lifecycle check at all. The engine's own post-CPI gate
+// (require_asset_risk_change_allowed) still rejects a risk-increasing trade on a non-Active
+// asset, so this is defense-in-depth, not a fund-safety hole by itself -- the observable this
+// test targets is specifically "did the matcher CPI run", proven via the matcher program's
+// pubkey being absent from the tx error/logs (a hostile-or-honest matcher's own
+// "Program <pubkey> invoke"/"success" log lines would appear there if the CPI happened) plus
+// byte-identical account state before/after. A code-only assertion on the final error code would
+// be vacuous here since both the fixed and unfixed paths end in the SAME Custom(21)
+// (EngineLockActive) -- the engine's own post-CPI gate produces that error regardless of whether
+// this wrapper-side preflight exists.
+#[test]
+fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
+    for lifecycle_case in ["Retired", "DrainOnly"] {
+        let mut env = V16CuEnv::new();
+        let creator = Keypair::new();
+        env.update_market_init_fee_policy_with_cu(1);
+        env.svm.warp_to_slot(1);
+        env.activate_permissionless_asset_with_fee(
+            &creator,
+            1,
+            1,
+            100,
+            creator.pubkey(),
+            creator.pubkey(),
+            creator.pubkey(),
+            creator.pubkey(),
+            1,
+        );
+        match lifecycle_case {
+            "Retired" => {
+                env.svm.warp_to_slot(3);
+                env.update_asset_lifecycle_as_admin_with_cu(
+                    percolator_prog::processor::ASSET_ACTION_RETIRE,
+                    1,
+                    3,
+                    0,
+                );
+                assert_eq!(
+                    env.market_state().1.assets[1].lifecycle,
+                    AssetLifecycleV16::Retired
+                );
+            }
+            "DrainOnly" => {
+                env.update_asset_lifecycle_as_admin_with_cu(
+                    percolator_prog::processor::ASSET_ACTION_DRAIN_ONLY,
+                    1,
+                    0,
+                    0,
+                );
+                assert_eq!(
+                    env.market_state().1.assets[1].lifecycle,
+                    AssetLifecycleV16::DrainOnly
+                );
+            }
+            _ => unreachable!(),
+        }
+        let matcher_program = Pubkey::new_unique();
+        let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+        env.svm.add_program(matcher_program, &matcher_bytes);
+        let taker = Keypair::new();
+        let lp = Keypair::new();
+        let taker_account = env.create_portfolio(&taker);
+        let lp_account = env.create_portfolio(&lp);
+        env.deposit(&taker, taker_account, 1_000_000);
+        env.deposit(&lp, lp_account, 1_000_000);
+        let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+        let matcher_key_str = matcher_program.to_string();
+        for route_is_batch in [false, true] {
+            let market_before = env.svm.get_account(&env.market).unwrap();
+            let taker_before = env.svm.get_account(&taker_account).unwrap();
+            let lp_before = env.svm.get_account(&lp_account).unwrap();
+            env.svm.expire_blockhash();
+            let accounts = vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(lp_account, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ];
+            let err = if route_is_batch {
+                env.send(
+                    ProgInstruction::BatchTradeCpi {
+                        legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+                            asset_index: 1,
+                            size_q: POS_SCALE as i128,
+                            fee_bps: 0,
+                            limit_price: 0,
+                        }],
+                    },
+                    accounts,
+                    &[&taker],
+                )
+            } else {
+                env.send(
+                    ProgInstruction::TradeCpi {
+                        asset_index: 1,
+                        size_q: POS_SCALE as i128,
+                        fee_bps: 0,
+                        limit_price: 0,
+                    },
+                    accounts,
+                    &[&taker],
+                )
+            }
+            .expect_err("inactive-asset CPI trade must reject before matcher CPI");
+            assert!(
+                err.contains("Custom(21)"),
+                "{lifecycle_case} route_is_batch={route_is_batch} rejection should be EngineLockActive(21), got {err}"
+            );
+            assert!(
+                !err.contains(&matcher_key_str),
+                "{lifecycle_case} route_is_batch={route_is_batch} rejection must NOT show the matcher program {matcher_key_str} in the tx error/logs -- the matcher CPI must never be invoked for a non-Active asset: {err}"
+            );
+            assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+            assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+            assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+        }
+    }
+}
+
+// FIX W2 (upstream #160 half): DrainOnly risk-increase-on-existing-position. Structurally
+// identical proof technique to the sibling test above, but exercises the "asset has an existing
+// position, request would GROW it" branch of #160 rather than the "no position at all" branch of
+// #147 -- both are gated by the SAME wrapper-side preflight added in this fix, just different
+// sub-conditions of it.
+#[test]
+fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
+    let mut env = V16CuEnv::new();
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000);
+    env.deposit(&lp, lp_account, 1_000_000);
+
+    // Open a real position on asset 0 (taker long, lp short) via the ordinary NoCpi path first.
+    env.trade_asset_with_cu(
+        0,
+        &taker,
+        taker_account,
+        &lp,
+        lp_account,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_DRAIN_ONLY,
+        0,
+        0,
+        0,
+    );
+    assert_eq!(
+        env.market_state().1.assets[0].lifecycle,
+        AssetLifecycleV16::DrainOnly
+    );
+
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+    let matcher_key_str = matcher_program.to_string();
+
+    for route_is_batch in [false, true] {
+        let market_before = env.svm.get_account(&env.market).unwrap();
+        let taker_before = env.svm.get_account(&taker_account).unwrap();
+        let lp_before = env.svm.get_account(&lp_account).unwrap();
+        env.svm.expire_blockhash();
+        let accounts = vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ];
+        // Taker is already long; requesting MORE long (same direction) is a risk INCREASE.
+        let err = if route_is_batch {
+            env.send(
+                ProgInstruction::BatchTradeCpi {
+                    legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+                        asset_index: 0,
+                        size_q: POS_SCALE as i128,
+                        fee_bps: 0,
+                        limit_price: 0,
+                    }],
+                },
+                accounts,
+                &[&taker],
+            )
+        } else {
+            env.send(
+                ProgInstruction::TradeCpi {
+                    asset_index: 0,
+                    size_q: POS_SCALE as i128,
+                    fee_bps: 0,
+                    limit_price: 0,
+                },
+                accounts,
+                &[&taker],
+            )
+        }
+        .expect_err("DrainOnly risk-increasing CPI trade must reject before matcher CPI");
+        assert!(
+            err.contains("Custom(21)"),
+            "route_is_batch={route_is_batch} rejection should be EngineLockActive(21), got {err}"
+        );
+        assert!(
+            !err.contains(&matcher_key_str),
+            "route_is_batch={route_is_batch} DrainOnly risk-increase rejection must NOT reach the matcher CPI: {err}"
+        );
+        assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+        assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+        assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    }
+}

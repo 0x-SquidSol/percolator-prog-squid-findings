@@ -8190,6 +8190,15 @@ pub mod processor {
         }
         let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
+        let (_, _, max_market_slots_pre, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            max_market_slots_pre,
+            &[(asset_index, size_q)],
+        )?;
 
         invoke_matcher(
             matcher_prog,
@@ -8657,12 +8666,23 @@ pub mod processor {
 
         // Build the matcher batch request: per leg, (asset, that asset's oracle price, signed size).
         let mut matcher_legs: Vec<(u16, u64, i128)> = Vec::with_capacity(legs.len());
+        let mut cpi_requests: Vec<(u16, i128)> = Vec::with_capacity(legs.len());
         for (i, leg) in legs.iter().enumerate() {
             if oracle_prices[i] == 0 {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             matcher_legs.push((leg.asset_index, oracle_prices[i], leg.size_q));
+            cpi_requests.push((leg.asset_index, leg.size_q));
         }
+        let (_, _, max_market_slots_pre, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            max_market_slots_pre,
+            &cpi_requests,
+        )?;
 
         invoke_matcher_batch(
             matcher_prog,
@@ -14940,6 +14960,108 @@ pub mod processor {
             return Err(PercolatorError::EngineStale.into());
         }
         Ok(())
+    }
+
+    // FIX W2 (upstream #147 + #160): a CPI trade route (TradeCpi/BatchTradeCpi) previously
+    // invoked the untrusted external matcher with no per-asset lifecycle check at all. The
+    // engine's own `require_asset_risk_change_allowed` gate (v16.rs) still rejects a
+    // risk-increasing trade on a non-Active asset AFTER the matcher CPI returns, so this is not
+    // a fund-safety hole by itself -- but it means any taker can force a CPI into an arbitrary,
+    // potentially hostile LP-registered matcher program for a trade that is *already known* to
+    // be rejected, burning the matcher's CU budget and handing it live CPI execution surface
+    // (writable matcher_ctx, readable market/portfolio-derived oracle price) for no reason.
+    // Reject before the matcher ever runs.
+    fn signed_position_for_asset_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+    ) -> Result<i128, ProgramError> {
+        if asset_index >= group.markets.len() {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        let market_id = group.markets[asset_index].engine.asset.market_id.get();
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            if leg.active && leg.asset_index as usize == asset_index && leg.market_id == market_id {
+                return Ok(match leg.side {
+                    SideV16::Long => leg.basis_pos_q.unsigned_abs() as i128,
+                    SideV16::Short => -(leg.basis_pos_q.unsigned_abs() as i128),
+                });
+            }
+            slot += 1;
+        }
+        Ok(0)
+    }
+
+    fn requested_delta_must_increase_risk(current_q: i128, delta_q: i128) -> bool {
+        current_q == 0 || (current_q > 0 && delta_q > 0) || (current_q < 0 && delta_q < 0)
+    }
+
+    /// `cpi_requests` is (asset_index, SIGNED requested size_q for account_a; account_b's
+    /// requested delta is the negation) for every asset touched by this CPI call.
+    fn ensure_cpi_trade_asset_lifecycle_before_matcher(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        cpi_requests: &[(u16, i128)],
+    ) -> ProgramResult {
+        for &(asset_index_u16, size_q) in cpi_requests {
+            let asset_index = asset_index_u16 as usize;
+            if asset_index >= group.header.config.max_market_slots.get() as usize
+                || asset_index >= group.markets.len()
+            {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            match group.markets[asset_index].engine.asset.lifecycle {
+                ASSET_LIFECYCLE_ACTIVE => {}
+                ASSET_LIFECYCLE_DRAIN_ONLY | ASSET_LIFECYCLE_RECOVERY => {
+                    let account_a_has_asset =
+                        portfolio_has_active_asset_view(group, account_a, asset_index)?;
+                    let account_b_has_asset =
+                        portfolio_has_active_asset_view(group, account_b, asset_index)?;
+                    if !account_a_has_asset && !account_b_has_asset {
+                        return Err(PercolatorError::EngineLockActive.into());
+                    }
+                    let account_a_pos =
+                        signed_position_for_asset_view(group, account_a, asset_index)?;
+                    let account_b_pos =
+                        signed_position_for_asset_view(group, account_b, asset_index)?;
+                    if requested_delta_must_increase_risk(account_a_pos, size_q)
+                        || requested_delta_must_increase_risk(account_b_pos, -size_q)
+                    {
+                        return Err(PercolatorError::EngineLockActive.into());
+                    }
+                }
+                _ => return Err(PercolatorError::EngineLockActive.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Account-borrowing wrapper for `ensure_cpi_trade_asset_lifecycle_before_matcher` --
+    /// builds the market + both portfolio views, runs the lifecycle gate, then drops every
+    /// borrow before returning so the caller is free to CPI into the matcher immediately after.
+    fn ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+        market_ai: &AccountInfo<'_>,
+        account_a_ai: &AccountInfo<'_>,
+        account_b_ai: &AccountInfo<'_>,
+        max_market_slots: usize,
+        cpi_requests: &[(u16, i128)],
+    ) -> ProgramResult {
+        ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
+        let mut account_b_data = account_b_ai.try_borrow_mut_data()?;
+        let account_a =
+            state::portfolio_view_mut_for_market_slots(&mut account_a_data, max_market_slots)?;
+        let account_b =
+            state::portfolio_view_mut_for_market_slots(&mut account_b_data, max_market_slots)?;
+        ensure_cpi_trade_asset_lifecycle_before_matcher(&group, &account_a, &account_b, cpi_requests)
     }
 
     fn ensure_trade_portfolios_current_for_requests_view(
