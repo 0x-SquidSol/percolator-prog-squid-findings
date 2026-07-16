@@ -182,6 +182,55 @@ fn make_token_data(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
     data
 }
 
+fn make_delegated_token_data(
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+    delegate: Pubkey,
+    delegated_amount: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8; TokenAccount::LEN];
+    TokenAccount::pack(
+        TokenAccount {
+            mint,
+            owner,
+            amount,
+            delegate: COption::Some(delegate),
+            state: AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount,
+            close_authority: COption::None,
+        },
+        &mut data,
+    )
+    .unwrap();
+    data
+}
+
+fn make_closable_token_data(
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+    close_authority: Pubkey,
+) -> Vec<u8> {
+    let mut data = vec![0u8; TokenAccount::LEN];
+    TokenAccount::pack(
+        TokenAccount {
+            mint,
+            owner,
+            amount,
+            delegate: COption::None,
+            state: AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::Some(close_authority),
+        },
+        &mut data,
+    )
+    .unwrap();
+    data
+}
+
 fn make_pyth_data(
     feed_id: &[u8; 32],
     price: i64,
@@ -8767,6 +8816,158 @@ fn v16_attack_close_resolved_ignores_spoofed_fee_rate_param() {
     let (_, g) = env.market_state();
     assert_eq!(env.portfolio_state(victim).capital, 0, "account fully closed");
     assert_eq!(g.vault, g.c_tot + g.insurance, "conservation after terminal close");
+}
+
+// W5 (upstream b7b6688e / #154) — CloseResolved is permissionless (any caller can finalize a
+// victim's resolved account, per the test above); verify_withdrawable_token_accounts checks
+// dest.mint/owner/state but not dest.delegate/dest.close_authority. A pre-poisoned destination
+// (victim-owned, but with an attacker-set delegate or close_authority) must be REJECTED, not
+// paid out — otherwise the delegate/close_authority can sweep the payout with no signature from
+// the victim. A clean destination must still succeed (fix must not be over-broad).
+#[test]
+fn v16_attack_permissionless_close_resolved_rejects_delegated_dest() {
+    let mut env = V16CuEnv::new();
+    let victim_owner = Keypair::new();
+    let victim = env.create_portfolio(&victim_owner);
+    env.deposit(&victim_owner, victim, 1_000);
+    env.resolve();
+
+    let attacker = Keypair::new();
+    let delegated_dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            delegated_dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_delegated_token_data(
+                    env.mint,
+                    victim_owner.pubkey(),
+                    0,
+                    attacker.pubkey(),
+                    u64::MAX,
+                ),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&victim).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let dest_before = env.svm.get_account(&delegated_dest).unwrap();
+
+    env.svm.expire_blockhash();
+    let rejected = env.send(
+        ProgInstruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(victim_owner.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(victim, false),
+            AccountMeta::new(delegated_dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    );
+    assert!(
+        rejected.is_err(),
+        "permissionless CloseResolved must reject a victim-owned destination with an active delegate"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "rejected delegated-dest close leaves market accounting unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&victim).unwrap(),
+        portfolio_before,
+        "rejected delegated-dest close rolls back payout state"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.vault).unwrap(),
+        vault_before,
+        "rejected delegated-dest close moves no vault custody"
+    );
+    assert_eq!(
+        env.svm.get_account(&delegated_dest).unwrap(),
+        dest_before,
+        "delegated destination receives no payout"
+    );
+
+    let closable_dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            closable_dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_closable_token_data(
+                    env.mint,
+                    victim_owner.pubkey(),
+                    0,
+                    attacker.pubkey(),
+                ),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let closable_before = env.svm.get_account(&closable_dest).unwrap();
+    env.svm.expire_blockhash();
+    let rejected = env.send(
+        ProgInstruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(victim_owner.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(victim, false),
+            AccountMeta::new(closable_dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    );
+    assert!(
+        rejected.is_err(),
+        "permissionless CloseResolved must reject a victim-owned destination with close authority"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&victim).unwrap(), portfolio_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+    assert_eq!(
+        env.svm.get_account(&closable_dest).unwrap(),
+        closable_before,
+        "close-authority destination receives no payout"
+    );
+
+    let clean_dest = env.token_account(victim_owner.pubkey(), 0);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        vec![
+            AccountMeta::new_readonly(victim_owner.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(victim, false),
+            AccountMeta::new(clean_dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    )
+    .expect("same permissionless close succeeds with a clean victim destination");
+    assert_eq!(env.token_amount(clean_dest), 1_000);
+    assert_eq!(env.market_state().1.vault, 0);
+    assert_eq!(env.portfolio_state(victim).capital, 0);
 }
 
 // Regression for #113 — permissionless cross-asset maintenance-fee siphon (FIXED).

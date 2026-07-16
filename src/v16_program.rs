@@ -12409,6 +12409,7 @@ pub mod processor {
                 &vault_authority,
                 &cfg_after,
             )?;
+            verify_permissionless_payout_dest_token_account(dest_token)?;
             let payout_u64 = amount_to_u64(payout)?;
             require_token_balance(vault_token, payout_u64)?;
             let bump_arr = [bump];
@@ -12473,6 +12474,7 @@ pub mod processor {
                 &vault_authority,
                 &cfg,
             )?;
+            verify_permissionless_payout_dest_token_account(dest_token)?;
             let payout_u64 = amount_to_u64(payout)?;
             require_token_balance(vault_token, payout_u64)?;
             let bump_arr = [bump];
@@ -16085,6 +16087,27 @@ pub mod processor {
             || *vault_token_ai.key != canonical_vault_address(expected_vault_owner, &vault.mint)
         {
             return Err(PercolatorError::InvalidVaultAccount.into());
+        }
+        Ok(())
+    }
+
+    // W5 (upstream b7b6688e / #154): terminal payout paths that are PERMISSIONLESS
+    // (CloseResolved, ClaimResolvedPayoutTopup -- any caller can trigger the payout,
+    // not just the portfolio owner) must additionally reject a `dest_token` that has
+    // an active delegate or close_authority. verify_withdrawable_token_accounts above
+    // only checks dest.mint/owner/state; a pre-poisoned destination (delegate/close_authority
+    // set by an attacker on an account the victim otherwise owns) would let the delegate
+    // sweep the payout the instant it lands, with no signature from the victim required
+    // to trigger the transfer. Signer-gated withdraw paths (Withdraw, WithdrawInsurance,
+    // WithdrawInsuranceAsset, WithdrawBackingBucket[Earnings], WithdrawProtocolFee) are NOT
+    // in scope: there the signer picks their own dest_token, so a poisoned account is
+    // self-inflicted, not attacker-injectable.
+    fn verify_permissionless_payout_dest_token_account(
+        dest_token_ai: &AccountInfo,
+    ) -> Result<(), ProgramError> {
+        let dest = unpack_token_account(dest_token_ai)?;
+        if dest.delegate.is_some() || dest.close_authority.is_some() {
+            return Err(PercolatorError::InvalidTokenAccount.into());
         }
         Ok(())
     }
