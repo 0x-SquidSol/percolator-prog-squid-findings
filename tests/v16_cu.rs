@@ -9386,3 +9386,152 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
         assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
     }
 }
+
+// FIX W4 (upstream 449e7d55, #145, HIGH): legs.len()<=MATCHER_BATCH_MAX_LEGS(16) and
+// tail.len()<=MAX_MATCHER_TAIL_ACCOUNTS(32) are each bounded independently, but their PRODUCT
+// (up to 512) was unbounded -- a batch with many legs AND a full matcher tail multiplies
+// per-leg tail-account validation/CPI-account-resolution work, a CU-griefing surface that no
+// single existing guard catches. This test proves the wrapper now caps the product, using the
+// REAL percolator-match reference matcher (not a stub): the discriminator is NOT "does it error"
+// in the abstract, it's that WITHOUT the fix a 14-leg x 5-tail batch (each axis individually
+// legal: 14<=16, 5<=32) sails straight through into a genuine, successful matcher fill -- the
+// exact same code path as the legal 14-leg x 4-tail batch below, just with product 70 instead of
+// 56 -- and only the multiplicative cap can tell them apart.
+#[test]
+fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
+    const LEGS: usize = 14; // matches this market's max_portfolio_assets below.
+    const PRICE: u64 = 100;
+    const REJECT_TAIL: usize = 5; // 14*5=70 > 64 budget; 5<=32 legal alone, 14<=16 legal alone.
+    const ALLOW_TAIL: usize = 4; // 14*4=56 <= 64 budget.
+
+    fn add_benign_tail_accounts(env: &mut V16CuEnv, count: usize) -> Vec<Pubkey> {
+        (0..count)
+            .map(|_| {
+                let key = Pubkey::new_unique();
+                env.svm
+                    .set_account(
+                        key,
+                        Account {
+                            lamports: 1_000_000_000,
+                            data: vec![0u8; 8],
+                            owner: Pubkey::default(),
+                            executable: false,
+                            rent_epoch: 0,
+                        },
+                    )
+                    .unwrap();
+                key
+            })
+            .collect()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn matcher_accounts(
+        taker: Pubkey,
+        market: Pubkey,
+        taker_account: Pubkey,
+        lp_account: Pubkey,
+        matcher_program: Pubkey,
+        ctx: Pubkey,
+        delegate: Pubkey,
+        tail: &[Pubkey],
+    ) -> Vec<AccountMeta> {
+        let mut metas = vec![
+            AccountMeta::new(taker, true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ];
+        metas.extend(tail.iter().copied().map(|key| AccountMeta::new_readonly(key, false)));
+        metas
+    }
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEGS as u16, 1_000, 1_000, 500);
+    // InitMarket with max_portfolio_assets=LEGS pre-activates ALL LEGS asset slots (0..LEGS) as
+    // Active immediately -- no explicit per-asset activation needed here, only an oracle mark.
+    for asset_index in 0..LEGS as u16 {
+        env.configure_auth_mark_for_asset_as_admin(asset_index, LEGS as u64 + 1, PRICE);
+    }
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 100_000_000);
+    env.deposit(&lp, lp_account, 100_000_000);
+    let (ctx, delegate, _) = env.init_matcher_context(&lp, matcher_program, lp_account);
+    let legs: Vec<percolator_prog::ix::BatchTradeCpiLeg> = (0..LEGS as u16)
+        .map(|asset_index| percolator_prog::ix::BatchTradeCpiLeg {
+            asset_index,
+            size_q: POS_SCALE as i128,
+            fee_bps: 100,
+            limit_price: 0,
+        })
+        .collect();
+
+    // REJECT: 14*5=70 > 64.
+    let reject_tail = add_benign_tail_accounts(&mut env, REJECT_TAIL);
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+    env.svm.expire_blockhash();
+    let rejected = env
+        .send(
+            ProgInstruction::BatchTradeCpi { legs: legs.clone() },
+            matcher_accounts(
+                taker.pubkey(),
+                env.market,
+                taker_account,
+                lp_account,
+                matcher_program,
+                ctx,
+                delegate,
+                &reject_tail,
+            ),
+            &[&taker],
+        )
+        .expect_err("oversized 14-leg x 5-tail (product 70 > budget 64) BatchTradeCpi must reject");
+    assert!(
+        rejected.contains("Custom(9)"),
+        "expected InvalidInstruction, got {rejected}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    assert_eq!(
+        env.svm.get_account(&ctx).unwrap(),
+        ctx_before,
+        "must reject BEFORE matcher CPI"
+    );
+
+    // ALLOW: 14*4=56 <= 64, must complete a real matcher CPI.
+    let allow_tail = add_benign_tail_accounts(&mut env, ALLOW_TAIL);
+    env.svm.expire_blockhash();
+    let allowed_cu = env
+        .send(
+            ProgInstruction::BatchTradeCpi { legs },
+            matcher_accounts(
+                taker.pubkey(),
+                env.market,
+                taker_account,
+                lp_account,
+                matcher_program,
+                ctx,
+                delegate,
+                &allow_tail,
+            ),
+            &[&taker],
+        )
+        .expect("budgeted 14-leg x 4-tail (product 56 <= budget 64) BatchTradeCpi must execute");
+    assert!(allowed_cu < 1_400_000);
+    let taker_after = env.portfolio_state(taker_account);
+    assert_eq!(
+        percolator::active_bitmap_count_ones(taker_after.active_bitmap),
+        LEGS as u32
+    );
+}

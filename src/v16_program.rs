@@ -8504,6 +8504,11 @@ pub mod processor {
     /// Maximum legs in a single matcher batch CPI: the matcher returns N*64 bytes via
     /// `set_return_data`, bounded by Solana's 1024-byte return-data cap.
     const MATCHER_BATCH_MAX_LEGS: usize = 16;
+    // W4 [HIGH]: legs.len()<=16 and tail.len()<=32 are each bounded independently, but their
+    // PRODUCT (up to 512) is not -- a batch with many legs AND a full matcher tail multiplies
+    // per-leg tail-account validation/CPI-account-resolution work, blowing the CU budget before
+    // any single guard fires. Cap the product directly (upstream wrapper 449e7d55, #145).
+    const MATCHER_BATCH_TAIL_FANOUT_BUDGET: usize = constants::MAX_MATCHER_TAIL_ACCOUNTS * 2;
 
     #[allow(clippy::too_many_arguments)]
     fn invoke_matcher_batch<'a>(
@@ -8660,6 +8665,9 @@ pub mod processor {
             matcher_delegate,
             program_id,
         )?;
+        if legs.len().saturating_mul(tail.len()) > MATCHER_BATCH_TAIL_FANOUT_BUDGET {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
 
         let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
