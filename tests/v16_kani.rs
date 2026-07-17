@@ -2391,3 +2391,108 @@ fn kani_fee_split_floor_ok_matches_tolerant_percentage_floors() {
         assert!(accepted, "the wizard's default 20/60/20 split must be accepted");
     }
 }
+
+// FIX E4 batch-fee reconciliation (LOW security nit): `batch_leg_fee` reconstructs the
+// per-leg fee the engine charges for one BatchTradeNoCpi leg, so wrapper-side per-domain fee
+// accounting can be split out of the engine's AGGREGATE outcome.fee_a/fee_b. It must compute
+// the fee on the same CEIL notional the engine's `trade_fee_notional_ceil` uses (upstream
+// engine 8f25aa5d), not the FLOOR notional used for margin/PnL bookkeeping -- the pre-fix bug
+// this proof targets used floor notional, which silently reconstructs fee=0 for a sub-atom
+// fill that the engine charged a nonzero fee for, tripping the wrapper's aggregate cross-check
+// and hard-reverting the whole batch. Bounded to a u16-scale symbolic domain (matching the
+// engine's own `proof_v16_trade_fee_notional_ceil_strictly_exceeds_floor_when_unaligned` in
+// percolator/tests/proofs_v16_arithmetic.rs) to keep the search space tractable while still
+// covering the unaligned/aligned boundary this fix is about.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn kani_batch_leg_fee_uses_ceil_notional_not_floor() {
+    let size_raw: u16 = kani::any();
+    let price_raw: u16 = kani::any();
+    let fee_bps_raw: u16 = kani::any();
+    kani::assume((1..=4000).contains(&size_raw));
+    kani::assume((1..=4000).contains(&price_raw));
+    kani::assume(fee_bps_raw as u64 <= percolator::MAX_MARGIN_BPS);
+    let abs_size_q = size_raw as u128;
+    let exec_price = price_raw as u64;
+    let fee_bps = fee_bps_raw as u64;
+
+    let ceil_fee = percolator_prog::processor::batch_leg_fee(abs_size_q, exec_price, fee_bps)
+        .expect("bounded inputs never overflow the fast u128 path");
+
+    // Pre-fix reference: the exact floor-notional computation batch_leg_fee used before this
+    // fix (mirrors trade_notional_floor, not trade_fee_notional_ceil).
+    let floor_notional = abs_size_q * exec_price as u128 / percolator::POS_SCALE;
+    let floor_fee = if floor_notional == 0 || fee_bps == 0 {
+        0u128
+    } else {
+        let product = floor_notional * fee_bps as u128;
+        let den = percolator::MAX_MARGIN_BPS as u128;
+        (product / den) + u128::from(product % den != 0)
+    };
+
+    let product = abs_size_q * exec_price as u128;
+    let unaligned_notional = product % percolator::POS_SCALE != 0;
+
+    kani::cover!(
+        unaligned_notional && fee_bps > 0,
+        "sub-atom-notional leg with a nonzero fee rate: the exact bug class this fix closes"
+    );
+    kani::cover!(
+        !unaligned_notional && fee_bps > 0,
+        "POS_SCALE-aligned leg: ceil and floor notional must agree, no spurious fee"
+    );
+
+    // The ceil-notional fee must never be less than the (buggy, pre-fix) floor-notional fee --
+    // reconciliation can only go up when correcting a rounded-down-to-zero reconstruction,
+    // never down, or the aggregate cross-check would start rejecting batches it used to accept.
+    // NOTE: this is deliberately NOT asserted as a strict `>` on the unaligned branch -- the
+    // bps-share ceil-division composed on top of the notional ceil can absorb the +1-atom
+    // notional bump into the same final fee-atom result (e.g. size=5,fee_bps=1 vs size=6,
+    // fee_bps=1 at MAX_MARGIN_BPS=10_000 both ceil to fee=1), so strict inequality does not hold
+    // universally at the whole-function level even though it always holds at the notional level
+    // below. An earlier version of this harness asserted strict inequality here and Kani found
+    // the counterexample; the concrete witness beneath it is the non-vacuity check instead.
+    assert!(
+        ceil_fee >= floor_fee,
+        "ceil-notional reconstruction must never under-charge relative to the pre-fix floor \
+         computation"
+    );
+    if !unaligned_notional {
+        assert_eq!(
+            ceil_fee, floor_fee,
+            "POS_SCALE-aligned fills must not be over-charged by the ceil fix"
+        );
+    }
+
+    // The underlying notional itself (before the bps share is applied) IS always strictly
+    // ceil > floor on an unaligned product -- this is the exact property the engine's own
+    // `proof_v16_trade_fee_notional_ceil_strictly_exceeds_floor_when_unaligned` proves for
+    // `trade_fee_notional_ceil` vs `trade_notional_floor`; batch_leg_fee must compute the same
+    // ceil-notional internally.
+    let fee_notional = (product / percolator::POS_SCALE)
+        + u128::from(product % percolator::POS_SCALE != 0);
+    if unaligned_notional {
+        assert!(
+            fee_notional > floor_notional,
+            "unaligned product: the ceil-notional batch_leg_fee computes internally must round \
+             up by exactly one atom of notional, matching the engine's trade_fee_notional_ceil"
+        );
+    } else {
+        assert_eq!(fee_notional, floor_notional);
+    }
+
+    // Non-vacuity witness at the whole-function (atoms-of-fee) level: a scaled-down analog (the
+    // full v16_bpf_batch_trade_nocpi_subatom_leg_charges_fee_on_ceil_notional BPF test in
+    // tests/v16_cu.rs uses size=POS_SCALE/100-1=9999, outside this harness's tractable u16-scale
+    // symbolic bound) of the exact sub-atom boundary this fix targets -- size=100, price=100
+    // gives product=10_000 < POS_SCALE, so floor notional is 0 (fee would silently reconstruct
+    // to 0, the exact pre-fix bug) while ceil notional is 1, and with fee_bps=1 the final fee
+    // genuinely is strictly greater (0 -> 1). Proves this harness's `ceil_fee >= floor_fee` is
+    // not vacuously satisfied by an identity function -- it is sensitive to the actual fix.
+    if abs_size_q == 100 && exec_price == 100 && fee_bps == 1 {
+        assert_eq!(floor_fee, 0, "pre-fix reconstruction silently drops this leg's fee to zero");
+        assert_eq!(ceil_fee, 1, "the fix must reconstruct the engine's real ceil-notional fee");
+        assert!(ceil_fee > floor_fee);
+    }
+}

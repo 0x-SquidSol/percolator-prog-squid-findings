@@ -9051,6 +9051,93 @@ fn v16_attack_non_active_asset_cannot_enable_backing_fee_batch_gate() {
     }
 }
 
+// FIX E4 batch-fee reconciliation (LOW security nit, percolator-security review): the wrapper's
+// batch_leg_fee reconstructed per-leg fees on PRE-E4 FLOOR notional after the engine's trade-fee
+// calc switched to CEIL notional (upstream engine 8f25aa5d). A sub-atom-notional leg
+// (abs_size_q * exec_price / POS_SCALE < 1, i.e. floor-notional == 0) now opens nonzero OI for a
+// nonzero fee at the engine level -- outcome.fee_a/fee_b reflects that ceil-rounded fee -- but the
+// wrapper's reconstruction still computed floor-notional fee=0 for that leg, so the aggregate
+// cross-check (`reconstructed_total != engine_total`) tripped and hard-reverted the WHOLE batch.
+// Fails closed (no mis-accounting), but every batch containing a sub-atom-notional leg started
+// reverting where it previously succeeded at zero fee -- an availability gap for otherwise
+// legitimate multi-leg batches. Non-vacuous: this exact scenario (adapted from the engine's own
+// v16_subatom_trade_charges_fee_on_ceil_fee_notional non-vacuity test) is verified BOTH ways in
+// the task return -- passes with batch_leg_fee ported to ceil notional, and hard-reverts
+// (EngineArithmeticOverflow, the aggregate cross-check) when batch_leg_fee is reverted to floor.
+#[test]
+fn v16_bpf_batch_trade_nocpi_subatom_leg_charges_fee_on_ceil_notional() {
+    let mut env = V16CuEnv::new();
+    let taker_owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let lp_account = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker_account, 1_000_000);
+    env.deposit(&lp_owner, lp_account, 1_000_000);
+
+    // sub_atom_size * exec_price / POS_SCALE floors to 0 (999_900 / 1_000_000 for
+    // POS_SCALE = 1_000_000), but ceils to 1 -- the exact sub-atom-notional boundary E4 targets.
+    // Matches the engine's own non-vacuity test for the same fix
+    // (v16_subatom_trade_charges_fee_on_ceil_fee_notional in percolator/tests/v16_spec_tests.rs).
+    let sub_atom_size = (POS_SCALE / 100 - 1) as i128;
+    env.svm.expire_blockhash();
+    let taker_capital_before = env.portfolio_state(taker_account).capital;
+    let lp_capital_before = env.portfolio_state(lp_account).capital;
+    let batch = env.send(
+        ProgInstruction::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: sub_atom_size,
+                exec_price: 100,
+                fee_bps: 1,
+            }],
+        },
+        vec![
+            AccountMeta::new(taker_owner.pubkey(), true),
+            AccountMeta::new(lp_owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+        ],
+        &[&taker_owner, &lp_owner],
+    );
+    assert!(
+        batch.is_ok(),
+        "a sub-atom-notional leg must not hard-revert the whole batch once batch_leg_fee \
+         agrees with the engine's ceil-notional fee calc: {batch:?}"
+    );
+
+    let taker_after = env.portfolio_state(taker_account);
+    let lp_after = env.portfolio_state(lp_account);
+    assert_eq!(
+        taker_after.capital,
+        taker_capital_before - 1,
+        "taker (long, the batch's taker-only payer) must be charged exactly the ceil-notional \
+         fee of 1 atom, not the floor-notional 0 the wrapper used to reconstruct"
+    );
+    assert_eq!(
+        lp_after.capital, lp_capital_before,
+        "maker (short) pays nothing under taker-only"
+    );
+    assert_eq!(
+        active_leg_for_asset(&taker_after, 0).basis_pos_q,
+        sub_atom_size,
+        "the sub-atom fill must still open its full nonzero position despite floor-notional \
+         reading zero"
+    );
+    assert_eq!(
+        active_leg_for_asset(&lp_after, 0).basis_pos_q,
+        -sub_atom_size
+    );
+
+    let (cfg_after, group_after) = env.market_state();
+    assert_eq!(
+        group_after.insurance_domain_budget[0] + cfg_after.protocol_fee_accrued_atoms,
+        1,
+        "the reconstructed 1-atom fee must be credited somewhere (domain budget or protocol \
+         cut), not silently dropped"
+    );
+}
+
 // security.md sweep — CloseResolved caller-supplied fee_rate_per_slot must be IGNORED (Copenhagen
 // SOL-001-class spoofed-param / SOL-023 fee-rounding-away-from-user): CloseResolved is permissionless
 // after the exit window (force_close_delay_slots==0 -> always permissionless), and it carries a

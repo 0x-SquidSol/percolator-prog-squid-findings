@@ -7430,10 +7430,20 @@ pub mod processor {
 
     /// Reconstruct the exact per-leg fee the engine charges for one leg, so wrapper-side
     /// per-asset/per-domain fee accounting can be split out of the engine's AGGREGATE batch
-    /// outcome. Mirrors engine `trade_notional_floor` (floor) + `checked_fee_bps` (ceil) on the
-    /// fast u128 path; extreme sizes that would need the engine's U256 widening error out (the
-    /// batch then rejects rather than mis-accounting — see the aggregate cross-check below).
-    fn batch_leg_fee(
+    /// outcome. FIX E4 (upstream engine 8f25aa5d, "charge sub-atom trade fees on ceil
+    /// notional"): the engine now computes the fee on `trade_fee_notional_ceil` (ceil), NOT the
+    /// `trade_notional_floor` (floor) used for margin/PnL bookkeeping -- a sub-atom fill
+    /// (abs_size_q * exec_price / POS_SCALE < 1) floors to notional=0 (and therefore fee=0) even
+    /// though it opens nonzero OI. Mirrors that: `fee_notional` here is the ceil (matching engine
+    /// `risk_notional_ceil` / `trade_fee_notional_ceil`), then `checked_fee_bps`-equivalent ceil
+    /// division on top for the fee itself. Extreme sizes that would need the engine's U256
+    /// widening error out (the batch then rejects rather than mis-accounting — see the aggregate
+    /// cross-check below). Before this fix, batch_leg_fee still used floor notional post-E4,
+    /// so any NoCpi batch containing a sub-atom-notional leg would reconstruct fee=0 for that
+    /// leg while the engine's aggregate outcome.fee_a/fee_b included its ceil-rounded fee atom,
+    /// tripping the `reconstructed_total != engine_total` guard and hard-reverting the whole
+    /// batch (fails closed, but an availability gap for otherwise-legitimate batches).
+    pub fn batch_leg_fee(
         abs_size_q: u128,
         exec_price: u64,
         fee_bps: u64,
@@ -7441,14 +7451,15 @@ pub mod processor {
         if abs_size_q == 0 || fee_bps == 0 {
             return Ok(0);
         }
-        let notional = abs_size_q
+        let product = abs_size_q
             .checked_mul(exec_price as u128)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?
-            / percolator::POS_SCALE;
-        if notional == 0 {
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let pos_scale = percolator::POS_SCALE;
+        let fee_notional = (product / pos_scale) + u128::from(product % pos_scale != 0);
+        if fee_notional == 0 {
             return Ok(0);
         }
-        let product = notional
+        let product = fee_notional
             .checked_mul(fee_bps as u128)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         let den = percolator::MAX_MARGIN_BPS as u128;
