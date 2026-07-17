@@ -125,6 +125,80 @@ fn has_active_leg_for_asset(account: &PortfolioAccountV16, asset_index: usize) -
         .any(|leg| leg.active && leg.asset_index as usize == asset_index)
 }
 
+// ---------------------------------------------------------------------------
+// E3 (upstream engine #92 / this fork's percolator @ 052baab9+c87a8978,
+// "liquidation min-fee chunking: engine-selected size + config-only fee")
+// fixture-repair reference reimplementations. These mirror engine formulas
+// EXACTLY, formula-for-formula, so expected liquidation-fee-split values
+// below are DERIVED from the same arithmetic the engine runs, not hardcoded
+// from an observed run:
+//   - `accrue_asset_to_not_atomic` (percolator src/v16.rs:10427 area): a
+//     single accrual step clamps the price move to at most
+//     `old_price * max_price_move_bps_per_slot * segment_dt / MAX_MARGIN_BPS`
+//     (segment_dt capped at `max_accrual_dt_slots`) -- see
+//     `clamped_price_move_ref` below.
+//   - `liquidation_risk_notional_ceil`/`liquidation_fee_for_close`
+//     (percolator src/v16.rs:16057+): fee = ceil(ceil(close_q*price/POS_SCALE)
+//     * liquidation_fee_bps / MAX_MARGIN_BPS), clamped to
+//     [min_liquidation_abs, liquidation_fee_cap] -- see `ceil_liquidation_fee_ref`.
+//   - `maintenance_cranker_reward` (src/v16_program.rs:15423): cranker share
+//     floors (`fee_share_floor_ref`), never ceils -- the insurance remainder
+//     is `fee - reward`, never the other way around.
+// ---------------------------------------------------------------------------
+const MAX_MARGIN_BPS_REF: u128 = 10_000;
+
+/// Mirrors `accrue_asset_to_not_atomic`'s linear price-move budget for ONE
+/// accrual step starting from `old_price`, clamped to at most
+/// `max_accrual_dt_slots` of elapsed time. Additive (not compounding): this
+/// is the max a SINGLE crank/liquidate call can move price by, from a fresh
+/// (never-yet-accrued-this-target) baseline.
+fn clamped_price_after_one_step_ref(
+    old_price: u64,
+    max_price_move_bps_per_slot: u64,
+    elapsed_slots: u64,
+    max_accrual_dt_slots: u64,
+) -> u64 {
+    let segment_dt = elapsed_slots.min(max_accrual_dt_slots) as u128;
+    let max_delta = (old_price as u128 * max_price_move_bps_per_slot as u128 * segment_dt)
+        / MAX_MARGIN_BPS_REF;
+    old_price + max_delta as u64
+}
+
+fn ceil_notional_ref(size_q: u128, price: u64) -> u128 {
+    if size_q == 0 || price == 0 {
+        return 0;
+    }
+    let product = size_q * price as u128;
+    let q = product / POS_SCALE;
+    let r = product % POS_SCALE;
+    q + u128::from(r != 0)
+}
+
+/// Mirrors `liquidation_fee_for_close`/`liquidation_risk_notional_ceil`
+/// exactly: ceil(ceil(close_q*price/POS_SCALE) * fee_bps / MAX_MARGIN_BPS),
+/// clamped to [min_liquidation_abs, liquidation_fee_cap].
+fn ceil_liquidation_fee_ref(
+    close_q: u128,
+    price: u64,
+    fee_bps: u64,
+    min_liquidation_abs: u128,
+    liquidation_fee_cap: u128,
+) -> u128 {
+    let notional = ceil_notional_ref(close_q, price);
+    let product = notional * fee_bps as u128;
+    let q = product / MAX_MARGIN_BPS_REF;
+    let r = product % MAX_MARGIN_BPS_REF;
+    let raw_fee = q + u128::from(r != 0);
+    raw_fee.max(min_liquidation_abs).min(liquidation_fee_cap)
+}
+
+/// Mirrors `maintenance_cranker_reward`/`fee_share_floor` exactly: FLOOR
+/// division, never ceiling -- the cranker's share must never exceed its
+/// nominal bps of the charged fee.
+fn fee_share_floor_ref(amount: u128, share_bps: u16) -> u128 {
+    (amount * share_bps as u128) / MAX_MARGIN_BPS_REF
+}
+
 fn signer() -> TestAccount {
     TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0).signer()
 }
@@ -14074,6 +14148,29 @@ fn v16_wrapper_permissionless_crank_rejects_stale_now_without_mutation() {
     );
 }
 
+// FIX E3 (upstream engine #92 / this fork's percolator @ 052baab9+c87a8978)
+// fixture repair, reusing the EXACT proven pattern from tests/v16_cu.rs's
+// `v16_bpf_permissionless_liquidation_is_bounded` repair (commit cfdd1b73):
+// this fixture (deposit 250, single 100->300 EWMA push clamped to 200 by
+// max_price_move_bps_per_slot=100%) left the account merely BORDERLINE
+// underwater -- a healthy partial close existed (closing part of the leg
+// already restores maintenance health at effective_price=200), so
+// engine-selected liquidation sizing (E3) correctly preferred that smaller
+// partial close over a full close, breaking the old
+// `active_bitmap_is_empty` assertion that hard-coded "liquidation always
+// fully closes". Repaired identically to cfdd1b73: drop to the MINIMUM
+// deposit satisfying initial_margin_bps=10_000 (100%, no leverage headroom
+// in this market's default config) so bankruptcy is only reachable via real
+// price movement, then drive the account genuinely (not borderline)
+// bankrupt via two real EWMA-push+accrual rounds, each capped to the
+// market's own max_price_move_bps_per_slot=100% budget (100->200->400),
+// landing certified_equity at 100-300=-200 < 0 -- this trips
+// `liquidation_engine_close_request_q`'s bankrupt-account early exit
+// (`cert.certified_equity < 0`), which forces a full close unconditionally,
+// regardless of any partial-close arithmetic. Same "the permissionless crank
+// can liquidate an unhealthy candidate, fully" property the test always
+// asserted, reached via real price discovery instead of a single push that
+// happened to land in the partial-close-eligible region.
 #[test]
 fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     let mut admin = signer();
@@ -14087,7 +14184,11 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 1_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 250);
+    // Minimum deposit satisfying initial_margin_bps=10_000 (100%) for a
+    // 1-unit position at entry price 100 -- this market has no leverage
+    // headroom at entry, so bankruptcy can only be reached via adverse price
+    // movement (matches tests/v16_cu.rs::v16_bpf_permissionless_liquidation_is_bounded).
+    deposit(&mut short_owner, &mut market, &mut short_account, 100);
     configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     run_ix(
         Instruction::TradeNoCpi {
@@ -14106,12 +14207,35 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     )
     .unwrap();
 
-    push_base_ewma_mark(&mut admin, &mut market, 1, 300);
+    // Step 1: real EWMA push + accrual crank, capped to a 100% mark move ->
+    // effective_price 100 -> 200 (still solvent: capital 100, no loss
+    // realized against the fresh leg yet).
+    push_base_ewma_mark(&mut admin, &mut market, 1, 999_999);
+    run_ix(
+        Instruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 1,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+        &mut [&mut admin, &mut market, &mut short_account],
+    )
+    .unwrap();
+    let short_after_step1 = state::read_portfolio(&short_account.data).unwrap();
+    assert!(
+        short_after_step1.capital == 100 && short_after_step1.pnl == 0,
+        "fixture assumption: position must still be open and solvent after the first accrual round"
+    );
+
+    // Step 2: second real EWMA push + accrual, again capped to 100% ->
+    // effective_price 200 -> 400 (equity 100-300=-200: genuinely bankrupt).
+    push_base_ewma_mark(&mut admin, &mut market, 2, 999_999);
     run_ix(
         Instruction::PermissionlessCrank {
             action: 1,
             asset_index: 0,
-            now_slot: 1,
+            now_slot: 2,
             funding_rate_e9: 0,
             recovery_reason: 0,
         },
@@ -14121,11 +14245,14 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
-    assert_eq!(group.slot_last, 1);
-    assert_eq!(group.assets[0].effective_price, 200);
+    assert_eq!(group.slot_last, 2);
+    assert_eq!(group.assets[0].effective_price, 400);
+    assert_eq!(short.capital, 0, "bankrupt account's capital must be fully consumed");
+    assert_eq!(short.pnl, 0, "settled loss must not leave a dangling pnl balance");
     assert!(
         percolator::active_bitmap_is_empty(short.active_bitmap),
-        "liquidation should close the unhealthy short through the public crank path"
+        "a genuinely bankrupt account (certified_equity < 0) must be fully closed through the \
+         public crank path, not left with a dangling partial position"
     );
 }
 
@@ -14221,6 +14348,16 @@ fn v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee() {
     );
 }
 
+// FIX E3 (upstream engine #92 / this fork's percolator @ 052baab9+c87a8978)
+// fixture repair -- see the detailed derivation comment on
+// `v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_insurance`
+// below (identical fixture/root-cause, this test just adds a cranker
+// portfolio + a 40% `cranker_share_bps` to verify the SPLIT). Same discipline:
+// a real EWMA-driven price move deep enough that no healthy partial close
+// exists within `liquidation_partial_search_hi`'s bound, landing on a full
+// close with `pnl == 0` throughout (solvent, not bankrupt) so the liquidation
+// fee is NOT waived by the `pnl < 0` short-circuit -- the only fixture shape
+// where a full close AND a nonzero, cranker-splittable fee coexist.
 #[test]
 fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     let mut admin = signer();
@@ -14233,6 +14370,10 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     let mut short_account = portfolio_account();
     let mut cranker_account = portfolio_account();
 
+    let liquidation_fee_bps = 100u64;
+    let max_price_move_bps_per_slot = 3u64;
+    let max_accrual_dt_slots = 100u64;
+    let cranker_share_bps = 4_000u16;
     run_ix(
         init_market_ix_with(|ix| {
             if let Instruction::InitMarket {
@@ -14240,10 +14381,10 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
                 initial_margin_bps,
                 min_nonzero_mm_req,
                 min_nonzero_im_req,
-                liquidation_fee_bps,
+                liquidation_fee_bps: cfg_liquidation_fee_bps,
                 liquidation_fee_cap,
-                max_price_move_bps_per_slot,
-                max_accrual_dt_slots,
+                max_price_move_bps_per_slot: cfg_max_price_move_bps_per_slot,
+                max_accrual_dt_slots: cfg_max_accrual_dt_slots,
                 max_abs_funding_e9_per_slot,
                 min_funding_lifetime_slots,
                 ..
@@ -14253,10 +14394,10 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
                 *initial_margin_bps = 600;
                 *min_nonzero_mm_req = 100;
                 *min_nonzero_im_req = 101;
-                *liquidation_fee_bps = 100;
+                *cfg_liquidation_fee_bps = liquidation_fee_bps;
                 *liquidation_fee_cap = percolator::MAX_PROTOCOL_FEE_ABS;
-                *max_price_move_bps_per_slot = 3;
-                *max_accrual_dt_slots = 100;
+                *cfg_max_price_move_bps_per_slot = max_price_move_bps_per_slot;
+                *cfg_max_accrual_dt_slots = max_accrual_dt_slots;
                 *max_abs_funding_e9_per_slot = 10_000;
                 *min_funding_lifetime_slots = 100;
             }
@@ -14264,10 +14405,14 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
         &mut [&mut admin, &mut market, &mut mint],
     )
     .unwrap();
+    configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     init_portfolio(&mut cranker_owner, &mut market, &mut cranker_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 1_000_000);
+    // Minimum deposit satisfying initial_margin_bps=600 (6%) on a 10,000
+    // notional position: no leverage headroom, so underwater is only
+    // reachable via a real adverse price move.
     deposit(&mut short_owner, &mut market, &mut short_account, 601);
     run_ix(
         Instruction::TradeNoCpi {
@@ -14285,29 +14430,35 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
         ],
     )
     .unwrap();
-    {
-        let (cfg, mut group) = state::read_market(&market.data).unwrap();
-        let mut short = state::read_portfolio(&short_account.data).unwrap();
-        short.capital = 499;
-        group.c_tot -= 102;
-        group.vault -= 102;
-        state::write_market(&mut market.data, &cfg, &group).unwrap();
-        state::write_portfolio(&mut short_account.data, &short).unwrap();
-    }
     run_ix(
-        Instruction::UpdateLiquidationFeePolicy {
-            cranker_share_bps: 4_000,
-        },
+        Instruction::UpdateLiquidationFeePolicy { cranker_share_bps },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
+    // Real adverse EWMA push (target far above any single-step budget so the
+    // engine's own linear clamp -- not our target -- determines the landed
+    // price); the liquidation crank below performs the clamped accrual and
+    // the liquidation in the same instruction.
+    push_base_ewma_mark(&mut admin, &mut market, 100, 999_999_999);
 
+    let landed_price =
+        clamped_price_after_one_step_ref(100, max_price_move_bps_per_slot, 100, max_accrual_dt_slots);
+    let expected_fee = ceil_liquidation_fee_ref(
+        100 * POS_SCALE,
+        landed_price,
+        liquidation_fee_bps,
+        0,
+        percolator::MAX_PROTOCOL_FEE_ABS,
+    );
+    let expected_cranker_reward = fee_share_floor_ref(expected_fee, cranker_share_bps);
+
+    let insurance_before = state::read_market(&market.data).unwrap().1.insurance;
     let vault_before = state::read_market(&market.data).unwrap().1.vault;
     run_ix(
         Instruction::PermissionlessCrank {
             action: 1,
             asset_index: 0,
-            now_slot: 1,
+            now_slot: 100,
             funding_rate_e9: 0,
             recovery_reason: 0,
         },
@@ -14323,21 +14474,93 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
     let cranker = state::read_portfolio(&cranker_account.data).unwrap();
-    assert!(percolator::active_bitmap_is_empty(short.active_bitmap));
     assert_eq!(
-        group.insurance, 60,
-        "1% liquidation fee on 10,000 notional is 100; 40% retained-fee share pays 40 to the cranker"
+        group.assets[0].effective_price, landed_price,
+        "fixture assumption: the single-step price clamp landed where derived"
+    );
+    assert_eq!(
+        short.pnl, 0,
+        "fixture assumption: the account must stay solvent (pnl>=0) through liquidation -- a \
+         genuinely bankrupt (pnl<0) account would have its liquidation fee unconditionally \
+         waived, making this test's cranker-split premise unreachable"
+    );
+    assert!(
+        percolator::active_bitmap_is_empty(short.active_bitmap),
+        "E3 must select a full close when no healthy partial exists within its search bound"
+    );
+    assert_eq!(
+        expected_cranker_reward, 41,
+        "fixture assumption: 40% of the derived {expected_fee}-atom liquidation fee floors to a \
+         nonzero, easy-to-distinguish-from-the-remainder cranker reward"
+    );
+    assert_eq!(
+        cranker.capital, expected_cranker_reward,
+        "cranker reward is credited as Percolator account capital, floor(fee * cranker_share_bps \
+         / MAX_MARGIN_BPS) of the derived liquidation fee -- not more (would siphon insurance \
+         beyond the configured share) and not less (would starve the cranker incentive)"
+    );
+    assert_eq!(
+        group.insurance,
+        insurance_before + expected_fee - expected_cranker_reward,
+        "1% liquidation fee on the landed notional is charged in full; the {cranker_share_bps}bps \
+         retained-fee share pays {expected_cranker_reward} to the cranker and the remainder stays \
+         in insurance -- not the whole fee (would mean the split was skipped) and not less than \
+         the remainder (would mean rounding is accumulating beyond the engine's guarantee)"
     );
     assert_eq!(
         group.vault, vault_before,
         "internal cranker reward must not withdraw SPL custody from the vault"
     );
-    assert_eq!(
-        cranker.capital, 40,
-        "cranker reward is credited as Percolator account capital"
-    );
 }
 
+// FIX E3 (upstream engine #92 / this fork's percolator @ 052baab9+c87a8978)
+// fixture repair. The original fixture directly poked `short.capital = 499`
+// (a bare 1-atom deficit under a 500 maintenance requirement, with no real
+// price movement and pnl untouched at 0) to represent "unhealthy". Post-E3,
+// `liquidation_engine_close_request_q` (percolator src/v16.rs:498) is
+// engine-selected: for a deficit that small, a tiny healthy PARTIAL close
+// exists and is preferred over a full close, so this fixture's hardcoded
+// `active_bitmap_is_empty` assertion broke -- not because liquidation became
+// unbounded, but because it became more precise (same root cause as the two
+// v16_cu.rs `v16_bpf_permissionless_liquidation_is_bounded`/
+// `..._auth_mark_target_effective_lag_...` repairs in commit cfdd1b73).
+//
+// Repair: replace the raw capital mutation with a REAL short position that
+// gets driven underwater via an actual EWMA price push + accrual (matching
+// this test's already-EWMA-capable `configure_base_ewma_mark`/
+// `push_base_ewma_mark` helpers), landing the deficit deep enough that the
+// engine's `liquidation_partial_search_hi`-bounded search finds NO healthy
+// partial close and forces a full close instead (see the derivation below --
+// this is NOT the separate `certified_equity < 0 || pnl < 0` "genuinely
+// bankrupt" branch: verified `short.pnl == 0` throughout below, i.e. the
+// account never becomes bankrupt in the engine's sense; a bankrupt account's
+// liquidation fee is unconditionally waived by `charge_account_fee_current_
+// not_atomic`'s `pnl < 0` short-circuit, which would make this test's whole
+// premise -- a NONZERO fee that still gets split with the cranker --
+// unreachable. Deep-but-solvent underwater is the only fixture shape where a
+// full close AND a nonzero fee coexist).
+//
+// Numbers are DERIVED, not hardcoded, via `clamped_price_after_one_step_ref`/
+// `ceil_liquidation_fee_ref`/`fee_share_floor_ref` above (which mirror the
+// engine's `accrue_asset_to_not_atomic`/`liquidation_fee_for_close`/
+// `maintenance_cranker_reward` formulas exactly):
+//   entry price 100, short 100*POS_SCALE (notional 10,000), deposit 601
+//   (exactly the 6% initial-margin minimum, no leverage headroom -- same
+//   "no shortcut via a bigger single EWMA push" discipline as the v16_cu fix).
+//   One accrual step from slot_last=0 to now_slot=100, max_price_move_bps_
+//   per_slot=3, max_accrual_dt_slots=100 clamps price to
+//   100 + floor(100*3*100/10_000) = 103 -- a ~41.5%-of-notional maintenance
+//   deficit (515 required vs 301 solvent-equity-after-loss-settlement),
+//   comfortably beyond what `liquidation_partial_search_hi` allows a partial
+//   close to resolve, forcing a full close.
+//   fee = ceil(ceil(100*POS_SCALE*103/POS_SCALE)*100/10_000)
+//       = ceil(10_300*100/10_000) = 103 (1% liquidation_fee_bps).
+// `insurance_before` is read immediately before the liquidation crank (same
+// pattern as the pre-existing `vault_before`) because enabling EWMA-mark
+// mode via `configure_base_ewma_mark` makes the preceding TradeNoCpi charge
+// an incidental hybrid-mode minimum fee despite its `fee_bps: 0` argument --
+// unrelated to E3, and isolated by measuring the liquidation's OWN delta
+// rather than assuming an absolute-zero baseline.
 #[test]
 fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_insurance() {
     let mut admin = signer();
@@ -14348,6 +14571,9 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     let mut long_account = portfolio_account();
     let mut short_account = portfolio_account();
 
+    let liquidation_fee_bps = 100u64;
+    let max_price_move_bps_per_slot = 3u64;
+    let max_accrual_dt_slots = 100u64;
     run_ix(
         init_market_ix_with(|ix| {
             if let Instruction::InitMarket {
@@ -14355,10 +14581,10 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
                 initial_margin_bps,
                 min_nonzero_mm_req,
                 min_nonzero_im_req,
-                liquidation_fee_bps,
+                liquidation_fee_bps: cfg_liquidation_fee_bps,
                 liquidation_fee_cap,
-                max_price_move_bps_per_slot,
-                max_accrual_dt_slots,
+                max_price_move_bps_per_slot: cfg_max_price_move_bps_per_slot,
+                max_accrual_dt_slots: cfg_max_accrual_dt_slots,
                 max_abs_funding_e9_per_slot,
                 min_funding_lifetime_slots,
                 ..
@@ -14368,10 +14594,10 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
                 *initial_margin_bps = 600;
                 *min_nonzero_mm_req = 100;
                 *min_nonzero_im_req = 101;
-                *liquidation_fee_bps = 100;
+                *cfg_liquidation_fee_bps = liquidation_fee_bps;
                 *liquidation_fee_cap = percolator::MAX_PROTOCOL_FEE_ABS;
-                *max_price_move_bps_per_slot = 3;
-                *max_accrual_dt_slots = 100;
+                *cfg_max_price_move_bps_per_slot = max_price_move_bps_per_slot;
+                *cfg_max_accrual_dt_slots = max_accrual_dt_slots;
                 *max_abs_funding_e9_per_slot = 10_000;
                 *min_funding_lifetime_slots = 100;
             }
@@ -14379,9 +14605,14 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
         &mut [&mut admin, &mut market, &mut mint],
     )
     .unwrap();
+    configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 1_000_000);
+    // Minimum deposit satisfying initial_margin_bps=600 (6%) on a 10,000
+    // notional position: no leverage headroom, so underwater is only
+    // reachable via a real adverse price move (same discipline as the v16_cu
+    // E3 fixture repairs).
     deposit(&mut short_owner, &mut market, &mut short_account, 601);
     run_ix(
         Instruction::TradeNoCpi {
@@ -14399,15 +14630,6 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
         ],
     )
     .unwrap();
-    {
-        let (cfg, mut group) = state::read_market(&market.data).unwrap();
-        let mut short = state::read_portfolio(&short_account.data).unwrap();
-        short.capital = 499;
-        group.c_tot -= 102;
-        group.vault -= 102;
-        state::write_market(&mut market.data, &cfg, &group).unwrap();
-        state::write_portfolio(&mut short_account.data, &short).unwrap();
-    }
     run_ix(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 4_000,
@@ -14415,13 +14637,29 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
         &mut [&mut admin, &mut market],
     )
     .unwrap();
+    // Real adverse EWMA push (target far above any single-step budget so the
+    // engine's own linear clamp -- not our target -- determines the landed
+    // price); the liquidation crank below performs the clamped accrual and
+    // the liquidation in the same instruction.
+    push_base_ewma_mark(&mut admin, &mut market, 100, 999_999_999);
 
+    let landed_price =
+        clamped_price_after_one_step_ref(100, max_price_move_bps_per_slot, 100, max_accrual_dt_slots);
+    let expected_fee = ceil_liquidation_fee_ref(
+        100 * POS_SCALE,
+        landed_price,
+        liquidation_fee_bps,
+        0,
+        percolator::MAX_PROTOCOL_FEE_ABS,
+    );
+
+    let insurance_before = state::read_market(&market.data).unwrap().1.insurance;
     let vault_before = state::read_market(&market.data).unwrap().1.vault;
     run_ix(
         Instruction::PermissionlessCrank {
             action: 1,
             asset_index: 0,
-            now_slot: 1,
+            now_slot: 100,
             funding_rate_e9: 0,
             recovery_reason: 0,
         },
@@ -14431,12 +14669,29 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
-    assert!(percolator::active_bitmap_is_empty(short.active_bitmap));
     assert_eq!(
-        group.insurance, 100,
-        "without an optional cranker portfolio, the full liquidation penalty remains in insurance"
+        group.assets[0].effective_price, landed_price,
+        "fixture assumption: the single-step price clamp landed where derived"
     );
-    assert_eq!(group.vault, vault_before);
+    assert_eq!(
+        short.pnl, 0,
+        "fixture assumption: the account must stay solvent (pnl>=0) through liquidation -- a \
+         genuinely bankrupt (pnl<0) account would have its liquidation fee unconditionally \
+         waived, making this test's nonzero-fee premise unreachable"
+    );
+    assert!(
+        percolator::active_bitmap_is_empty(short.active_bitmap),
+        "E3 must select a full close when no healthy partial exists within its search bound"
+    );
+    assert_eq!(
+        group.insurance,
+        insurance_before + expected_fee,
+        "without an optional cranker portfolio, the full liquidation penalty (derived: ceil-notional \
+         fee at the landed price) remains in insurance -- not zero (would mean the fee was skipped) \
+         and not more (would mean rounding is accumulating beyond the engine's own ceil-per-close \
+         guarantee)"
+    );
+    assert_eq!(group.vault, vault_before, "internal liquidation fee must not move SPL vault custody");
 }
 
 #[test]

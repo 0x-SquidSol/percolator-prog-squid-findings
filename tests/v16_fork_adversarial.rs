@@ -149,6 +149,37 @@ fn assert_custom(res: Result<(), TransactionError>, code: u32, label: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// E4 (upstream engine 8f25aa5d / this fork's percolator @ 1ecbd9d0, "charge
+// sub-atom trade fees on ceil notional") reference reimplementations.
+// Mirror engine `risk_notional_ceil`/`trade_fee_notional_ceil` and
+// `checked_fee_bps` (percolator src/v16.rs) EXACTLY, formula-for-formula, so
+// the expected fee below is DERIVED from the same ceiling-division algorithm
+// the engine runs, not a hardcoded observed number. (percolator-prog's own
+// `batch_leg_fee` in src/v16_program.rs reconstructs engine fee math the same
+// way for the same reason: an independent, traceable re-derivation, not a
+// magic constant.)
+// ---------------------------------------------------------------------------
+fn ceil_notional_ref(size_q: u128, price: u64) -> u128 {
+    if size_q == 0 || price == 0 {
+        return 0;
+    }
+    let product = size_q * price as u128;
+    let q = product / POS_SCALE;
+    let r = product % POS_SCALE;
+    q + u128::from(r != 0)
+}
+
+fn ceil_fee_bps_ref(notional: u128, fee_bps: u64) -> u128 {
+    if notional == 0 || fee_bps == 0 {
+        return 0;
+    }
+    let product = notional * fee_bps as u128;
+    let q = product / 10_000; // MAX_MARGIN_BPS
+    let r = product % 10_000;
+    q + u128::from(r != 0)
+}
+
+// ---------------------------------------------------------------------------
 // Self-contained adversarial harness.
 // ---------------------------------------------------------------------------
 struct Env {
@@ -865,13 +896,49 @@ fn adv_min_position_whipsaw_no_rounding_mint() {
 // ===========================================================================
 // SCENARIO 10 — many one-unit trades: sub-quantum rounding must not accumulate.
 // v12: test_attack_many_one_unit_trades_no_rounding_accumulation (archive L867-914).
-// OPERATIVE DEFENSE (load-bearing here): trade_notional_floor (v16.rs:20186) floors
-// a 1-quantum (size_q=1, POS_SCALE=1e6) notional to 0. We charge fee_bps=100 on
-// EVERY trade: if the floor were broken (notional not floored to 0) the fee would
-// be charged into insurance, so asserting insurance EXACTLY unchanged makes the
-// floor load-bearing. Combined with exact capital/PnL conservation across 100
-// attach/detach cycles, this proves sub-quantum trades are economically INERT
-// (no minted/burned dust) — the v12 rounding-accumulation invariant.
+//
+// FIX E4 (upstream engine 8f25aa5d / this fork's percolator @ 1ecbd9d0, "charge
+// sub-atom trade fees on ceil notional") fixture repair. This test's hardcoded
+// "insurance EXACTLY unchanged" assertion documented the OLD, BROKEN behavior:
+// pre-E4, `apply_trade_after_refresh_not_atomic` computed the trade fee on
+// `trade_notional_floor(size_q, exec_price)`, which floors to 0 for every
+// one-unit fill here (size_q=1, exec_price=100: 1*100 / POS_SCALE(1e6) has a
+// nonzero numerator strictly less than the denominator, so floor = 0), which
+// zeroed the fee via `checked_fee_bps`'s notional==0 short-circuit — even
+// though every such fill opens one real, non-dust atom of open interest. That
+// is precisely the free-OI-via-rounding exploit E4 closed: build an arbitrary
+// position for zero fee, one indivisible atom at a time, by construction. This
+// test's own comment called that the "OPERATIVE DEFENSE" and asserted it as
+// correct; it was in fact the bug.
+//
+// E4 computes the fee on `trade_fee_notional_ceil` (ceil(size_q*exec_price /
+// POS_SCALE)) instead, kept deliberately separate from the floor-based
+// `notional` that still drives margin/PnL/TradeApplyOutcomeV16 accounting (see
+// percolator src/v16.rs:13061-13065 and the E4 commit message). For this exact
+// fixture (size_q=1, exec_price=100) that ceil is 1 (100/1_000_000 has a
+// nonzero remainder), so `checked_fee_bps(notional=1, fee_bps=100)` =
+// ceil(1*100/10_000) = 1 atom of fee is now correctly charged on EVERY
+// successful one-unit trade. Derivation is proof-checked below via
+// `ceil_notional_ref`/`ceil_fee_bps_ref`, exact reimplementations of the
+// engine's `risk_notional_ceil`/`trade_fee_notional_ceil` and
+// `checked_fee_bps` formulas (not hardcoded from an observed run) — matching
+// upstream's own non-vacuity proof
+// `proof_v16_trade_fee_notional_ceil_strictly_exceeds_floor_when_unaligned`
+// (0/426 failed) and unit test `v16_subatom_trade_charges_fee_on_ceil_fee_notional`.
+//
+// REPAIRED OPERATIVE DEFENSE (still load-bearing, now against the CORRECT
+// bug class): the fee charged must be EXACTLY `successful_trades *
+// expected_fee_per_trade` — not zero (the pre-E4 floor-notional evasion this
+// test originally, mistakenly, asserted as correct) and not MORE than that
+// deterministic total (which would mean the ceil-notional fee is itself
+// compounding/over-rounding across repeated sub-atom trades — the actual
+// "rounding accumulation" failure mode this test exists to catch, now
+// verified against the fixed formula instead of the broken one). The
+// taker-only fee model (design §1A) charges this fee entirely to
+// `account_a` (== `ua`/`user` in every `try_trade` call below, which always
+// passes `user`/`ua` first); `la`/`lp` is always the maker and pays nothing,
+// so its capital must stay untouched — that maker-side conservation was never
+// the part of this test that E4 broke, and stays asserted unchanged.
 // ===========================================================================
 #[test]
 fn adv_many_one_unit_trades_no_rounding_accumulation() {
@@ -887,11 +954,25 @@ fn adv_many_one_unit_trades_no_rounding_accumulation() {
     let initial = (user_dep + lp_dep) as i128;
     let insurance_before = env.group().insurance;
 
+    let exec_price: u64 = 100;
+    let trade_fee_bps: u64 = 100;
+    // Derive (not hardcode) the expected per-trade fee from the engine's own
+    // ceil-notional formula (E4). Pin the fixture's boundary values so a future
+    // edit to `exec_price`/`trade_fee_bps` can't silently drift this test off
+    // the sub-atom boundary it's designed to probe.
+    let fee_notional = ceil_notional_ref(1, exec_price);
+    assert_eq!(fee_notional, 1, "fixture assumption: 1*100/POS_SCALE must ceil to exactly 1 (the sub-atom boundary E4 targets)");
+    let expected_fee_per_trade = ceil_fee_bps_ref(fee_notional, trade_fee_bps);
+    assert_eq!(expected_fee_per_trade, 1, "fixture assumption: ceil(1*100/10_000) must be exactly 1 atom of fee per one-unit trade under E4");
+
     let mut successful = 0u64;
     for round in 0..100u64 {
         let size = if round % 2 == 0 { 1i128 } else { -1i128 };
-        // fee_bps = 100: a broken notional floor would charge a fee -> insurance grows.
-        if env.try_trade(&user, ua, &lp, la, size, 100, 100).is_ok() {
+        // E4: every successful one-unit trade now charges exactly
+        // `expected_fee_per_trade` (ceil-notional fee) into insurance, taken
+        // from the taker's (`ua`) capital. Pre-E4 the floor-notional bug made
+        // this fee-less; see the header comment for the derivation.
+        if env.try_trade(&user, ua, &lp, la, size, exec_price, trade_fee_bps).is_ok() {
             successful += 1;
         }
         if round % 10 == 0 {
@@ -907,13 +988,32 @@ fn adv_many_one_unit_trades_no_rounding_accumulation() {
     assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
     assert_eq!(env.residual(), 0, "one-unit trades must not create trader-claimable residual");
 
-    // LOAD-BEARING floor check: with fee_bps=100 on every trade, insurance is EXACTLY
-    // unchanged only because trade_notional_floor(1,100)=0 -> checked_fee_bps(0,100)=0.
-    // A broken floor would have charged a fee and grown insurance.
-    assert_eq!(env.group().insurance, insurance_before, "sub-quantum trade charged a fee -> notional floor failed");
-    // Exact zero-dust conservation across all 100 attach/detach cycles.
-    assert_eq!(env.portfolio(ua).capital, user_dep, "sub-quantum trades minted/burned user capital dust");
-    assert_eq!(env.portfolio(la).capital, lp_dep, "sub-quantum trades minted/burned LP capital dust");
+    // LOAD-BEARING E4 ceil-notional check (repairs the pre-E4 assertion that
+    // insurance stayed EXACTLY unchanged, which enshrined the floor-notional
+    // fee-evasion bug as correct behavior — see the derivation above).
+    // Insurance must grow by EXACTLY `successful * expected_fee_per_trade`:
+    // not zero (pre-E4 evasion would regress this back to 0), and not more
+    // than that deterministic total (which would mean sub-atom rounding IS
+    // accumulating beyond the engine's own ceil-per-trade guarantee — the
+    // actual rounding-accumulation bug class this test's purpose is to catch).
+    let expected_insurance_growth = successful as u128 * expected_fee_per_trade;
+    assert_eq!(
+        env.group().insurance,
+        insurance_before + expected_insurance_growth,
+        "sub-atom trade fee must accrue EXACTLY successful_trades * ceil-notional-fee to insurance \
+         -- not zero (pre-E4 floor-notional evasion) and not more (rounding accumulation)"
+    );
+    // Exact conservation across all 100 attach/detach cycles: the taker
+    // (`ua`/`user`, always `account_a`) pays exactly the ceil-notional fee
+    // total; the maker (`la`/`lp`) pays nothing (taker-only fee model, design
+    // §1A) and must be byte-for-byte untouched.
+    assert_eq!(
+        env.portfolio(ua).capital,
+        user_dep - expected_insurance_growth,
+        "taker capital must be debited by EXACTLY the ceil-notional fee total -- no more (dust \
+         accumulation), no less (fee evasion regressing E4)"
+    );
+    assert_eq!(env.portfolio(la).capital, lp_dep, "maker capital must be untouched by the taker-only fee");
     assert_eq!(env.portfolio(ua).pnl, 0, "sub-quantum trades accumulated user PnL dust");
     assert_eq!(env.portfolio(la).pnl, 0, "sub-quantum trades accumulated LP PnL dust");
 }
