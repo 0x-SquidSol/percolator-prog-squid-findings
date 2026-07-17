@@ -2247,15 +2247,33 @@ fn x7_registry_wrong_nft_program_id_rejects() {
 
 /// X3-LP-LIEN — the LP-redemption OI-reservation guard (Custom 37).
 ///
+/// LP-VAULT-REDEEM-BUG (found + fixed 2026-07-17): prior to the fix,
+/// `outstanding_post` in the guard counted ALL remaining fresh (un-liened)
+/// backing as "outstanding," not just backing genuinely liened against real
+/// open interest -- so this exact test, prior to the fix, asserted that a
+/// PARTIAL redemption against a CLEAN (zero-OI) bucket rejects under ANY
+/// nonzero threshold. That was the bug: it bricked ordinary, fully-solvent,
+/// zero-OI redemption for every real deployed vault (since no wrapper
+/// instruction ever writes `valid_liened_backing_num` on a real trade -- see
+/// CONSTRUCTIBILITY NOTE below), while protecting nothing. The fix narrows
+/// `outstanding_post` to `bucket.valid_liened_backing_num` only. See
+/// tests/v16_fork_lp_vault_redeem.rs for the full writeup and the
+/// non-vacuous fail-pre-fix/pass-post-fix proof.
+///
+/// This test now pins the CORRECTED accept-path semantics: a PARTIAL
+/// redemption against a CLEAN bucket now SUCCEEDS under a nonzero threshold
+/// (there is no real OI to protect). The reject-path (genuine OI lien still
+/// blocks an under-backed redemption, Custom 37) is pinned separately below
+/// in `x3_lp_redemption_oi_reservation_genuine_lien_still_rejects`.
+///
 /// CONSTRUCTIBILITY NOTE: the TRUE "matcher/trade OI lien blocks redemption" path
 /// is NOT reachable with the real programs — no wrapper instruction writes the
 /// engine's `valid_liened_backing_num` (it is mutated only by a `#[cfg(test)]`
-/// engine unit path), so a real trade leaves the lien at zero. What IS reachable,
-/// and what this pins in the assembled instance, is the fail-closed threshold
-/// haircut: with `oi_reservation_threshold_bps > 0`, a PARTIAL redemption against
-/// fresh (un-liened) backing reverts `LpVaultOiReservationViolated Custom(37)`
-/// because `covered = nav_post * threshold/10_000 < outstanding_post`. (Logged as a
-/// cross-cut divergence: true OI-lien path deferred / not program-constructible.)
+/// engine unit path), so a real trade leaves the lien at zero. The reject-path
+/// test below hand-crafts the lien field directly (same raw-account-poke
+/// technique used throughout tests/v16_fork_lp_vault_redeem.rs) to exercise the
+/// guard's real solvency logic despite this. (Logged as a cross-cut divergence:
+/// true OI-lien path deferred / not program-constructible.)
 #[test]
 fn x3_lp_redemption_oi_reservation_guard_fires() {
     let mut env = CrosscutEnv::new();
@@ -2270,16 +2288,82 @@ fn x3_lp_redemption_oi_reservation_guard_fires() {
     // Executed guard: the deposit really minted shares (the guard isn't trivially met).
     assert_eq!(env.token_amount(lp_ata), minted as u64, "deposit minted LP shares");
 
-    // A PARTIAL redemption against fresh backing is fail-closed by the OI guard.
+    // A PARTIAL redemption against a CLEAN (zero-OI) bucket now succeeds under
+    // any nonzero threshold — non-vacuously proven to fail pre-fix and pass
+    // post-fix in tests/v16_fork_lp_vault_redeem.rs
+    // (execute_redemption_oi_reservation_clean_bucket_partial_succeeds).
     let redemption =
         state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
     env.lp_request_redeem(&depositor, redemption, lp_ata, l / 2);
-    let (_dest, res) = env.lp_try_execute_redeem(&depositor, redemption);
+    let dest = env.lp_execute_redeem(&depositor, redemption);
+    assert_eq!(
+        env.token_amount(dest),
+        (l / 2) as u64,
+        "clean-bucket partial redemption pays exact pro-rata, no longer fail-closed"
+    );
+}
+
+/// Hand-crafts a genuine OI lien on `domain`'s backing bucket: moves
+/// `lien_atoms` worth of backing from `fresh_unliened_backing_num` into
+/// `valid_liened_backing_num` -- the effect a real matcher/trade-CPI lien
+/// against LP-vault backing would have (see CONSTRUCTIBILITY NOTE above).
+/// Total bucket backing is unchanged, so header/vault aggregates stay in
+/// lockstep and `validate_shape()` still passes.
+fn set_bucket_oi_lien_for_test(env: &mut CrosscutEnv, domain: u16, lien_atoms: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    let lien_num = lien_atoms * percolator::BOUND_SCALE;
+    let bucket = &mut group.source_backing_buckets[domain as usize];
+    bucket.fresh_unliened_backing_num = bucket
+        .fresh_unliened_backing_num
+        .checked_sub(lien_num)
+        .expect("enough fresh backing to lien");
+    bucket.valid_liened_backing_num = bucket
+        .valid_liened_backing_num
+        .checked_add(lien_num)
+        .expect("no overflow");
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+/// NEGATIVE test (solvency preserved): a redemption that would leave a
+/// GENUINE OI lien uncovered by post-redeem NAV at the configured threshold
+/// is still rejected at LpVaultOiReservationViolated (Custom 37) after the
+/// LP-VAULT-REDEEM-BUG fix.
+///
+/// Single depositor deposits l=1_000_000 (mints 999_000). Hand-craft a
+/// genuine OI lien of 400_000 atoms, leaving fresh_unliened_backing_num =
+/// 600_000. Threshold = 5_000 (50%). Redeem 500_000:
+///   - Availability gate: fresh_unliened (600_000) >= backing_num (500_000)
+///     -> passes (not the gate that fires).
+///   - Post-redeem NAV = 1_000_000 - 500_000 = 500_000 (no earnings).
+///   - covered = nav_post * 50% = 250_000.
+///   - outstanding_post = valid_liened_backing_num = 400_000.
+///   - covered (250_000) < outstanding_post (400_000) -> REJECT, Custom(37).
+/// This holds under BOTH the old and new formula (old: outstanding_post =
+/// (600_000 - 500_000) + 400_000 = 500_000, even larger) — proving the fix
+/// did not weaken protection against real OI.
+#[test]
+fn x3_lp_redemption_oi_reservation_genuine_lien_still_rejects() {
+    let mut env = CrosscutEnv::new();
+    env.lp_create_full(0, 0, 5_000); // 50% OI-reservation threshold
+    let depositor = Keypair::new();
+    env.svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let l: u128 = 1_000_000;
+    let (lp_ata, _src) = env.lp_deposit(&depositor, l);
+
+    set_bucket_oi_lien_for_test(&mut env, CROSSCUT_DOMAIN, 400_000);
+
+    let redemption =
+        state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
+    env.lp_request_redeem(&depositor, redemption, lp_ata, l / 2);
+    let (dest, res) = env.lp_try_execute_redeem(&depositor, redemption);
     assert_custom(
         res,
         LP_VAULT_OI_RESERVATION_VIOLATED,
-        "partial redeem under a non-zero OI threshold is fail-closed (Custom 37)",
+        "redemption leaving a genuine OI lien uncovered is still fail-closed (Custom 37)",
     );
+    assert_eq!(env.token_amount(dest), 0, "no payout on the rejected under-backed redemption");
 }
 
 /// 3A.1b — a real matcher `TradeCpi` fires through the loaded `percolator_match`

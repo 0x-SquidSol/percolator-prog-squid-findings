@@ -588,21 +588,176 @@ fn setup_vault_admin_authority() -> Env {
 }
 
 // ── Phase 2.E deferred LP test #1: OI-reservation reject (I6) ───────────────
-/// A redemption that would leave the vault's outstanding backing uncovered by
-/// (nav_post * oi_reservation_threshold_bps) is rejected at
-/// LpVaultOiReservationViolated (Custom 37); guard at v16_program.rs:5990-6013.
-/// The accept path (threshold = 0, guard disabled) is `request_then_execute_pays_pro_rata`.
+// LP-VAULT-REDEEM-BUG (found + fixed 2026-07-17): `outstanding_post` in the
+// OI-reservation guard (v16_program.rs handle_execute_redemption) was
+// `(bucket.fresh_unliened_backing_num - backing_num) + bucket.valid_liened_backing_num`
+// -- i.e. it counted ALL remaining idle/uncommitted LP capital as
+// "outstanding," not just backing genuinely liened against real open
+// interest. Because no wrapper instruction in this build ever writes
+// `bucket.valid_liened_backing_num` on a real trade (grep-confirmed: the only
+// non-test write site is a raw-struct-poke inside a `#[test]` fn), that field
+// is always 0 on every deployed vault, so the old formula reduced to an
+// unconditional NAV-surplus-over-idle-capital requirement that rejected
+// EVERY ordinary, fully-solvent, zero-OI redemption above threshold_bps=0 --
+// this exact test, prior to the fix, asserted that broken behavior as
+// "expected." The fix narrows `outstanding_post` to `bucket.valid_liened_backing_num`
+// only (real OI at risk); see the fix-site comment for the full writeup.
+//
+// This test now exercises the CORRECTED semantics: a genuine OI lien
+// (hand-crafted via `set_bucket_oi_lien_for_test`, the only way to get real
+// OI into `valid_liened_backing_num` in this build -- same technique as
+// `set_source_credit_lien_for_test` above) that the post-redeem NAV cannot
+// cover at the configured threshold is STILL rejected at
+// LpVaultOiReservationViolated (Custom 37) -- proving the fix narrows the
+// guard to real risk without deleting solvency protection.
+//
+// The accept path for a CLEAN (zero-OI) bucket at a nonzero threshold --
+// i.e. the fix itself, non-vacuously proven to fail pre-fix and pass
+// post-fix -- is `execute_redemption_oi_reservation_clean_bucket_partial_succeeds`
+// / `execute_redemption_oi_reservation_clean_bucket_full_succeeds` below. The
+// threshold=0 (guard fully disabled) accept path is
+// `request_then_execute_pays_pro_rata`.
+
+/// Hand-crafts a genuine OI lien on `domain`'s backing bucket: moves
+/// `lien_atoms` worth of backing from `fresh_unliened_backing_num` into
+/// `valid_liened_backing_num` -- exactly the effect a real matcher/trade-CPI
+/// lien against LP-vault backing would have. Total bucket backing
+/// (fresh_unliened + valid_liened) is unchanged, so header/vault aggregates
+/// stay in lockstep and `validate_shape()` still passes. Same raw-account-poke
+/// pattern as `set_source_credit_lien_for_test` / `seed_earnings` above, used
+/// because no wrapper instruction in this build opens a real position against
+/// LP-vault backing (CONSTRUCTIBILITY NOTE, tests/v16_five_program_crosscut.rs).
+fn set_bucket_oi_lien_for_test(env: &mut Env, domain: u16, lien_atoms: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    let lien_num = lien_atoms * percolator::BOUND_SCALE;
+    let bucket = &mut group.source_backing_buckets[domain as usize];
+    bucket.fresh_unliened_backing_num = bucket
+        .fresh_unliened_backing_num
+        .checked_sub(lien_num)
+        .expect("enough fresh backing to lien");
+    bucket.valid_liened_backing_num = bucket
+        .valid_liened_backing_num
+        .checked_add(lien_num)
+        .expect("no overflow");
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+/// NEGATIVE test (solvency preserved): a redemption that would leave a
+/// GENUINE OI lien uncovered by post-redeem NAV at the configured threshold
+/// is rejected at LpVaultOiReservationViolated (Custom 37), even after the
+/// LP-VAULT-REDEEM-BUG fix.
+///
+/// Two depositors share DOMAIN's backing pool (no earnings -> 1:1):
+///   D1 (genesis): deposits DEPOSIT (1_000_000), mints MINTED (999_000).
+///   D2: deposits 2*DEPOSIT (2_000_000), mints 2_000_000.
+/// Total bucket backing = 3_000_000 atoms.
+///
+/// Hand-craft a genuine OI lien of 1_500_000 atoms (bucket.valid_liened_backing_num),
+/// leaving bucket.fresh_unliened_backing_num = 1_500_000. Threshold = 5_000 (50%).
+///
+/// D1 redeems its full MINTED (999_000):
+///   - Availability gate: fresh_unliened_backing_num (1_500_000) >= backing_num
+///     (999_000) -> passes (not the availability gate that fires).
+///   - Post-redeem NAV = 3_000_000 - 999_000 = 2_001_000 (no earnings).
+///   - covered = nav_post * 50% = 1_000_500.
+///   - outstanding_post = valid_liened_backing_num = 1_500_000.
+///   - covered (1_000_500) < outstanding_post (1_500_000) -> REJECT, Custom(37).
+/// This holds under BOTH the old and new formula (old: outstanding_post =
+/// (1_500_000 - 999_000) + 1_500_000 = 2_001_000, even larger) -- proving the
+/// fix did not weaken protection against real OI, it only removed the
+/// idle-capital term that had nothing to do with real risk.
 #[test]
 fn execute_redemption_oi_reservation_violation_rejects() {
     let mut env = setup_vault_oi(0, 5_000); // 50% OI reservation, immediate cooldown
-    let d = new_depositor(&mut env, DEPOSIT);
-    // Redeem a fraction so backing remains outstanding; with a 50% reservation the
-    // post-redemption NAV cannot cover the still-reserved backing -> reject.
-    request(&mut env, &d, DEPOSIT / 4).expect("request");
+    let d1 = new_depositor(&mut env, DEPOSIT);
+    let _d2 = new_depositor(&mut env, 2 * DEPOSIT);
+
+    let lien_atoms: u128 = 1_500_000;
+    set_bucket_oi_lien_for_test(&mut env, DOMAIN, lien_atoms);
+
+    request(&mut env, &d1, MINTED).expect("request d1 full MINTED");
     env.svm.expire_blockhash();
-    let res = execute(&mut env, &d);
+    let res = execute(&mut env, &d1);
     let msg = format!("{res:?}");
     assert!(msg.contains("Custom(37)"), "expected LpVaultOiReservationViolated Custom(37), got: {msg}");
+    // Solvency preserved: no payout, no state mutation on the rejected redemption.
+    assert_eq!(tok(&env.svm, d1.dest), 0, "no payout on the rejected under-backed redemption");
+}
+
+/// POSITIVE / NON-VACUOUS fix-proof test (S3): a PARTIAL redemption of a
+/// CLEAN (zero real-OI) bucket at a conventional nonzero threshold (8_000 bps
+/// = 80%, mirroring the observed devnet run-full.ts flow) MUST SUCCEED with
+/// an exact pro-rata payout.
+///
+/// This is the accept-path test that was entirely absent before this fix --
+/// every pre-existing nonzero-threshold test asserted only rejection. Before
+/// the fix, outstanding_post = (fresh_unliened_backing_num - backing_num) + 0
+/// = (1_000_000 - 499_500) = 500_500; nav_post = 500_500; covered = 500_500 *
+/// 80% = 400_400 < 500_500 -> REJECT Custom(37) (verified live against the
+/// exact hash-verified pre-fix deployed bytecode, sha256
+/// 8a833a53c3a18fc8d2c9dee372ce37c62ef06a3e84a4ec8819500061d656b23f, this
+/// session). After the fix, outstanding_post = valid_liened_backing_num = 0
+/// (no real OI was ever crafted here) -> covered(any) >= 0 always -> ACCEPT.
+/// Proves the fix non-vacuously: this test fails against the pre-fix
+/// source/bytecode and passes against the post-fix source/bytecode.
+#[test]
+fn execute_redemption_oi_reservation_clean_bucket_partial_succeeds() {
+    let mut env = setup_vault_oi(0, 8_000); // 80% OI reservation, immediate cooldown
+    let d = new_depositor(&mut env, DEPOSIT);
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64);
+
+    // Partial redemption: half of MINTED (999_000 / 2 = 499_500, exact).
+    let half = MINTED / 2;
+    request(&mut env, &d, half).expect("request partial");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect(
+        "partial redemption of a CLEAN (zero-OI) bucket must succeed under any \
+         oi_reservation_threshold_bps -- there is no real OI to protect",
+    );
+    assert_eq!(tok(&env.svm, d.dest), half as u64, "partial redeemer paid exactly half of MINTED, no dust");
+    let r = reg(&env);
+    assert_eq!(r.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY + (MINTED - half), "remaining outstanding shares exact");
+}
+
+/// POSITIVE / NON-VACUOUS fix-proof test (S4): a FULL redemption of a CLEAN
+/// (zero real-OI) bucket at a conventional nonzero threshold (8_000 bps =
+/// 80%) MUST SUCCEED with an exact pro-rata payout, draining down to the
+/// dead-share floor exactly like the threshold=0 accept path
+/// (`request_then_execute_pays_pro_rata`).
+///
+/// Separate `Env`/depositor from the partial test above (not a second
+/// request on the same redemption PDA) -- LiteSVM 0.1.0 does not reap a
+/// zero-lamport-closed PDA between separate `send_transaction` calls within
+/// one test process the way a live validator's end-of-transaction account
+/// sweep would, so re-deriving the same (registry, redeemer) redemption PDA
+/// for a second `RequestRedeemLpShares` in the same env spuriously rejects
+/// with AlreadyInitialized (Custom 2) -- an unrelated LiteSVM harness
+/// limitation, not a wrapper bug (single request-then-execute cycles are
+/// unaffected, as proven throughout this file).
+///
+/// Before the fix: outstanding_post = (1_000_000 - 999_000) + 0 = 1_000;
+/// nav_post = 1_000; covered = 1_000 * 80% = 800 < 1_000 -> REJECT Custom(37)
+/// (verified live against the pre-fix bytecode this session -- even the
+/// dead-share floor's 1_000-atom margin trips the bug). After the fix:
+/// outstanding_post = 0 -> ACCEPT.
+#[test]
+fn execute_redemption_oi_reservation_clean_bucket_full_succeeds() {
+    let mut env = setup_vault_oi(0, 8_000); // 80% OI reservation, immediate cooldown
+    let d = new_depositor(&mut env, DEPOSIT);
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64);
+
+    request(&mut env, &d, MINTED).expect("request full MINTED");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect(
+        "full redemption of a CLEAN (zero-OI) bucket must succeed under any \
+         oi_reservation_threshold_bps -- there is no real OI to protect",
+    );
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata in full");
+    assert_eq!(tok(&env.svm, env.escrow), 0, "escrow burned to zero");
+    let r = reg(&env);
+    assert_eq!(r.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY, "dead-share floor remains, not 0");
 }
 
 // W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL

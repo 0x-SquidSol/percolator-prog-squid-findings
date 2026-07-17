@@ -13634,13 +13634,31 @@ pub mod processor {
             // OI reservation guard: leave nav_post * threshold/10_000 of
             // outstanding backing covered. nav_post is computed from the full
             // post-redeem NAV (available_principal_post + lp_earnings_post).
+            //
+            // LP-VAULT-REDEEM-BUG fix (2026-07-17): outstanding_post is the
+            // backing actually AT RISK against real open interest, i.e. the
+            // bucket's `valid_liened_backing_num` only. The prior formula
+            // additionally folded in `fresh_unliened_backing_num` (idle,
+            // uncommitted LP capital with no OI against it) after subtracting
+            // this redemption's principal, so it was really measuring "all
+            // capital left in the vault," not "capital at risk." Since no
+            // wrapper instruction in this build ever writes
+            // `valid_liened_backing_num` on a real trade (it is always 0 on
+            // every deployed vault today), the old formula degenerated into an
+            // unconditional NAV-surplus-over-idle-capital requirement that
+            // rejected every ordinary, fully-solvent, zero-OI redemption for
+            // any nonzero oi_reservation_threshold_bps -- while providing zero
+            // actual OI protection, since there was never real OI to protect.
+            // This one-line fix restores the guard's intended meaning: reject
+            // only when the redemption would leave *real* liened OI
+            // insufficiently covered by post-redeem NAV. See
+            // execute_redemption_oi_reservation_clean_bucket_partial_succeeds /
+            // execute_redemption_oi_reservation_clean_bucket_full_succeeds
+            // (accept path) and execute_redemption_oi_reservation_violation_rejects
+            // (genuine-lien reject path, solvency-preserving) in
+            // tests/v16_fork_lp_vault_redeem.rs.
             if registry.oi_reservation_threshold_bps != 0 {
-                let outstanding_post = bucket
-                    .fresh_unliened_backing_num
-                    .checked_sub(backing_num)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?
-                    .checked_add(bucket.valid_liened_backing_num)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                let outstanding_post = bucket.valid_liened_backing_num;
                 // Post-redeem NAV: recompute with post-withdrawal counters.
                 let post_principal = ledger
                     .total_principal_atoms
