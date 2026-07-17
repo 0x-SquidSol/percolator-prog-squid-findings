@@ -1112,6 +1112,36 @@ impl V16CuEnv {
         )
     }
 
+    /// FIX (upstream #400, "require cranker portfolio owner to sign
+    /// SyncMaintenanceFee reward claim"): when the maintenance-fee cranker
+    /// reward is directed at a THIRD-PARTY portfolio (cranker_portfolio !=
+    /// portfolio being synced), the handler requires accounts[3] to be that
+    /// cranker portfolio's owner, signing -- otherwise any caller could
+    /// direct every user's maintenance-fee reward share to an
+    /// attacker-controlled portfolio. `sync_maintenance_fee_with_cu` above
+    /// covers the self-crank (cranker_portfolio == portfolio or None) path,
+    /// which does not need this signer; use this variant for the
+    /// separate-cranker path.
+    fn sync_maintenance_fee_with_cranker_owner_with_cu(
+        &mut self,
+        portfolio: Pubkey,
+        cranker_portfolio: Pubkey,
+        cranker_owner: &Keypair,
+        now_slot: u64,
+    ) -> u64 {
+        self.send(
+            ProgInstruction::SyncMaintenanceFee { now_slot },
+            vec![
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(cranker_portfolio, false),
+                AccountMeta::new_readonly(cranker_owner.pubkey(), true),
+            ],
+            &[cranker_owner],
+        )
+        .expect("sync maintenance fee with cranker owner")
+    }
+
     fn seed_n_leg_position_for_benchmark(
         &mut self,
         long_account: Pubkey,
@@ -2502,6 +2532,63 @@ impl V16CuEnv {
         .expect("withdraw backing bucket to admin token")
     }
 
+    fn try_withdraw_backing_bucket_to_admin_token_with_cu(
+        &mut self,
+        dest: Pubkey,
+        domain: u16,
+        amount: u128,
+    ) -> Result<u64, String> {
+        send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            vec![
+                AccountMeta::new(self.admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&self.admin],
+        )
+    }
+
+    /// FIX (upstream #395, F-3 / D-STAKE-1 guard): once a domain's
+    /// `backing_bucket_authority` is bound to a non-zero authority (always
+    /// true for an activated asset), `marketauth`'s admin shutdown-drain
+    /// bypass is blocked -- only the bound `backing_bucket_authority` itself
+    /// may withdraw, even after shutdown. `withdraw_backing_bucket_to_admin_token_with_cu`
+    /// above (signed by `self.admin`) only remains valid for domains whose
+    /// authority was never separately bound; use this variant when the
+    /// domain's backing_bucket_authority is a distinct signer.
+    fn withdraw_backing_bucket_with_authority_cu(
+        &mut self,
+        authority: &Keypair,
+        dest: Pubkey,
+        domain: u16,
+        amount: u128,
+    ) -> u64 {
+        self.ensure_signer_account(authority.pubkey());
+        send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            vec![
+                AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[authority],
+        )
+        .expect("withdraw backing bucket with authority")
+    }
+
     fn sync_backing_domain_ledger_with_cu(&mut self, ledger: Pubkey, domain: u16) -> u64 {
         send_tx(
             &mut self.svm,
@@ -3880,31 +3967,63 @@ fn v16_bpf_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot(
     assert!(!has_active_leg_for_asset(&short_closed, 1));
 
     let admin_key = env.admin.pubkey();
-    let admin_recovery = env.token_account(admin_key, 0);
     // v17 convergence: WithdrawInsuranceDomain per-side removed. v17 uses per-asset insurance
     // via WithdrawInsuranceAsset. For asset 1 with bound insurance_authority (non-zero),
     // only insurance_operator can sign (D-STAKE-1 guard blocks admin bypass), and dest must
-    // be owned by the signer (insurance_operator). Backing domains 2+3 still go to admin.
-    // Insurance recovery (10) → insurance_op_dest; backing recovery (45) → admin_recovery.
+    // be owned by the signer (insurance_operator).
+    //
+    // Fixture repair note (unrelated to E3/E4): the backing-bucket half of this comment was
+    // stale -- upstream #395 (F-3 / D-STAKE-1 guard) blocks marketauth's admin shutdown-drain
+    // bypass on WithdrawBackingBucket too, the moment a domain's backing_bucket_authority is
+    // bound to a non-zero authority (which it always is here: `backing_authority` was bound at
+    // activation above). So domains 2+3 must also go through the bound `backing_authority`, not
+    // admin, exactly like the insurance leg already does one line below. Predates this session's
+    // E3/E4 engine work entirely (#395 landed 2026-06-23, same day as #393/#398/#400 above).
+    // Insurance recovery (10) → insurance_op_dest; backing recovery (45) → backing_recovery.
     // Matrix row: v17-auth-overhaul (per-side domain insurance → per-asset, D-STAKE-1 guard).
     let insurance_operator_clone = insurance_operator.insecure_clone();
     let insurance_op_dest = env.token_account(insurance_operator.pubkey(), 0);
     env.withdraw_insurance_asset_with_authority_cu(&insurance_operator_clone, insurance_op_dest, 1, 10);
+    let backing_authority_clone = backing_authority.insecure_clone();
+    let backing_recovery = env.token_account(backing_authority.pubkey(), 0);
+    // D-STAKE-1 negative check: marketauth (admin) must NOT be able to bypass the bound
+    // backing_bucket_authority via the shutdown-drain path, even now that asset 1 is in
+    // Recovery. Guards against a regression that reintroduces the admin bypass this
+    // fixture repair otherwise wouldn't catch (it only exercises the authorized-signer path).
+    let admin_recovery_probe = env.token_account(admin_key, 0);
+    let admin_bypass_attempt =
+        env.try_withdraw_backing_bucket_to_admin_token_with_cu(admin_recovery_probe, 2, 20);
+    assert!(
+        admin_bypass_attempt.is_err(),
+        "marketauth must not be able to withdraw a domain whose backing_bucket_authority is \
+         bound to a distinct authority, even after shutdown"
+    );
     for (domain, amount) in [(2u16, 20u128), (3u16, 25u128)] {
-        env.withdraw_backing_bucket_to_admin_token_with_cu(admin_recovery, domain, amount);
+        env.withdraw_backing_bucket_with_authority_cu(
+            &backing_authority_clone,
+            backing_recovery,
+            domain,
+            amount,
+        );
     }
     assert_eq!(env.token_amount(insurance_op_dest), 10);
-    assert_eq!(env.token_amount(admin_recovery), 45);
+    assert_eq!(env.token_amount(backing_recovery), 45);
     assert_eq!(
-        env.token_amount(insurance_op_dest) + env.token_amount(admin_recovery),
+        env.token_amount(insurance_op_dest) + env.token_amount(backing_recovery),
         55,
-        "admin+operator must recover all asset-domain insurance and backing funds"
+        "insurance operator + backing authority must recover all asset-domain insurance and \
+         backing funds"
     );
     assert_eq!(env.token_amount(env.vault), 20_025);
 
-    // Re-deposit insurance via TopUpInsurance using a fresh admin-owned source token account
-    // containing the 10 recovered insurance atoms (separate from insurance_op_dest which is
-    // operator-owned). This preserves the original test's insurance_domain_budget assertions.
+    // Re-deposit insurance/backing via TopUpInsurance/TopUpBackingBucket using fresh
+    // admin-owned source token accounts containing the recovered atoms (separate from
+    // insurance_op_dest/backing_recovery, which are operator/backing-authority-owned --
+    // TopUpBackingBucket for market-0's domain 0 requires the source be owned by market-0's
+    // own backing_bucket_authority, which is admin by default, not `backing_authority` from
+    // asset 1 above). This preserves the original test's insurance_domain_budget assertions
+    // while respecting the same per-domain authority boundaries the withdrawal side above
+    // now enforces.
     let insurance_redeposit_src = Pubkey::new_unique();
     env.svm.set_account(insurance_redeposit_src, solana_sdk::account::Account {
         lamports: 1_000_000_000,
@@ -3914,11 +4033,24 @@ fn v16_bpf_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot(
         rent_epoch: 0,
     }).unwrap();
     env.top_up_insurance_from_admin_token_with_cu(insurance_redeposit_src, 10);
-    env.top_up_backing_bucket_from_admin_token_with_cu(admin_recovery, 0, 45, 20);
+    let backing_redeposit_src = Pubkey::new_unique();
+    env.svm.set_account(backing_redeposit_src, solana_sdk::account::Account {
+        lamports: 1_000_000_000,
+        data: make_token_data(env.mint, admin_key, 45),
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+    env.top_up_backing_bucket_from_admin_token_with_cu(backing_redeposit_src, 0, 45, 20);
     assert_eq!(
-        env.token_amount(admin_recovery),
+        env.token_amount(backing_redeposit_src),
         0,
         "recovered funds should be re-deposited into market-0 buckets"
+    );
+    assert_eq!(
+        env.token_amount(backing_recovery),
+        45,
+        "backing_authority retains custody of what it withdrew from asset 1's domains"
     );
     assert_eq!(env.token_amount(env.vault), 20_080);
     let market_data = env.svm.get_account(&env.market).unwrap().data;
@@ -5306,6 +5438,21 @@ fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
 
 #[test]
 fn v16_bpf_sync_maintenance_fee_with_cranker_share_is_bounded() {
+    // Fixture repair note: this failure is NOT an E3/E4 regression -- it
+    // predates this session's engine work entirely. Wrapper commit e0e05a78
+    // ("require cranker portfolio owner to sign SyncMaintenanceFee reward
+    // claim", #400, landed the same session as #398 above) added a required
+    // 4th account (the cranker portfolio's owner, signing) whenever the
+    // maintenance-fee cranker reward is directed at a THIRD-PARTY portfolio
+    // -- closing a "direct every user's reward share to my own account"
+    // insurance-drain path (Finding 15). This test is the ONLY call site in
+    // the whole suite that exercises the separate-cranker path (every other
+    // `sync_maintenance_fee_with_cu` caller passes `None` or self-cranks),
+    // so it is the only one #400 broke, and #400 never updated it. Repaired
+    // to supply the now-required signer via
+    // `sync_maintenance_fee_with_cranker_owner_with_cu`; the property under
+    // test (cranker's reward share is bounded/correctly computed) is
+    // unchanged.
     let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
         1, 10_000, 10_000, 10_000, 58,
     );
@@ -5317,11 +5464,16 @@ fn v16_bpf_sync_maintenance_fee_with_cranker_share_is_bounded() {
     env.update_maintenance_fee_policy_with_cu(4_000);
 
     env.svm.warp_to_slot(10);
-    let sync_cu = env.sync_maintenance_fee_with_cu(payer_portfolio, Some(cranker_portfolio), 10);
-    println!("v16 SyncMaintenanceFee 3-account cranker-share CU: {sync_cu}");
+    let sync_cu = env.sync_maintenance_fee_with_cranker_owner_with_cu(
+        payer_portfolio,
+        cranker_portfolio,
+        &cranker_owner,
+        10,
+    );
+    println!("v16 SyncMaintenanceFee 4-account cranker-share CU: {sync_cu}");
     assert!(
         sync_cu <= CUSTODY_CU_LIMIT,
-        "3-account SyncMaintenanceFee CU {} exceeded limit {}",
+        "4-account SyncMaintenanceFee CU {} exceeded limit {}",
         sync_cu,
         CUSTODY_CU_LIMIT
     );
@@ -5351,27 +5503,51 @@ fn v16_bpf_underfunded_flat_sync_sweeps_remaining_capital_once() {
     env.deposit(&short_owner, short_portfolio, 10_000);
 
     env.svm.warp_to_slot(10);
-    let market_lamports_before_close = env.svm.get_account(&env.market).unwrap().lamports;
-    let long_lamports_before_close = env.svm.get_account(&long_portfolio).unwrap().lamports;
+    let long_lamports_before_sync = env.svm.get_account(&long_portfolio).unwrap().lamports;
     env.sync_maintenance_fee_with_cu(long_portfolio, None, 10);
     let (_, group_after_flat_sync) = env.market_state();
     assert_eq!(
         group_after_flat_sync.insurance, 1,
         "underfunded flat sync sweeps the remaining capital into insurance"
     );
-    assert_eq!(group_after_flat_sync.materialized_portfolio_count, 1);
+    // Fixture repair note: this failure is NOT an E3/E4 regression -- it
+    // predates this session's engine work entirely. Wrapper commit 69bc27ad
+    // ("remove permissionless auto-close from handle_sync_maintenance_fee",
+    // VULN-03, #393, same session as #398/#400 above) deliberately removed
+    // the deregister-and-close step this test originally relied on:
+    // SyncMaintenanceFee has no owner signer check (by design -- it's meant
+    // to be permissionlessly crankable), so auto-closing an emptied
+    // portfolio there let any third party force-close a user's dust account
+    // and strand its rent in the market slab (griefing) or leave it in an
+    // unrecoverable half-deregistered limbo. Account closure now only
+    // happens through the owner/marketauth-gated ClosePortfolio path. The
+    // underlying property this test verifies -- an underfunded flat sync
+    // sweeps whatever capital remains into insurance exactly once, without
+    // over-sweeping or leaving the account in a broken state -- is
+    // unchanged and still fully asserted below; only the (now intentionally
+    // removed) auto-close side effect is gone.
     assert_eq!(
-        env.svm.get_account(&env.market).unwrap().lamports,
-        market_lamports_before_close + long_lamports_before_close,
-        "dust-closed portfolio rent should move into the market slab"
+        group_after_flat_sync.materialized_portfolio_count,
+        2,
+        "VULN-03: SyncMaintenanceFee must sweep the dust capital but must NOT auto-close/\
+         deregister the portfolio -- both accounts remain materialized"
     );
-    if let Some(closed_long_account) = env.svm.get_account(&long_portfolio) {
-        assert_eq!(closed_long_account.lamports, 0);
-        assert!(
-            closed_long_account.data.is_empty()
-                || !state::is_initialized(&closed_long_account.data)
-        );
-    }
+    let long_after_flat_sync = env.portfolio_state(long_portfolio);
+    assert_eq!(
+        long_after_flat_sync.capital, 0,
+        "underfunded flat sync sweeps the account's capital fully, exactly once"
+    );
+    assert_eq!(long_after_flat_sync.last_fee_slot, 10);
+    assert_eq!(
+        env.svm.get_account(&long_portfolio).unwrap().lamports,
+        long_lamports_before_sync,
+        "VULN-03: the dust-swept portfolio's rent must stay with the account, not move to \
+         the market slab -- only an explicit owner/marketauth ClosePortfolio call may do that"
+    );
+    assert!(
+        state::is_initialized(&env.svm.get_account(&long_portfolio).unwrap().data),
+        "VULN-03: SyncMaintenanceFee must not close/zero the portfolio account"
+    );
 
     let fresh_long_portfolio = env.create_portfolio(&long_owner);
     env.deposit(&long_owner, fresh_long_portfolio, 1_000);
@@ -5531,6 +5707,24 @@ fn v16_bpf_fee_sync_rejects_reused_market_slot_stale_leg_without_mutation() {
 
 #[test]
 fn v16_bpf_close_portfolio_sweeps_rent_to_market_slab() {
+    // Fixture repair note: this failure is NOT an E3/E4 regression -- it predates
+    // this session's engine work entirely. Wrapper commit 62067ef1 ("route
+    // portfolio rent to closer, not market slab, on ClosePortfolio", #398)
+    // deliberately changed `close_portfolio_account_to_market_slab`'s rent
+    // destination from `market_ai` to `closer` (the portfolio owner) as a
+    // security fix: routing a closer's own rent into the market account let it
+    // silently accumulate for the market authority to capture at CloseSlab,
+    // permanently costing the owner the SOL they paid to open their account.
+    // #398 never updated this test (added earlier by 7e161e8b, well before
+    // #398), so it has asserted stale pre-#398 behavior ever since -- this is
+    // long-standing test staleness, unrelated to engine-selected liquidation
+    // sizing (E3) or ceil-notional fees (E4). Repaired to assert the CURRENT,
+    // intentionally-fixed behavior: rent goes back to the closer, not the
+    // market. The underlying property (ClosePortfolio must fully sweep the
+    // closed account's rent-exempt lamports out to a single well-defined
+    // destination, leaving the portfolio account itself at zero lamports) is
+    // unchanged and, if anything, more load-bearing now since it protects user
+    // funds rather than protocol-captured rent.
     let mut env = V16CuEnv::new();
     let owner = Keypair::new();
     let portfolio = env.create_portfolio(&owner);
@@ -5538,6 +5732,7 @@ fn v16_bpf_close_portfolio_sweeps_rent_to_market_slab() {
     env.withdraw(&owner, portfolio, 1_000);
 
     let market_lamports_before_close = env.svm.get_account(&env.market).unwrap().lamports;
+    let owner_lamports_before_close = env.svm.get_account(&owner.pubkey()).unwrap().lamports;
     let portfolio_lamports_before_close = env.svm.get_account(&portfolio).unwrap().lamports;
     let close_cu = env.close_portfolio_with_cu(&owner, portfolio);
     assert_cu_within("close portfolio rent sweep", close_cu, CUSTODY_CU_LIMIT);
@@ -5546,8 +5741,14 @@ fn v16_bpf_close_portfolio_sweeps_rent_to_market_slab() {
     assert_eq!(group.materialized_portfolio_count, 0);
     assert_eq!(
         env.svm.get_account(&env.market).unwrap().lamports,
-        market_lamports_before_close + portfolio_lamports_before_close,
-        "ClosePortfolio should move closed account rent into the market slab"
+        market_lamports_before_close,
+        "ClosePortfolio must not leave the closed account's rent stranded in the market slab \
+         (upstream #398: that SOL belongs to the closer, not the protocol)"
+    );
+    assert_eq!(
+        env.svm.get_account(&owner.pubkey()).unwrap().lamports,
+        owner_lamports_before_close + portfolio_lamports_before_close,
+        "ClosePortfolio should move closed account rent back to the closer"
     );
     if let Some(closed_account) = env.svm.get_account(&portfolio) {
         assert_eq!(closed_account.lamports, 0);
@@ -5696,13 +5897,36 @@ fn v16_bpf_tradecpi_external_matcher_executes_on_added_asset() {
 
 #[test]
 fn v16_bpf_permissionless_liquidation_is_bounded() {
+    // FIX E3 (upstream #92) fixture repair: the original fixture (short deposits
+    // 250 against a 1-unit position, single 100->300 EWMA push clamped by
+    // max_price_move_bps_per_slot to effective_price=200) left the account
+    // *borderline* underwater -- a healthy partial close existed (closing ~75%
+    // of the leg already restores maintenance health at effective_price=200),
+    // so engine-selected liquidation sizing (E3) correctly picked that smaller
+    // partial close instead of fully closing the leg, and the old
+    // `active_bitmap_is_empty` assertion (which hard-coded "liquidation always
+    // fully closes") broke -- not because liquidation became unbounded, but
+    // because it became *more precise*. This is not an insolvency-mutation
+    // fixture (no raw account-byte poking anywhere in this file); it is
+    // entirely real EWMA price discovery. The repair drives the account
+    // genuinely (not borderline) bankrupt via two real accrual steps, each
+    // capped by the market's max_price_move_bps_per_slot/max_accrual_dt_slots
+    // config to at most a 100% mark move per crank call (100->200->400), so a
+    // single EWMA push cannot shortcut it: certified_equity == capital(100) -
+    // loss(300) == -200 < 0, which hits `liquidation_engine_close_request_q`'s
+    // bankrupt-account early exit and forces a full close regardless of any
+    // partial-close arithmetic -- the same "liquidation is bounded" property
+    // (leg fully closed, CU bounded) the test always asserted.
     let mut env = V16CuEnv::new();
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 1_000_000);
-    env.deposit(&short_owner, short_account, 250);
+    // Minimum deposit that satisfies initial_margin_bps=10_000 (100%) for a
+    // 1-unit position at entry price 100 -- this env has no leverage headroom
+    // at entry, so bankruptcy can only be reached via adverse price movement.
+    env.deposit(&short_owner, short_account, 100);
     env.configure_ewma_mark_with_cu(0, 100, 1, 0);
     env.trade_with_cu(
         &long_owner,
@@ -5714,14 +5938,37 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
         0,
     );
 
+    // Step 1: real EWMA push + accrual crank, capped to a 100% mark move ->
+    // effective_price 100 -> 200 (still solvent: equity 100-100=0).
     env.svm.warp_to_slot(1);
-    env.push_ewma_mark_with_cu(1, 300);
+    env.push_ewma_mark_with_cu(1, 999_999);
+    env.crank(
+        short_account,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 1,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+    );
+    // Step 2: second real EWMA push + accrual, again capped to 100% ->
+    // effective_price 200 -> 400 (equity 100-300=-200: genuinely bankrupt).
+    env.svm.warp_to_slot(2);
+    env.push_ewma_mark_with_cu(2, 999_999);
+    let short_before =
+        state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data).unwrap();
+    assert!(
+        short_before.capital == 100 && short_before.pnl == 0,
+        "position must still be open going into the liquidation crank"
+    );
+
     let liquidation_cu = env.crank(
         short_account,
         ProgInstruction::PermissionlessCrank {
             action: 1,
             asset_index: 0,
-            now_slot: 1,
+            now_slot: 2,
             funding_rate_e9: 0,
             recovery_reason: 0,
         },
@@ -5738,9 +5985,15 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
     let short_data = env.svm.get_account(&short_account).unwrap().data;
     let (_, group) = state::read_market(&market_data).unwrap();
     let short = state::read_portfolio(&short_data).unwrap();
-    assert_eq!(group.slot_last, 1);
-    assert_eq!(group.assets[0].effective_price, 200);
-    assert!(percolator::active_bitmap_is_empty(short.active_bitmap));
+    assert_eq!(group.slot_last, 2);
+    assert_eq!(group.assets[0].effective_price, 400);
+    assert_eq!(short.capital, 0, "bankrupt account's capital must be fully consumed");
+    assert_eq!(short.pnl, 0, "settled loss must not leave a dangling pnl balance");
+    assert!(
+        percolator::active_bitmap_is_empty(short.active_bitmap),
+        "a genuinely bankrupt account (certified_equity < 0) must be fully closed, not \
+         left with a dangling partial position"
+    );
 }
 
 #[test]
@@ -7825,9 +8078,49 @@ fn v16_bpf_auth_mark_target_effective_lag_counts_toward_liquidation_health() {
         },
     );
     let liquidated_long = env.portfolio_state(long_portfolio);
+    // FIX E3 (upstream #92) fixture repair: the original assertion here was
+    // `!has_active_leg_for_asset(...)` (leg fully closed). That property is
+    // mathematically unreachable for this fixture without shrinking the
+    // position to a single indivisible atom: this account is margined at
+    // exactly 100% (deposit == entry notional, no leverage headroom), so its
+    // certified equity reduces algebraically to `size/POS_SCALE *
+    // effective_price` -- strictly positive for any effective_price >= 1,
+    // which the protocol always enforces (PushAuthMark/PushEwmaMark reject
+    // mark_e6 == 0). The bankrupt-account early exit in
+    // `liquidation_engine_close_request_q` (certified_equity < 0) can
+    // therefore never trigger here, at any lag magnitude -- only a genuine
+    // partial-close search runs, and this fixture's lag-driven deficit
+    // (9.52M short against a 109.52M requirement, ~8.7% of the position) is
+    // well inside what a healthy partial close can resolve, so
+    // engine-selected sizing (E3) correctly picks that smaller close over a
+    // full one. Asserting full closure here would be asserting an
+    // unreachable, not merely a "changed", outcome.
+    //
+    // The repaired assertions verify the SAME underlying claim the test
+    // exists to make -- that the lag-driven deficit is genuinely actionable
+    // by permissionless liquidation -- at the precision E3 actually
+    // guarantees: liquidation must close enough of the position to fully
+    // resolve the certified deficit (not partially, not zero), while still
+    // strictly reducing the position (proving liquidation had a bounded,
+    // real effect rather than either no-op'ing or over-liquidating to a
+    // full close it didn't need).
     assert!(
-        !has_active_leg_for_asset(&liquidated_long, 0),
-        "positive lag-deficit certification must allow permissionless liquidation"
+        has_active_leg_for_asset(&liquidated_long, 0),
+        "engine-selected liquidation sizing (E3) must select the minimal healthy partial \
+         close here, not a full close, given this fixture's deficit is well inside what a \
+         partial close can resolve"
+    );
+    let closed_leg = active_leg_for_asset(&liquidated_long, 0);
+    let remaining_abs_q = closed_leg.basis_pos_q.unsigned_abs();
+    assert!(
+        remaining_abs_q > 0 && remaining_abs_q < POS_SCALE,
+        "liquidation must strictly reduce a lag-liquidatable position (bounded, non-vacuous \
+         close): remaining={remaining_abs_q}, original={POS_SCALE}"
+    );
+    assert_eq!(
+        liquidated_long.health_cert.certified_liq_deficit, 0,
+        "positive lag-deficit certification must allow permissionless liquidation to fully \
+         resolve the deficit it was called to address"
     );
 }
 
