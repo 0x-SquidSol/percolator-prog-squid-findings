@@ -2220,30 +2220,121 @@ fn kani_set_protocol_fee_authority_requires_upgrade_authority() {
 // wizard's (feeSplit.ts) fee-split floors -- creator at most 45%, LP at
 // least 40%, insurance at least 15%, all as a share of
 // `T = trade_fee_base_bps + backing_fee_bps` -- applied by
-// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy` so a raw instruction
-// can't bypass the client-side-only wizard check. For any input in the
-// on-chain-reachable wire-width range that the function ACCEPTS, the
-// derived percentages of T satisfy each floor within the documented,
-// proven-worst-case tolerance (FEE_SPLIT_CREATOR_TOLERANCE / the T-scaled
-// share tolerance built from FEE_SPLIT_SHARE_TOLERANCE_FLAT, see their doc
-// comments for the derivation).
+// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy` (the latter re-validating
+// EVERY configured asset's stored domain against a proposed new
+// `trade_fee_base_bps`, not just asset 0's -- see W11/46627c82) so a raw
+// instruction can't bypass the client-side-only wizard check. For any input
+// in the harness's domain (see BOUND rationale below) that the function
+// ACCEPTS, the derived percentages of T satisfy each floor within the
+// documented, proven-worst-case tolerance (FEE_SPLIT_CREATOR_TOLERANCE / the
+// T-scaled share tolerance built from FEE_SPLIT_SHARE_TOLERANCE_FLAT, see
+// their doc comments for the derivation).
 // Also proves the wizard's default 20/60/20 example is always accepted,
 // and (non-vacuity) that both an accept and a reject are reachable.
+//
+// BOUND RATIONALE (why this harness is intentionally NOT the full
+// `<=10_000` wire-width domain, and why that is still a real, representative
+// proof rather than a weakened one):
+//
+// History: the original unrestricted harness (`trade_fee_base_bps`,
+// `backing_fee_bps`, `insurance_share_bps` each a full `kani::any::<u64>()`
+// only narrowed post-hoc via `kani::assume(<=10_000)`) never reached a
+// verdict across three separate attempts, the longest run 10h57m before
+// being killed (CBMC/cadical, "128-bit arithmetic blowup"). Root cause: CBMC
+// bit-blasts `u128` multiplication (`fee_split_floor_ok`'s internal
+// `tfb.checked_mul(100)`, `bf.checked_mul(isb)`, etc.) into a boolean circuit
+// sized by the OPERAND'S BIT WIDTH, not its assumed value range. A
+// `kani::any::<u64>()` later constrained via `kani::assume(<= 10_000)` is
+// still, structurally, a fully free 64-bit (then zero-extended to 128-bit)
+// symbolic word as far as CBMC's own front-end simplification is concerned
+// -- the assume() is just extra clauses fed to the SAT solver on top of a
+// full-width multiplier circuit, not a narrower circuit. Three independent
+// ~10000x10000x10000 symbolic multiplications over that representation is
+// what never converged.
+//
+// Fix: declare the two `T`-contributing inputs with a NARROW native type
+// (`u8`, 0..=255) instead of `u64`, then `kani::assume` a small ceiling on
+// top. Casting a genuinely 8-bit-wide symbolic value up to `u128` is a
+// structural zero-extension CBMC's own front-end constant-folds away before
+// the solver ever sees a multiplier circuit -- the upper 120 bits are
+// provably-constant zero at the GOTO-program level, not merely SAT-solver-
+// derivable. This collapses `tfb`/`bf`'s effective multiplier width from 128
+// bits to a handful of bits, which is what makes the proof tractable.
+// `insurance_share_bps` is kept at its full on-chain `<=10_000` range (via
+// `kani::any::<u16>()`, still narrower than the original `u64`) because it
+// is the SMALLER-width operand in every product it appears in once `bf` is
+// bounded (`bf * isb` with `bf<=48` is effectively a ~6-bit x 14-bit
+// multiply, not 128x128), so widening it back out does not reintroduce the
+// blowup.
+//
+// Domain covered, `trade_fee_base_bps<=48`, `backing_fee_bps<=48` (so
+// `T = trade_fee_base_bps + backing_fee_bps` ranges over `0..=96`),
+// `insurance_share_bps<=10_000` (full on-chain range):
+//   - The previously-vacuous low-T region `T in 1..8` (exhaustive proper
+//     subset of `0..=96`).
+//   - The launch wizard's default `T=20` example (`tfb=4, bf=16`, both
+//     `<=48`) -- reachable symbolically, and additionally pinned by an
+//     explicit concrete assertion below.
+//   - `T` well past the documented residual carve-out thresholds (insurance
+//     no-op at `T in {1,2,3}`, LP no-op at `T=1`) with 32-96x margin, so the
+//     proof also confirms the fix's improvement over the old flat-10_000
+//     bound (no-op at `T<=6`/`T<=2`) generalizes, not just holds at the
+//     single previously-cited boundary.
+//   - The W11 multi-asset re-validation path (`handle_update_trade_fee_policy`
+//     looping `fee_split_floor_ok` over every configured asset's domain,
+//     not just asset 0's): W11 did NOT change `fee_split_floor_ok` itself
+//     (confirmed by inspection of 46627c82 -- only the CALLER's loop
+//     changed, the predicate is invoked unmodified once per asset/domain).
+//     Since this harness proves the predicate itself sound for any input in
+//     its domain, and the loop's soundness is exactly "reject the whole
+//     instruction if calling this predicate on ANY asset's domain returns
+//     false" -- with each call independent and side-effect-free -- proving
+//     the predicate once composes trivially across the loop's N calls. The
+//     loop's own control flow (does it actually scan
+//     `0..configured_market_slots`, does it actually reject on the first
+//     `false`) is a wrapper-processor property outside a pure-function
+//     harness's scope; that is covered instead by the non-Kani integration
+//     test
+//     `v16_wrapper_fee_split_floor_update_trade_fee_policy_checks_every_asset_not_just_asset0`
+//     (re-run as corroborating evidence for this session, see report).
+//
+// NOT covered by this harness (stated plainly, per the redesign mandate):
+// `T > 96` is not explored symbolically. Representativeness argument (not
+// itself Kani-checked, a closed-form monotonicity claim over the exact
+// constants above): for all three floors the ratio of `tolerance(T)` to the
+// (pre-tolerance) target threshold is monotonically DEcreasing in `T` for
+// `T>0` --
+//   creator:   tolerance/target = 50            / (45*T)         = O(1/T)
+//   insurance: tolerance/target = (T/2+5001)     / (1500*T)  -> 1/3000 + O(1/T)
+//   lp:        tolerance/target = (T/2+5001)     / (4000*T)  -> 1/8000 + O(1/T)
+// so the RELATIVE slack the tolerance allows (i.e. how large a violation of
+// the true, tolerance-free floor the check can still accept, as a fraction
+// of the floor itself) is largest at the smallest `T` and only shrinks as
+// `T` grows -- this is the same reasoning the source's own
+// `FEE_SPLIT_SHARE_TOLERANCE_FLAT` doc comment uses to identify the
+// low-T residual carve-out. The fully-covered `0..=96` region is therefore
+// argued to be the domain where an under-enforcement bug is MOST likely to
+// hide, not an arbitrary slice; `T` in `97..=20_000` is not symbolically
+// checked here and a bug specific to that region (e.g. a genuinely
+// T-dependent overflow) would not be caught by this harness. All three
+// `checked_mul`/`checked_add` calls inside `fee_split_floor_ok` operate on
+// `u128` with actual operand magnitudes that never exceed ~1e8 for ANY
+// input in the full `<=10_000` wire-width domain (nowhere near `u128::MAX`),
+// so arithmetic overflow inside the function is not the residual risk left
+// by this bound -- CBMC's proof-engine tractability is.
 #[kani::proof]
 fn kani_fee_split_floor_ok_matches_tolerant_percentage_floors() {
-    let trade_fee_base_bps: u64 = kani::any();
-    let backing_fee_bps: u64 = kani::any();
-    let insurance_share_bps: u64 = kani::any();
-    // Exactly the wire-width bounds `handle_update_backing_fee_policy` /
-    // `handle_update_trade_fee_policy` already enforce before ever calling
-    // `fee_split_floor_ok`: `fee_bps`/`insurance_share_bps` are u16 fields
-    // capped at 10_000 by the pre-existing `backing_trade_fee_policy_shape_ok`
-    // check, and `trade_fee_base_bps` is additionally capped by
-    // `MAX_DYNAMIC_TRADE_FEE_BPS == 10_000`. This is the full adversarial
-    // space a malicious creator can actually reach on-chain -- not a
-    // narrowing relative to production.
-    kani::assume(trade_fee_base_bps <= 10_000);
-    kani::assume(backing_fee_bps <= 10_000);
+    let trade_fee_base_bps: u64 = kani::any::<u8>() as u64;
+    let backing_fee_bps: u64 = kani::any::<u8>() as u64;
+    let insurance_share_bps: u64 = kani::any::<u16>() as u64;
+    // BOUNDED domain -- see the BOUND RATIONALE doc comment above this
+    // harness for the termination argument and exactly what T range /
+    // representativeness claim this buys. `insurance_share_bps` keeps the
+    // full on-chain `<=10_000` wire-width range; only the two `T`-forming
+    // inputs are narrowed, since they are what drove the u128-multiply
+    // blowup.
+    kani::assume(trade_fee_base_bps <= 48);
+    kani::assume(backing_fee_bps <= 48);
     kani::assume(insurance_share_bps <= 10_000);
 
     let accepted = policy_v16::fee_split_floor_ok(
@@ -2269,7 +2360,7 @@ fn kani_fee_split_floor_ok_matches_tolerant_percentage_floors() {
     }
 
     if accepted {
-        let t = trade_fee_base_bps + backing_fee_bps; // no overflow: both <=10_000
+        let t = trade_fee_base_bps + backing_fee_bps; // no overflow: both <=48 here (bounded harness)
         assert!(t > 0);
         // creator% <= 45 within tolerance: tfb*100 <= 45*T + CREATOR_TOLERANCE
         assert!(
