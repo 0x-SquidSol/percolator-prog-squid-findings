@@ -5403,6 +5403,8 @@ pub mod oracle_v16 {
 
 pub mod policy_v16 {
     use crate::constants::MAX_DYNAMIC_TRADE_FEE_BPS;
+    use crate::error::PercolatorError;
+    use solana_program::program_error::ProgramError;
 
     pub fn price_move_bps_ceil(old: u64, new: u64) -> Option<u64> {
         if old == 0 || old == new {
@@ -5759,6 +5761,57 @@ pub mod policy_v16 {
         }
 
         true
+    }
+
+    /// Exact four-way split of a trade fee (2026-07-19 fee-collection design).
+    ///
+    /// Each leg is `floor(fee * share_bps / 10_000)`; the residual dust is
+    /// assigned to `insurance` — the most conservative destination, since it
+    /// grows the backstop rather than anyone's withdrawable revenue.
+    ///
+    /// CONSERVATION INVARIANT (Kani-proven, `kani_fee_split_conserves`):
+    ///   protocol + creator + lp + insurance == fee, for every input.
+    /// Violating it desyncs `header.insurance` and the vault accounting with it.
+    ///
+    /// Takes plain bps rather than `&WrapperConfigV16` so it stays free of the
+    /// zero-copy type and is directly Kani-provable (same rationale as
+    /// `maintenance_cranker_reward`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct FeeSplitParts {
+        pub protocol: u128,
+        pub creator: u128,
+        pub lp: u128,
+        pub insurance: u128,
+    }
+
+    pub fn split_trade_fee(
+        fee: u128,
+        protocol_bps: u16,
+        creator_bps: u16,
+        lp_bps: u16,
+        insurance_bps: u16,
+    ) -> Result<FeeSplitParts, ProgramError> {
+        if fee == 0 {
+            return Ok(FeeSplitParts::default());
+        }
+        let cut = |bps: u16| -> Result<u128, ProgramError> {
+            fee.checked_mul(bps as u128)
+                .map(|v| v / 10_000)
+                .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+        };
+        let protocol = cut(protocol_bps)?;
+        let creator = cut(creator_bps)?;
+        let lp = cut(lp_bps)?;
+        // Insurance takes its floor share PLUS all residual dust, so the four
+        // parts sum to exactly `fee` regardless of rounding.
+        let assigned = protocol
+            .checked_add(creator)
+            .and_then(|v| v.checked_add(lp))
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let insurance = fee
+            .checked_sub(assigned)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        Ok(FeeSplitParts { protocol, creator, lp, insurance })
     }
 }
 
