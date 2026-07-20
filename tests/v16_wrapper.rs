@@ -18459,9 +18459,25 @@ fn v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority() {
 // RETIRED on 2026-07-19: it validated a split of
 // `T = trade_fee_base_bps + backing_fee_bps` that no longer exists, and is
 // superseded by `validate_fee_split` (tag 86), which is exact rather than
-// tolerance-based. The first two tests below are the inverted regression
-// guards for that removal; the third still pins that genuine wizard splits
-// are accepted, which is unchanged by the retirement.
+// tolerance-based.
+//
+// EXACT CHURN in `2b3a6a65` (`git show 2b3a6a65 -- tests/v16_wrapper.rs`):
+// three floor-pinning tests were removed and two inverted guards added —
+//   deleted: `..._fee_split_floor_low_t_vacuity_shrinks_to_proven_residual`
+//   inverted: `..._fee_split_floor_enforced_at_wizard_default_t20`
+//             -> `..._update_backing_fee_policy_no_longer_enforces_the_two_rate_floor`
+//   inverted: `..._fee_split_floor_update_trade_fee_policy_checks_every_asset_not_just_asset0`
+//             -> `..._update_trade_fee_policy_no_longer_enforces_the_two_rate_floor`
+// So: TWO inverted, ONE deleted. The commit message's "three ... inverted into
+// two regression guards" counts the originals, not the inversions; read as
+// "three inverted" it is wrong.
+//
+// The two inverted guards are the first two tests below. The third test,
+// `..._legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untouched`,
+// was NOT part of that churn — it predates it and survived unchanged, which
+// left it asserting a floor that no longer existed. It was rewritten in the
+// branch-review pass (finding 6) to pin persistence plus the independence of
+// these legacy setters from the tag-86 split.
 // =============================================================================
 
 #[test]
@@ -18539,12 +18555,50 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
 }
 
 #[test]
-fn v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers() {
-    // The T-scaled tolerance must never false-reject a genuine wizard
-    // output, at both the wizard's default and its own tightest
-    // simultaneous-boundary selection (creator=45%/lp=40%/insurance=15% at
-    // once), exercised through the real setter handlers end to end (not
-    // just the pure-function unit tests).
+fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untouched() {
+    // REWRITTEN (branch review finding 6). This was
+    // `v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers`,
+    // whose stated purpose was that "the T-scaled tolerance must never
+    // false-reject a genuine wizard output". That claim is now UNFALSIFIABLE:
+    // the tolerance it referred to lived in `fee_split_floor_ok`, which both
+    // setters stopped calling in `2b3a6a65`. The only surviving range gate is
+    // `MAX_DYNAMIC_TRADE_FEE_BPS == 10_000`, and every input below (4, 5, 16,
+    // 2_500, 2_727) is trivially inside it, so no code path could reject them.
+    // A test whose headline assertion cannot fail is worse than no test: it
+    // reads as coverage of the floors while covering nothing.
+    //
+    // Kept rather than deleted, because two REAL properties are worth pinning
+    // here and one of them was never asserted before:
+    //
+    //   1. PERSISTENCE — the accepted values must actually reach the account,
+    //      not be validated and silently dropped.
+    //
+    //   2. INDEPENDENCE (new) — these legacy two-rate setters must NOT touch
+    //      the live tag-86 split (`creator_share_bps` / `lp_share_bps` /
+    //      `insurance_share_bps`). Those are now two unrelated mechanisms that
+    //      merely share the word "fee split", and the whole retirement rests on
+    //      them being decoupled. If anyone re-couples them — e.g. makes
+    //      `UpdateTradeFeePolicy` recompute the shares — that would silently
+    //      bypass `validate_fee_split`'s floors via a handler that no longer
+    //      checks them. THIS is the regression the old test was gesturing at
+    //      and never actually caught.
+    //
+    // The inputs are kept as the wizard's own outputs (its default and its
+    // tightest simultaneous 45/40/15 boundary) so the fixture still documents
+    // realistic client values.
+
+    // The tag-86 defaults InitMarket hardcodes; nothing in this test may move
+    // them. Cross-checked against `tag86_marketauth_sets_a_valid_non_default_
+    // split_and_it_persists` in tests/v16_fee_split.rs.
+    const DEFAULT_SPLIT: (u16, u16, u16) = (1600, 4800, 1600);
+    fn split_of(market: &TestAccount) -> (u16, u16, u16) {
+        let (cfg, _) = state::read_market(&market.data).unwrap();
+        (
+            cfg.creator_share_bps,
+            cfg.lp_share_bps,
+            cfg.insurance_share_bps,
+        )
+    }
 
     // Wizard default: T=20bps, creatorPct=20/lpPct=60/insurancePct=20 ->
     // trade_fee_base_bps=4, backing_fee_bps=16, insurance_share_bps=2_500.
@@ -18567,9 +18621,18 @@ fn v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers() {
         )
         .expect("wizard default 20/60/20 split must be accepted");
         let (cfg, _) = state::read_market(&market.data).unwrap();
+        // (1) PERSISTENCE.
         assert_eq!(cfg.trade_fee_base_bps, 4);
         assert_eq!(cfg.backing_trade_fee_bps_short, 16);
         assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_500);
+        // (2) INDEPENDENCE — neither setter may disturb the tag-86 split.
+        assert_eq!(
+            split_of(&market),
+            DEFAULT_SPLIT,
+            "the legacy two-rate setters must not write the tag-86 fee split; \
+             that split is owned solely by UpdateFeeSplit (86), which is the \
+             only handler that runs validate_fee_split's floors"
+        );
     }
 
     // Wizard's tightest simultaneous boundary: creatorPct=45/lpPct=40/
@@ -18598,9 +18661,22 @@ fn v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers() {
         )
         .expect("wizard's own 45/40/15 boundary split at T=10 must be accepted");
         let (cfg, _) = state::read_market(&market.data).unwrap();
+        // (1) PERSISTENCE.
         assert_eq!(cfg.trade_fee_base_bps, 5);
         assert_eq!(cfg.backing_trade_fee_bps_short, 5);
         assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 2_727);
+        // (2) INDEPENDENCE. This case matters most: as the retired comment
+        // noted, 5/5/2_727 lands at 50% creator / 36.365% LP / 13.635%
+        // insurance — all three OLD floors violated by rounding alone. If a
+        // future change ever propagated these two-rate values into the tag-86
+        // shares, it would install a split that `validate_fee_split` would
+        // reject outright, through a handler that never calls it.
+        assert_eq!(
+            split_of(&market),
+            DEFAULT_SPLIT,
+            "a two-rate split that violates every retired floor must still \
+             leave the live tag-86 split at its defaults"
+        );
     }
 }
 
