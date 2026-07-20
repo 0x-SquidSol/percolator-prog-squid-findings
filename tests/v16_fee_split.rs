@@ -1678,3 +1678,200 @@ fn tag88_rejects_a_non_marketauth_signer_with_unauthorized() {
         "a rejected call must not have written anything"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TAG 86 (UpdateFeeSplit) — END-TO-END, ON-CHAIN
+//
+// FINDING 2 (branch review). Tag 86 previously appeared in `tests/` ONLY as the
+// `set_fee_split` fixture above, which `.expect()`s success. Nothing exercised
+// it on-chain as the subject: no test proved it rejects an invalid split, and
+// no test proved it is authority-gated.
+//
+// That gap mattered specifically because "tag 86 now owns validation" is the
+// entire justification for `2b3a6a65` removing `fee_split_floor_ok` from both
+// setters. The floors were retired on the strength of a validator whose
+// on-chain enforcement was never tested. These tests pay that debt: they are
+// the evidence for the claim the removal rests on.
+//
+// Written to mirror the tag-88 tests directly above (same harness, same
+// `assert_custom` code pinning, same read-back-from-chain discipline).
+// ════════════════════════════════════════════════════════════════════════════
+
+impl FeeEnv {
+    /// Send tag 86 as `signer`, returning the raw result so the negative cases
+    /// can pin their exact code rather than merely observing "some error".
+    /// The `set_fee_split` fixture above cannot serve here: it hardcodes the
+    /// admin and unwraps.
+    fn set_fee_split_as(
+        &mut self,
+        signer: &Keypair,
+        creator: u16,
+        lp: u16,
+        insurance: u16,
+    ) -> Result<(), solana_sdk::transaction::TransactionError> {
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            data: ProgInstruction::UpdateFeeSplit {
+                creator_share_bps: creator,
+                lp_share_bps: lp,
+                insurance_share_bps: insurance,
+            }
+            .encode(),
+        };
+        let payer = self.payer.insecure_clone();
+        send_ixs(&mut self.svm, &payer, vec![ix], &[signer])
+    }
+
+    /// The three share bps, read back from the LIVE account — never from a
+    /// local copy. A setter that returns Ok without persisting would pass any
+    /// test that trusted its return value.
+    fn fee_split_shares(&self) -> (u16, u16, u16) {
+        let acct = self.svm.get_account(&self.market).unwrap();
+        let (cfg, _, _, _) = state::read_market_config_mode_and_capacity(&acct.data).unwrap();
+        (
+            cfg.creator_share_bps,
+            cfg.lp_share_bps,
+            cfg.insurance_share_bps,
+        )
+    }
+}
+
+/// HAPPY PATH: marketauth sets a valid NON-DEFAULT split and it persists.
+///
+/// Non-default is the point — a test that "sets" the defaults would pass
+/// against a handler that writes nothing at all.
+#[test]
+fn tag86_marketauth_sets_a_valid_non_default_split_and_it_persists() {
+    let mut env = FeeEnv::new(1_000_000);
+
+    // InitMarket hardcodes the defaults (spec §1).
+    assert_eq!(
+        env.fee_split_shares(),
+        (1600, 4800, 1600),
+        "InitMarket must seed the documented defaults"
+    );
+
+    // 800/5600/1600: sums to FEE_SHARE_TOTAL_BPS (8000) and clears every floor
+    // (creator 800 <= 3600, lp 5600 >= 3200, insurance 1600 >= 1200). Differs
+    // from the defaults in all three legs.
+    let admin = env.admin.insecure_clone();
+    env.set_fee_split_as(&admin, 800, 5600, 1600)
+        .expect("marketauth must be able to set a valid split");
+    assert_eq!(
+        env.fee_split_shares(),
+        (800, 5600, 1600),
+        "the new split must be readable back from the account"
+    );
+
+    // Settable more than once — a policy lever, not a one-shot latch.
+    env.set_fee_split_as(&admin, 3600, 3200, 1200)
+        .expect("the exact-floor extreme must be settable");
+    assert_eq!(
+        env.fee_split_shares(),
+        (3600, 3200, 1200),
+        "the floor-extreme split must persist too"
+    );
+}
+
+/// A split that does not sum to `FEE_SHARE_TOTAL_BPS` must be rejected with the
+/// exact code, and must leave the stored split untouched.
+///
+/// 1600/4800/1601 sums to 8001. Every leg individually clears its floor, so the
+/// ONLY thing wrong is the sum — this isolates the sum check.
+#[test]
+fn tag86_rejects_an_invalid_sum_with_custom_52() {
+    let mut env = FeeEnv::new(1_000_000);
+    let admin = env.admin.insecure_clone();
+
+    assert_custom(
+        env.set_fee_split_as(&admin, 1600, 4800, 1601),
+        52, // FeeSplitSumInvalid
+        "a split summing to 8001 must be rejected",
+    );
+    assert_eq!(
+        env.fee_split_shares(),
+        (1600, 4800, 1600),
+        "a rejected call must not have written anything"
+    );
+}
+
+/// A split with the CORRECT sum but a floor violation must be rejected with the
+/// floor code — proving the floors are genuinely enforced on-chain at tag 86,
+/// which is the claim that justified retiring `fee_split_floor_ok`.
+///
+/// 1600/3000/3400 sums to exactly 8000, so it passes the sum check and reaches
+/// the floor check. Only ONE floor is broken: lp 3000 < MIN_LP_SHARE_BPS 3200
+/// (creator 1600 <= 3600, insurance 3400 >= 1200). This is the LP leg being
+/// quietly starved while the arithmetic still looks balanced — exactly the case
+/// the floors exist to stop.
+#[test]
+fn tag86_rejects_a_floor_violation_with_custom_51() {
+    let mut env = FeeEnv::new(1_000_000);
+    let admin = env.admin.insecure_clone();
+
+    assert_custom(
+        env.set_fee_split_as(&admin, 1600, 3000, 3400),
+        51, // FeeSplitFloorViolation
+        "an lp share below MIN_LP_SHARE_BPS must be rejected",
+    );
+    assert_eq!(
+        env.fee_split_shares(),
+        (1600, 4800, 1600),
+        "a rejected call must not have written anything"
+    );
+
+    // The creator ceiling is the other direction of the same guard. 4000/3200/800
+    // also sums to 8000: creator 4000 > 3600 AND insurance 800 < 1200, because
+    // the floors are precisely complementary (spec §1) — over-paying the creator
+    // necessarily starves another leg.
+    assert_custom(
+        env.set_fee_split_as(&admin, 4000, 3200, 800),
+        51,
+        "a creator share above MAX_CREATOR_SHARE_BPS must be rejected",
+    );
+    assert_eq!(
+        env.fee_split_shares(),
+        (1600, 4800, 1600),
+        "the second rejected call must not have written anything either"
+    );
+}
+
+/// AUTHORITY: tag 86 is marketauth-gated. An unrelated funded signer must not be
+/// able to retune the split — that would let anyone redirect the LP and staker
+/// legs to the creator.
+///
+/// NOTE the split passed here is VALID (the defaults). `handle_update_fee_split`
+/// runs `validate_fee_split` BEFORE `expect_live_authority`, so an invalid split
+/// would fail at 52/51 and this test would pass without the authority check ever
+/// being reached — proving nothing. A valid split forces the failure to come
+/// from the authority gate.
+#[test]
+fn tag86_rejects_a_non_marketauth_signer_with_unauthorized() {
+    let mut env = FeeEnv::new(1_000_000);
+
+    let interloper = Keypair::new();
+    env.svm.airdrop(&interloper.pubkey(), 1_000_000_000).unwrap();
+
+    assert_custom(
+        env.set_fee_split_as(&interloper, 1600, 4800, 1600),
+        8, // Unauthorized — same code as the sibling marketauth setters
+        "a non-marketauth signer must not retune the fee split",
+    );
+
+    // And a valid, floor-clearing, non-default split from the interloper is
+    // rejected for the same reason — the gate is on the signer, not the values.
+    assert_custom(
+        env.set_fee_split_as(&interloper, 800, 5600, 1600),
+        8,
+        "authority is checked independently of whether the split is legal",
+    );
+    assert_eq!(
+        env.fee_split_shares(),
+        (1600, 4800, 1600),
+        "no rejected call may have written anything"
+    );
+}
