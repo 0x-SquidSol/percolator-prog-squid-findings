@@ -311,12 +311,14 @@ pub mod constants {
     /// SHARED SEED CONTRACT: SPL authority over the pool's vault token account.
     pub const STAKE_VAULT_AUTHORITY_SEED: &[u8] = b"vault_auth";
 
-    /// `percolator-stake::state::STAKE_POOL_SIZE` (v3 — `state.rs:688` asserts
-    /// 392). NOTE: `tests/v16_five_program_crosscut.rs:1662` still crafts the
+    /// `percolator-stake::state::STAKE_POOL_SIZE` (v3 — the
+    /// `assert!(STAKE_POOL_SIZE == 392)` in that file's const-assert block,
+    /// `state.rs:204` at percolator-stake@474079f). NOTE: `tests/v16_five_program_crosscut.rs:1662` still crafts the
     /// v2 384-byte shape; that harness is stale, not this constant.
     pub const STAKE_POOL_LEN: usize = 392;
     pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = *b"SPOOL_V1";
-    /// `StakePool::CURRENT_VERSION` (`state.rs:464`). Checked EXACTLY, never
+    /// `StakePool::CURRENT_VERSION` (`pub const CURRENT_VERSION: u8 = 3`,
+    /// `state.rs:506` at percolator-stake@474079f). Checked EXACTLY, never
     /// ignored: the `_reserved` sub-layout has been recarved at every version
     /// bump (352 -> 384 -> 392), so a future v4 must fail loudly here rather
     /// than misread `vault` out of a moved field.
@@ -10788,12 +10790,18 @@ pub mod processor {
     /// ran a burn that was never actually load-bearing).
     ///
     /// With the owner pinned, `insurance_authority` is only a POINTER, and
-    /// rotating it is harmless: to pass step (2) the rotated value must equal
+    /// rotating it is harmless: to pass step (3) the rotated value must equal
     /// `PDA(["vault_auth", pool], STAKE_PROGRAM_ID)` — a PDA under a program the
     /// attacker does not control and cannot sign for. Forging that would mean
     /// finding a preimage for a chosen 32-byte PDA target, not exploiting a
     /// validation gap. So the creator may rotate `insurance_authority` freely;
     /// the only thing they can do is make tag 87 fail.
+    ///
+    /// (This sentence said "step (2)" until the branch-review pass. The steps
+    /// were renumbered when the burn gate was removed and (0) was inserted, so
+    /// it pointed at the zero-check instead of the `vault_auth` PDA equality.
+    /// The step numbers below are the authority; keep them in sync with this
+    /// paragraph if the sequence changes again.)
     ///
     /// This matters because tag 87 reaches a fund `WithdrawInsurance` (tag 41)
     /// cannot: tag 41 is Resolved-only and budget-scoped
@@ -10944,7 +10952,8 @@ pub mod processor {
     ///
     /// MODE GATE — Live-only, matching tag 78 (the other permissionless leg)
     /// and deliberately STRICTER than `handle_withdraw_protocol_fee`'s
-    /// Live-or-wound-down-Resolved (`:10369-10378`).
+    /// Live-or-wound-down-Resolved gate (its `live_mode` / `resolved_mode`
+    /// block).
     ///
     /// Why not the protocol-fee model. Tag 84 may run in Resolved because it is
     /// signer-gated on `protocol_fee_authority` AND because W12 applies to it:
@@ -11003,7 +11012,7 @@ pub mod processor {
     /// insurance_domain_budget_remaining_total`. Nothing checks that the three
     /// wrapper-side counters sum within it, so whichever leg cranks last would
     /// get `EngineLockActive` out of the engine unless each clamps its own
-    /// claim first. Mirrors `handle_withdraw_protocol_fee` (`:10405-10411`),
+    /// claim first. Mirrors `handle_withdraw_protocol_fee`'s `§1.3/N2 clamp`,
     /// then advances `insurance_reserve_withdrawn_atoms` by the amount
     /// ACTUALLY TRANSFERRED — never the pre-clamp capacity — so a partial fill
     /// leaves the remainder claimable next call instead of marking it paid
@@ -11090,8 +11099,9 @@ pub mod processor {
                 .insurance_reserve_accrued_atoms
                 .checked_sub(cfg.insurance_reserve_withdrawn_atoms)
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            // MANDATORY CLAMP — mirrors handle_withdraw_protocol_fee:10405-10411
-            // verbatim. `.min(vault)` mirrors `protocol_fee_withdraw_amount`'s
+            // MANDATORY CLAMP — mirrors `handle_withdraw_protocol_fee`'s
+            // `§1.3/N2 clamp` verbatim. `.min(vault)` mirrors
+            // `protocol_fee_withdraw_amount`'s
             // second bound: `withdraw_insurance_surplus_delta` rejects
             // `amount > vault` too.
             let engine_available = group
@@ -11461,7 +11471,9 @@ pub mod processor {
             // `engine_available`-neutral: `charge_account_fee_current_not_atomic`
             // does `c_tot -= charged; insurance += charged` (engine
             // `v16.rs:13781-13800`), `maintenance_cranker_reward` is bounded by
-            // `bps <= 10_000` (validated at `:1462`) so `reward <= charged`, and
+            // `bps <= 10_000` (validated in `validate_wrapper_config`, via the
+            // `config.maintenance_cranker_fee_share_bps > 10_000` reject) so
+            // `reward <= charged`, and
             // the retained remainder is credited to the domain budgets 1:1 --
             // hence `d(engine_available) = (c-r) - (c-r) = 0` and this path
             // cannot reduce the surplus the LP claim sits in. Reserving the LP
@@ -14348,7 +14360,7 @@ pub mod processor {
         // path (bucket.fresh_unliened_backing_num decrement). earnings_portion
         // is routed through withdraw_backing_provider_earnings_not_atomic and
         // booked to total_earnings_withdrawn_atoms (GROSS convention, mirroring
-        // handle_withdraw_backing_bucket_earnings at v16_program.rs:8580-8583).
+        // `handle_withdraw_backing_bucket_earnings`, which books the same way).
         // The insurance-side stub ((1-fee_share) of gross net_earnings) stays
         // in the bucket — it was never counted in LP NAV and no token moves for
         // it. This is the only correct split; see lp_vault_design.md §5.2 Note 3.
@@ -14958,9 +14970,10 @@ pub mod processor {
     /// moving. `withdraw_insurance_surplus_not_atomic` (engine `v16.rs:7942`)
     /// does exactly `insurance -= a; vault -= a` and moves NO tokens — the
     /// wrapper separately decides whether to CPI a transfer. Restoring
-    /// `header.vault` afterwards (precedent: `:13433`) leaves the tokens in
-    /// place, and `add_fresh_counterparty_backing_view` (precedent: `:13419`,
-    /// `:10421`) hands them to the LP domain:
+    /// `header.vault` afterwards leaves the tokens in place, and
+    /// `add_fresh_counterparty_backing_view` hands them to the LP domain.
+    /// Both moves have precedent in `handle_deposit_to_lp_vault`, which
+    /// performs the same vault-write + fresh-backing pair:
     ///
     ///   `C + (I−a) + E + (FB+a) = S` against an unchanged `V`
     ///
@@ -14974,8 +14987,15 @@ pub mod processor {
     /// LP shares are minted, so the same share count now claims more atoms —
     /// which is precisely how the yield reaches existing LPs. `earnings_portion`
     /// therefore stays 0 in `handle_execute_redemption`, which *disarms* rather
-    /// than arms the `:13889` gate defect (that gate tests `earnings_portion`
-    /// but guards a `gross_consumed` subtraction; both are 0 on this path).
+    /// than arms the earnings-availability gate defect in that function — the
+    /// `if earnings_portion > bucket.utilization_fee_earnings` check, which
+    /// tests `earnings_portion` but guards a `gross_consumed` subtraction. Both
+    /// are 0 on this path.
+    ///
+    /// (Cited by line number as `:13889` until the branch-review pass. That
+    /// number had drifted onto `handle_execute_redemption`'s `mode !=
+    /// MarketModeV16::Live` check — a real gate, so the citation looked correct
+    /// and was not. Named rather than renumbered so it cannot rot again.)
     ///
     /// ACCEPTED TRADE-OFF (user decision): LP fee yield lands as at-risk backing
     /// capital, not a senior earnings claim, so it can be impaired by backing
@@ -15012,8 +15032,8 @@ pub mod processor {
     /// reserved_total_atoms − insurance_domain_budget_remaining_total`. Nothing
     /// checks that the three wrapper-side counters sum within it, so whichever
     /// leg cranks last would get `EngineLockActive` out of the engine unless
-    /// each clamps its own claim first. This mirrors the clamp in
-    /// `handle_withdraw_protocol_fee` (`:10405-10411`) and then advances
+    /// each clamps its own claim first. This mirrors the `§1.3/N2 clamp` in
+    /// `handle_withdraw_protocol_fee` and then advances
     /// `lp_fee_withdrawn_atoms` by the CLAMPED amount actually applied, never
     /// the requested amount — so a partial fill leaves the remainder claimable
     /// on the next crank instead of marking it paid without paying it.
@@ -15062,9 +15082,9 @@ pub mod processor {
         // Error choice: NOT `LpVaultNoFeesToCrank` (38) -- fees demonstrably DO
         // exist here, and reporting "no fees" would send an operator hunting for
         // a missing accrual instead of a missing LP. `LpVaultZeroSharesMinted`
-        // (41) is the existing variant for exactly this invariant: at
-        // `handle_deposit_to_lp_vault:13368` it refuses to absorb value when the
-        // operation would leave zero real shares behind it. Same failure mode,
+        // (41) is the existing variant for exactly this invariant:
+        // `handle_deposit_to_lp_vault` raises it to refuse to absorb value when
+        // the operation would leave zero real shares behind it. Same failure mode,
         // same remedy (deposit first) -- value in, no shares to claim it. No new
         // variant is warranted.
         if registry.total_lp_shares_outstanding <= crate::constants::LP_VAULT_MINIMUM_LIQUIDITY {
@@ -15077,8 +15097,8 @@ pub mod processor {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             // MODE GATE (Finding 1) -- modelled on `handle_deposit_to_lp_vault`
-            // (`:13399-13402`), NOT on `handle_withdraw_protocol_fee`
-            // (`:10369-10378`), and deliberately the STRICTER of the two.
+            // mode gate, NOT on `handle_withdraw_protocol_fee`'s `live_mode`
+            // / `resolved_mode` block, and deliberately the STRICTER of the two.
             //
             // Rationale. What this crank does is functionally a DEPOSIT into the
             // LP backing domain: it calls the same
@@ -15151,8 +15171,9 @@ pub mod processor {
                 .lp_fee_accrued_atoms
                 .checked_sub(cfg.lp_fee_withdrawn_atoms)
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            // MANDATORY CLAMP — mirrors handle_withdraw_protocol_fee:10405-10411
-            // verbatim. Three legs (protocol / LP / stake) share this one surplus
+            // MANDATORY CLAMP — mirrors `handle_withdraw_protocol_fee`'s
+            // `§1.3/N2 clamp` verbatim.
+            // Three legs (protocol / LP / stake) share this one surplus
             // pool with no cross-leg accounting, so an unclamped claim makes the
             // last leg to crank fail out of the engine with EngineLockActive.
             // `.min(vault)` mirrors `protocol_fee_withdraw_amount`'s second bound:
