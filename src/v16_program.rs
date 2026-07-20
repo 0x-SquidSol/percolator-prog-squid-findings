@@ -17659,8 +17659,15 @@ pub mod processor {
         /// BREAKING CHANGE. This test acts as an immutable CI gate: if you rename
         /// or reorder fork error variants the test fails loudly.
         ///
-        /// Ordinals 0-29 are toly variants and are tested implicitly by the
-        /// existing v16_baseline_smoke tests.
+        /// Ordinals 0-29 are pinned by
+        /// `upstream_percolator_error_ordinals_are_stable` directly below.
+        ///
+        /// That claim used to read "tested implicitly by the existing
+        /// v16_baseline_smoke tests". It was FALSE: `tests/v16_baseline_smoke.rs`
+        /// contains zero `PercolatorError` references and zero `Custom(`
+        /// references, so it pinned nothing. `Unauthorized` (8) and
+        /// `InvalidInstruction` (9) — two of the most widely decoded codes on
+        /// the wire — were protected by nothing at all.
         #[test]
         fn fork_percolator_error_ordinals_are_stable() {
             use crate::error::PercolatorError;
@@ -17699,6 +17706,77 @@ pub mod processor {
             assert_eq!(custom_code(PercolatorError::EngineInsufficientInitialMargin),  49);
             // BUG-2 / N7: LP vault genesis dead-share floor — ordinal 50.
             assert_eq!(custom_code(PercolatorError::LpVaultDepositBelowMinimumLiquidity), 50);
+        }
+
+        /// Ordinals 0-29 — the UPSTREAM (toly) variants.
+        ///
+        /// FINDING 7 (branch review). These were pinned by NOTHING. 30-50 are
+        /// pinned above and 51-60 in `tests/v16_fee_split.rs`, but the block
+        /// underneath both — including `Unauthorized` (8) and
+        /// `InvalidInstruction` (9), the two most widely decoded codes in the
+        /// keeper, indexer and SDK — had no assertion anywhere. The comment
+        /// above claimed `v16_baseline_smoke` covered them; that file has zero
+        /// `PercolatorError` references.
+        ///
+        /// This enum has NO explicit discriminants, so declaration order IS the
+        /// wire ABI: inserting a variant anywhere in this run silently shifts
+        /// every code below it and every downstream decoder starts
+        /// misattributing errors, with nothing failing to build. That is the
+        /// failure this pins.
+        ///
+        /// Asserting only — no variant is renumbered or reordered here. To add
+        /// an error, APPEND it at the tail of the enum and extend the last
+        /// block; never insert.
+        #[test]
+        fn upstream_percolator_error_ordinals_are_stable() {
+            use crate::error::PercolatorError;
+            use solana_program::program_error::ProgramError;
+
+            fn custom_code(e: PercolatorError) -> u32 {
+                match ProgramError::from(e) {
+                    ProgramError::Custom(n) => n,
+                    _ => panic!("not a Custom error"),
+                }
+            }
+
+            // Account//framing errors — 0-13.
+            assert_eq!(custom_code(PercolatorError::InvalidMagic),              0);
+            assert_eq!(custom_code(PercolatorError::InvalidVersion),            1);
+            assert_eq!(custom_code(PercolatorError::AlreadyInitialized),        2);
+            assert_eq!(custom_code(PercolatorError::NotInitialized),            3);
+            assert_eq!(custom_code(PercolatorError::InvalidAccountKind),        4);
+            assert_eq!(custom_code(PercolatorError::InvalidAccountLen),         5);
+            assert_eq!(custom_code(PercolatorError::ExpectedSigner),            6);
+            assert_eq!(custom_code(PercolatorError::ExpectedWritable),          7);
+            // The two the review called out as unprotected.
+            assert_eq!(custom_code(PercolatorError::Unauthorized),              8);
+            assert_eq!(custom_code(PercolatorError::InvalidInstruction),        9);
+            assert_eq!(custom_code(PercolatorError::InvalidMint),              10);
+            assert_eq!(custom_code(PercolatorError::InvalidTokenAccount),      11);
+            assert_eq!(custom_code(PercolatorError::InvalidVaultAccount),      12);
+            assert_eq!(custom_code(PercolatorError::InvalidTokenProgram),      13);
+
+            // Engine errors — 14-25.
+            assert_eq!(custom_code(PercolatorError::EngineInvalidConfig),      14);
+            assert_eq!(custom_code(PercolatorError::EngineArithmeticOverflow), 15);
+            assert_eq!(custom_code(PercolatorError::EngineProvenanceMismatch), 16);
+            assert_eq!(custom_code(PercolatorError::EngineHiddenLeg),          17);
+            assert_eq!(custom_code(PercolatorError::EngineInvalidLeg),         18);
+            assert_eq!(custom_code(PercolatorError::EngineStale),              19);
+            assert_eq!(custom_code(PercolatorError::EngineBStale),             20);
+            assert_eq!(custom_code(PercolatorError::EngineLockActive),         21);
+            assert_eq!(custom_code(PercolatorError::EngineNonProgress),        22);
+            assert_eq!(custom_code(PercolatorError::EngineRecoveryRequired),   23);
+            assert_eq!(custom_code(PercolatorError::EngineCounterOverflow),    24);
+            assert_eq!(custom_code(PercolatorError::EngineCounterUnderflow),   25);
+
+            // Oracle errors — 26-29. `InvalidOracleKey` (29) is the last
+            // upstream variant; ordinal 30 must remain `LpVaultAlreadyExists`,
+            // which is the boundary the test above starts from.
+            assert_eq!(custom_code(PercolatorError::OracleInvalid),            26);
+            assert_eq!(custom_code(PercolatorError::OracleStale),              27);
+            assert_eq!(custom_code(PercolatorError::OracleConfTooWide),        28);
+            assert_eq!(custom_code(PercolatorError::InvalidOracleKey),         29);
         }
 
         // ── F-1 cooldown gate (check_insurance_withdraw_cooldown) ────────────
