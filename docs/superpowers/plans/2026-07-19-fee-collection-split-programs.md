@@ -1,3 +1,27 @@
+> # ⚠️ EXECUTED AND SUPERSEDED — DO NOT RE-EXECUTE THIS PLAN
+>
+> All tasks were completed 2026-07-19/20. Implementation diverged materially from these
+> instructions, and **several steps below are now actively dangerous to follow**:
+>
+> - **Task 8 would rebuild a closed security hole.** Its tag-87 text still claims the
+>   destination is safe because "the destination is fixed by the stake pool PDA derivation…
+>   there is nothing for a caller to redirect." That reasoning was demolished by a working
+>   forgery exploit (a creator deploys their own program, derives matching PDAs, forges a
+>   392-byte pool, drains the payout). The shipped fix pins `constants::STAKE_PROGRAM_ID`
+>   and asserts `pool_ai.owner == STAKE_PROGRAM_ID` **before reading any bytes**. There is
+>   no amendment to Task 8 below — it never mentions the owner pin.
+> - **Task 7's mechanism is wrong here.** Tag 78 does not credit vault NAV; no such call
+>   exists. See the PLAN CORRECTION block inside Task 7, and the as-built spec.
+> - **Task 9's payload type is wrong** — tag 88 is `u128`, not `u64`.
+> - The `asset_admin` burn gate described in places was added and then **reverted** as
+>   ineffective; it left the self-rotation branch of `handle_update_asset_authority` open.
+>
+> **Authoritative record of what shipped:**
+> `docs/superpowers/specs/2026-07-20-fee-collection-split-as-built.md`.
+>
+> Kept for provenance — how the work was sequenced and why decisions were made — not as
+> instructions.
+
 # Fee Collection Split — Programs Implementation Plan (Phase 1 of 4)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
