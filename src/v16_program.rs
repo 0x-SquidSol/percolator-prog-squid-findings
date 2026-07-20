@@ -14288,8 +14288,34 @@ pub mod processor {
 
     /// LP Vault — LpVaultCrankFees (tag 78).
     ///
-    /// Permissionless: syncs backing-domain ledger from live bucket, computes
-    /// new earnings delta, distributes the LP share to the fee accumulator.
+    /// Permissionless: syncs the backing-domain ledger from the live bucket,
+    /// then drains the wrapper-side LP fee counter
+    /// (`cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms`) into the
+    /// vault's fee accumulator.
+    ///
+    /// FEE-SPLIT REPOINT (2026-07-19 design, Task 7). This crank used to key
+    /// off `bucket.utilization_fee_earnings` (via the synced ledger's
+    /// `total_earnings_atoms`) minus `registry.insurance_fee_snapshot_atoms`.
+    /// That source is structurally always 0 on every real market: the backing
+    /// utilization fee that feeds it is rate-0 (`backing_trade_fee_bps == 0`,
+    /// no instruction sets it) AND is only charged on a lien draw that a
+    /// well-capitalized trader never triggers. So tag 78 dead-ended at
+    /// `LpVaultNoFeesToCrank` forever and LPs earned nothing. The LP leg of
+    /// the trade fee (`cfg.lp_share_bps` of every trade, credited at the two
+    /// fee sites) is the real revenue stream, so that is what this drains.
+    ///
+    /// NO SECOND SPLIT. `registry.fee_share_bps` is deliberately NOT applied
+    /// to `available`. That bps splits *bucket* earnings between the LP side
+    /// and the insurance-side stub that stays behind in the bucket (see
+    /// `percolator::lp_vault::lp_fee_split` / `lp_vault_nav_atoms` Note 3).
+    /// `cfg.lp_fee_accrued_atoms` is already the LP-designated leg — the
+    /// four-way `split_trade_fee` applied `cfg.lp_share_bps` at the fee site
+    /// and routed the insurance leg to `cfg.insurance_reserve_accrued_atoms`
+    /// separately. Re-splitting here would strand
+    /// `(1 - fee_share_bps/10_000) * available` with no destination and no
+    /// counter, and would force `lp_fee_withdrawn_atoms` to advance by more
+    /// than was actually credited. The whole of `available` is credited and
+    /// exactly the whole of `available` is marked withdrawn.
     #[inline(never)]
     fn handle_lp_vault_crank_fees<'a>(
         program_id: &Pubkey,
@@ -14317,10 +14343,11 @@ pub mod processor {
         expect_key(ledger_ai, &ledger_pda)?;
         let domain = registry.domain as usize;
 
-        // Sync the ledger from the live bucket, persist, read current earnings.
-        let total_earnings = {
+        // Sync the ledger from the live bucket, persist, read current earnings,
+        // and compute/consume the wrapper-side LP fee claim.
+        let (total_earnings, available, cfg_after) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, group) = state::market_view_mut(&mut market_data)?;
             // PROG-1: verify the vault is still the backing authority for this domain.
             // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
             // without the check here, a fee crank after an asset_admin authority rotation
@@ -14342,27 +14369,47 @@ pub mod processor {
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
             let te = ledger.total_earnings_atoms;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
-            te
+
+            // Claim capacity. Monotonic invariant:
+            // lp_fee_withdrawn_atoms <= lp_fee_accrued_atoms, always — so the
+            // subtraction can only underflow on a corrupt config, which fails
+            // closed. Mirrors `protocol_fee_withdraw_amount`'s bound.
+            let available = cfg
+                .lp_fee_accrued_atoms
+                .checked_sub(cfg.lp_fee_withdrawn_atoms)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            if available == 0 {
+                return Err(PercolatorError::LpVaultNoFeesToCrank.into());
+            }
+            // Mark withdrawn HERE, by exactly `available` — the same value the
+            // registry credit below adds, with no clamp, no rounding and no
+            // second split between the two. There is no partial-fill path: the
+            // credit is a single `checked_add` on a u128 counter that either
+            // succeeds for the full amount or aborts the whole instruction.
+            cfg.lp_fee_withdrawn_atoms = cfg
+                .lp_fee_withdrawn_atoms
+                .checked_add(available)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            (te, available, cfg)
         };
 
-        let delta = total_earnings
-            .checked_sub(registry.insurance_fee_snapshot_atoms)
-            .ok_or(PercolatorError::EngineCounterUnderflow)?;
-        if delta == 0 {
-            return Err(PercolatorError::LpVaultNoFeesToCrank.into());
-        }
-        let (lp_side, _insurance_side) =
-            percolator::lp_vault::lp_fee_split(delta, registry.fee_share_bps)
-                .map_err(map_v16_error)?;
         {
             let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
             reg.insurance_fee_snapshot_atoms = total_earnings;
             reg.fee_distribution_total_atoms = reg
                 .fee_distribution_total_atoms
-                .checked_add(lp_side)
+                .checked_add(available)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
         }
+        // CRITICAL write-back. Unconditional on this path: every successful
+        // call mutates `lp_fee_withdrawn_atoms` (a zero-`available` crank
+        // returned Err above, and a failed instruction rolls every account
+        // write back). Without it the counter resets and the SAME atoms are
+        // credited to `fee_distribution_total_atoms` again on the next crank.
+        // Mirrors `handle_withdraw_protocol_fee`'s unconditional write-back
+        // rather than the trade-fee sites' opt-in `cfg_after` pattern.
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
         Ok(())
     }
 

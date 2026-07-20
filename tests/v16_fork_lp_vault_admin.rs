@@ -194,14 +194,18 @@ fn crank_fees(env: &mut Env) -> Result<(), String> {
 
 #[test]
 fn crank_fees_no_new_fees_rejects() {
-    // No trades → bucket utilization_fee_earnings == 0 → total_earnings == 0 ==
-    // snapshot → delta 0 → LpVaultNoFeesToCrank. (Happy path needs bucket
-    // earnings from trades → Phase 2.E assembled-system test.)
+    // FEE-SPLIT REPOINT (Task 7): the crank now keys off the wrapper-side LP
+    // fee counter, not the backing bucket. No trades → lp_fee_accrued_atoms ==
+    // lp_fee_withdrawn_atoms == 0 → available 0 → LpVaultNoFeesToCrank (38).
     let mut env = setup_vault();
     let _ = deposit(&mut env, DEPOSIT); // creates the backing ledger
     env.svm.expire_blockhash();
     let res = crank_fees(&mut env);
-    assert!(res.is_err(), "crank with no new fees must reject: {res:?}");
+    let err = res.expect_err("crank with no accrued LP fees must reject");
+    assert!(
+        err.contains("Custom(38)"),
+        "zero-available crank must return LpVaultNoFeesToCrank = Custom(38), got: {err}"
+    );
 }
 
 // ── G: Pause / Unpause / Close ──────────────────────────────────────
@@ -287,6 +291,25 @@ fn seed_bucket_earnings(env: &mut Env, earnings: u128) {
     env.svm.set_account(env.market, acct).unwrap();
 }
 
+/// FEE-SPLIT REPOINT (Task 7) counterpart of `seed_bucket_earnings`: seed the
+/// wrapper-side LP fee counter tag 78 now drains. Same accepted direct-write
+/// boundary (`state::read_market` / `state::write_market`) — the production
+/// producer is `split_trade_fee`'s LP leg at the two trade fee sites, which
+/// needs a full trading env this file does not build.
+fn seed_lp_fee_accrued(env: &mut Env, atoms: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (mut cfg, group) = state::read_market(&acct.data).expect("read market");
+    cfg.lp_fee_accrued_atoms += atoms;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+fn lp_fee_counters(env: &Env) -> (u128, u128) {
+    let acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, _) = state::read_market(&acct.data).expect("read market");
+    (cfg.lp_fee_accrued_atoms, cfg.lp_fee_withdrawn_atoms)
+}
+
 fn registry(env: &Env) -> state::LpVaultRegistryV16 {
     state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap()
 }
@@ -302,28 +325,27 @@ fn crank_fees_distributes_lp_share_after_earnings() {
     let mut env = setup_vault();
     let _ = deposit(&mut env, DEPOSIT); // creates the backing ledger + outstanding shares
 
+    // FEE-SPLIT REPOINT (Task 7): the crank's SOURCE is now
+    // `cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms`, not the backing
+    // bucket's utilization earnings. Bucket earnings are still seeded here to
+    // pin the ledger-sync half of the handler, which is unchanged.
     let earnings: u128 = 1_000_000;
     seed_bucket_earnings(&mut env, earnings);
+    let lp_fees: u128 = 777_777;
+    seed_lp_fee_accrued(&mut env, lp_fees);
 
     let reg_before = registry(&env);
     let te_before = ledger_total_earnings(&env);
+    let (accrued_before, withdrawn_before) = lp_fee_counters(&env);
+    assert_eq!(withdrawn_before, 0, "nothing withdrawn before the first crank");
     env.svm.expire_blockhash();
-    crank_fees(&mut env).expect("crank with accrued earnings must succeed");
+    crank_fees(&mut env).expect("crank with accrued LP fees must succeed");
     let reg_after = registry(&env);
     let te_after = ledger_total_earnings(&env);
+    let (accrued_after, withdrawn_after) = lp_fee_counters(&env);
 
-    // GAP-CRANKFEES (Phase 3A.2 belt-and-braces): exact sync + formula-derived split.
-    // NOTE on the seed: the fee SOURCE here is `seed_bucket_earnings` — the SAME
-    // accepted direct-write boundary `tests/v16_cu.rs:4876` uses to seed
-    // `utilization_fee_earnings`. The design doc's "real TradeNoCpi fee" recipe is
-    // mis-modeled: the backing/provider fee accrues on the increase in
-    // `source_lien_counterparty_backing_num` (a counterparty-backed LOSS
-    // reservation, v16_program.rs:11643-11683), NOT on positive PnL — so a real
-    // fee needs a sub-100%-margin loss-backed trade, requiring an Env-margin change
-    // that would perturb this file's other tests. Deferred (PENDING_DECISIONS);
-    // here we harden the crank's DISTRIBUTION bookkeeping against the seeded input.
-
-    // total_earnings_atoms grew by EXACTLY the accrued earnings (was a `>=` bound).
+    // GAP-CRANKFEES (Phase 3A.2 belt-and-braces): exact ledger sync is unchanged.
+    // total_earnings_atoms grew by EXACTLY the accrued bucket earnings.
     assert_eq!(
         te_after - te_before,
         earnings,
@@ -331,14 +353,67 @@ fn crank_fees_distributes_lp_share_after_earnings() {
     );
     // The snapshot advances to the current total_earnings.
     assert_eq!(reg_after.insurance_fee_snapshot_atoms, te_after, "fee snapshot must advance to current total_earnings");
-    // LP distribution == lp_fee_split(delta, fee_share_bps).0 = floor(delta * bps / 10_000)
-    // (percolator/src/v16.rs:21008), fee_share_bps = 5_000 from setup_vault's CreateLpVault —
-    // the REAL engine formula, not a hard-coded /2 constant.
-    const CRANK_FEE_SHARE_BPS: u128 = 5_000;
-    let expected_lp_side = earnings * CRANK_FEE_SHARE_BPS / 10_000;
+
+    // The crank credits the WHOLE available LP claim — `registry.fee_share_bps`
+    // is deliberately NOT re-applied, because `lp_fee_accrued_atoms` is already
+    // the LP-designated leg of `split_trade_fee`. A second split would strand
+    // atoms with no destination counter.
     let grew = reg_after.fee_distribution_total_atoms - reg_before.fee_distribution_total_atoms;
-    assert!(grew > 0, "LP fee distribution must grow after a fee crank");
-    assert_eq!(grew, expected_lp_side, "lp_side must equal lp_fee_split(earnings, fee_share_bps).0");
+    // `lp_fees` (777_777) is deliberately NOT any fraction of the seeded bucket
+    // `earnings` (1_000_000), so a credit sourced from the bucket cannot
+    // coincidentally satisfy this.
+    assert_eq!(grew, lp_fees, "the crank credits the full available LP claim, unsplit");
+
+    // WRITE-BACK PROOF, half 1: `withdrawn` advanced by EXACTLY the credited
+    // amount and `accrued` is untouched — so the invariant
+    // `lp_fee_withdrawn_atoms <= lp_fee_accrued_atoms` is preserved.
+    assert_eq!(accrued_after, accrued_before, "accrued must not move on a crank");
+    assert_eq!(
+        withdrawn_after - withdrawn_before,
+        grew,
+        "lp_fee_withdrawn_atoms must advance by exactly what was credited"
+    );
+
+    // WRITE-BACK PROOF, half 2 (the counter-reset trap): a second crank with no
+    // new accrual must find available == 0 and reject with Custom(38). If the
+    // cfg write-back above were missing, `withdrawn` would have reset to 0 and
+    // this crank would credit the SAME atoms a second time.
+    env.svm.expire_blockhash();
+    let again = crank_fees(&mut env);
+    let err = again.expect_err("second crank with no new LP fees must reject");
+    assert!(
+        err.contains("Custom(38)"),
+        "re-crank must return LpVaultNoFeesToCrank = Custom(38), got: {err}"
+    );
+    assert_eq!(
+        registry(&env).fee_distribution_total_atoms,
+        reg_after.fee_distribution_total_atoms,
+        "a rejected re-crank must not credit anything"
+    );
+}
+
+#[test]
+fn crank_fees_second_accrual_credits_only_the_delta() {
+    // Claim capacity is `accrued - withdrawn`, not gross `accrued`: after a
+    // first crank drains the counter, a fresh accrual must credit ONLY the new
+    // delta. Isolated from `crank_fees_distributes_lp_share_after_earnings` so
+    // the delta assertion is reached on its own.
+    let mut env = setup_vault();
+    let _ = deposit(&mut env, DEPOSIT);
+
+    seed_lp_fee_accrued(&mut env, 777_777);
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("first crank must succeed");
+    let after_first = registry(&env).fee_distribution_total_atoms;
+
+    seed_lp_fee_accrued(&mut env, 3);
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("crank after a fresh accrual must succeed");
+    assert_eq!(
+        registry(&env).fee_distribution_total_atoms - after_first,
+        3,
+        "only the NEW accrual delta is credited, not gross accrued"
+    );
 }
 
 // W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
