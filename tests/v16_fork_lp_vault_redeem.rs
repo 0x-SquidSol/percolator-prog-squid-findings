@@ -408,6 +408,69 @@ fn request_then_execute_pays_pro_rata() {
         "redemption PDA consumed");
 }
 
+/// FINDING 3 (branch review). `handle_execute_redemption` validated `ledger_ai`
+/// with `expect_owner` + `expect_writable` but never `expect_key` — unlike the
+/// two other sites that touch the same account, `handle_deposit_to_lp_vault` and
+/// `handle_lp_vault_crank_fees`, which both pin the derived address.
+///
+/// Owner-only is not a real constraint here: this program owns the backing
+/// ledger of EVERY (market, domain) pair, so an owner check alone admits any of
+/// them. The handler reads `total_principal_atoms` / `cumulative_loss_atoms` off
+/// this account to price the redemption and then writes the decremented
+/// principal back, so a substituted ledger both misprices the payout and
+/// corrupts whichever ledger was swapped in.
+///
+/// The substitute below is a BYTE-IDENTICAL copy of this market's own real
+/// ledger, placed at a non-derived address and still owned by the program.
+/// That is deliberate: every other check in the handler — owner, writability,
+/// decode, magic, and the market/domain binding stored INSIDE the ledger — still
+/// passes on it. The address is the only thing that differs, so the ONLY thing
+/// that can reject this transaction is the `expect_key` this finding added. The
+/// test therefore isolates that single check and cannot pass for an unrelated
+/// reason.
+#[test]
+fn execute_redemption_rejects_a_substituted_backing_ledger() {
+    let mut env = setup_vault(0); // immediate cooldown
+    let d = new_depositor(&mut env, DEPOSIT);
+    request(&mut env, &d, MINTED).expect("request");
+    env.svm.expire_blockhash();
+
+    // Byte-identical clone of the real ledger, at an address nobody derives.
+    let real = env.svm.get_account(&env.ledger).expect("real ledger exists after deposit");
+    assert_eq!(real.owner, env.program_id, "clone source must be program-owned");
+    let impostor = Pubkey::new_unique();
+    assert_ne!(impostor, env.ledger, "impostor must not be the derived ledger");
+    env.svm.set_account(impostor, real.clone()).expect("plant impostor ledger");
+
+    // Swap ONLY the ledger account meta; everything else is the happy path.
+    let mut accts = execute_accounts(&env, &d);
+    assert_eq!(accts[8].pubkey, env.ledger, "ledger is account index 8");
+    accts[8] = AccountMeta::new(impostor, false);
+
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let res = send(&mut env.svm, pid, &payer,
+        vec![(ProgInstruction::ExecuteRedemption, accts)], &[]);
+
+    assert!(res.is_err(), "substituted backing ledger must be rejected, got: {res:?}");
+    // `expect_key` returns ProgramError::InvalidArgument.
+    let msg = format!("{res:?}");
+    assert!(msg.contains("InvalidArgument"),
+        "expected InvalidArgument from expect_key(ledger_ai), got: {msg}");
+
+    // Fail-closed: no payout, shares still escrowed, impostor untouched.
+    assert_eq!(tok(&env.svm, d.dest), 0, "no payout on a substituted ledger");
+    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "shares still escrowed");
+    assert_eq!(env.svm.get_account(&impostor).expect("impostor").data, real.data,
+        "impostor ledger must not have been written");
+
+    // Control: the SAME transaction with the correctly derived ledger succeeds,
+    // proving the rejection above is the address check and not broken setup.
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("control: derived ledger still redeems");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "control payout is pro-rata");
+}
+
 #[test]
 fn execute_before_cooldown_rejects() {
     let mut env = setup_vault(1000); // long cooldown

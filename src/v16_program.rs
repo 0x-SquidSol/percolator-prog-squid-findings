@@ -14269,6 +14269,19 @@ pub mod processor {
         }
         let (escrow_pda, _) = state::derive_lp_escrow(program_id, &market_key);
         expect_key(escrow_ai, &escrow_pda)?;
+        // Backing-domain ledger: pin the ADDRESS, not just the owner. Every
+        // other site that touches this ledger does — `handle_deposit_to_lp_vault`
+        // and `handle_lp_vault_crank_fees` both `expect_key` against this same
+        // derivation. Owner-only is not enough: this program owns every backing
+        // ledger for every (market, domain) pair, so an owner check alone admits
+        // ANY other market's or domain's ledger. This handler reads
+        // `total_principal_atoms` / `cumulative_loss_atoms` from it to price the
+        // redemption and then writes the decremented principal back, so a
+        // substituted ledger both misprices the payout and corrupts the ledger
+        // it was swapped in from.
+        let (ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, &market_key, registry.domain);
+        expect_key(ledger_ai, &ledger_pda)?;
 
         // ── Cooldown gate. ──
         let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
