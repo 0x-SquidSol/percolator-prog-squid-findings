@@ -1289,6 +1289,18 @@ Read `process_admin_resolve_market` and its `cpi.rs` helper in full. It is the *
 
 One forwarding to wrapper tag 86 (`UpdateFeeSplit`, args `creator_share_bps`/`lp_share_bps`/`insurance_share_bps`, all `u16`), one to tag 88 (`UpdateMaintenanceFeePerSlot`, arg `maintenance_fee_per_slot: u64`). Append new stake instruction tags; do not renumber existing ones.
 
+**PLUS (folded in 2026-07-19, research option O3) — proxy the three `insurance_authority`/`asset_admin`-gated tags as well.** These are stranded by a *different* mechanism than the marketauth rotation, and one of them is the reason the fee split is unachievable:
+
+| Wrapper tag | Handler | Gated on | Why it strands |
+|---|---|---|---|
+| **51** `UpdateBackingFeePolicy` | `v16_program.rs:12329` | `insurance_authority` | `BindInsuranceAuthority` hands this field to the stake program's `vault_auth`. **This is the tag that sets `backing_trade_fee_bps`** — on a staked market nobody *can* set the backing fee, which is the mechanical root of the "fee split is unachievable" finding. |
+| **55** `UpdateTradeFeePolicy` | `:12450` | `insurance_authority` | same |
+| **69** `RestartAssetOracle` | `:11786` | `asset_admin` | stranded once `asset_admin` is burned or rotated |
+
+These proxies sign as `vault_auth` (not the pool PDA), since that is the authority `BindInsuranceAuthority` installs. That is a different signer from the tag 86/88 proxies above — do not conflate them.
+
+Note the ordering consequence: tags 51/55 become reachable only *after* `BindInsuranceAuthority` runs. Before the bind they are still callable directly by whoever holds `insurance_authority` (the creator, by default). So this proxy restores capability rather than transferring it.
+
 Validation stays in the wrapper — do not duplicate `validate_fee_split`'s floor logic here, or the two copies will drift.
 
 - [ ] **Step 4: Prove reachability end-to-end (this is the whole point)**
