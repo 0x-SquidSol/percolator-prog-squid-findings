@@ -17982,18 +17982,44 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain
     let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
     let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
     let expected_protocol_cut = total_fee * 2_000 / 10_000;
-    let expected_taker_domain = total_fee - expected_protocol_cut;
+    // Four-way split (2026-07-19, Task 5): the creator no longer gets "the
+    // complement" of the protocol cut on the batch site either -- it gets its
+    // own configured share, with LP and insurance now also carved out of what
+    // used to be 100% creator, mirroring the single-trade site (Task 4).
+    let expected_creator_cut = total_fee * cfg_before.creator_share_bps as u128 / 10_000;
+    let expected_lp_cut = total_fee * cfg_before.lp_share_bps as u128 / 10_000;
+    // Insurance is the remainder leg in split_trade_fee (absorbs rounding dust),
+    // so compute it the same way rather than re-deriving its bps share.
+    let expected_insurance_cut =
+        total_fee - expected_protocol_cut - expected_creator_cut - expected_lp_cut;
 
-    assert_eq!(group_after.insurance - group_before.insurance, total_fee);
-    assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
+    assert_eq!(
+        group_after.insurance - group_before.insurance,
+        total_fee,
+        "header.insurance still receives 100% of the fee -- the four-way split only changes routing"
+    );
+    assert_eq!(
+        cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut,
+        "protocol accrues exactly fee_share_floor(fee, 2000)"
+    );
     assert_eq!(
         group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
-        expected_taker_domain,
-        "batch taker's (account_a, always long_account for batches) domain gets the complement"
+        expected_creator_cut,
+        "batch taker's (account_a, always long_account for batches) domain gets the creator's configured share"
     );
     assert_eq!(
         group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
         "N1/N4 regression guard: batch maker's domain is byte-unchanged"
+    );
+    assert_eq!(
+        cfg_after.lp_fee_accrued_atoms - cfg_before.lp_fee_accrued_atoms,
+        expected_lp_cut,
+        "lp accrues exactly its configured share (Task 5 wiring)"
+    );
+    assert_eq!(
+        cfg_after.insurance_reserve_accrued_atoms - cfg_before.insurance_reserve_accrued_atoms,
+        expected_insurance_cut,
+        "insurance reserve accrues its configured share plus rounding dust (Task 5 wiring)"
     );
 }
 

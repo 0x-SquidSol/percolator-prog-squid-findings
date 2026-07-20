@@ -7768,12 +7768,15 @@ pub mod processor {
 
             // Post-pass: split fees back to each asset's single paying domain and drive its hybrid
             // mark. Fees are reconstructed deterministically per leg; the running total must equal
-            // the engine's aggregate or we refuse the batch (no silent mis-accounting). Also skims
-            // the protocol's 20% off the top of each leg's fee before crediting the domain (design
-            // §1/§2), symmetric with the single-trade credit site above.
+            // the engine's aggregate or we refuse the batch (no silent mis-accounting). Also applies
+            // the four-way split (design §1/§2) to each leg's fee before crediting the domain --
+            // the domain gets only the configured creator share, not everything left over --
+            // symmetric with the single-trade credit site above.
             let mut reconstructed_total: u128 = 0;
             let mut cfg_dirty = false;
             let mut protocol_cut_running_total: u128 = 0;
+            let mut lp_cut_running_total: u128 = 0;
+            let mut insurance_cut_running_total: u128 = 0;
             for (
                 asset_index,
                 oracle_profile,
@@ -7786,12 +7789,22 @@ pub mod processor {
             {
                 let fee_leg = batch_leg_fee(*abs_size, *fee_basis_price, *fee_bps_eff)?;
                 if fee_leg != 0 {
-                    let protocol_cut_leg = fee_share_floor(fee_leg, constants::PROTOCOL_FEE_BPS)?;
-                    let domain_amount_leg = fee_leg
-                        .checked_sub(protocol_cut_leg)
-                        .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                    let split_leg = policy_v16::split_trade_fee(
+                        fee_leg,
+                        constants::PROTOCOL_FEE_BPS,
+                        cfg.creator_share_bps,
+                        cfg.lp_share_bps,
+                        cfg.insurance_share_bps,
+                    )?;
+                    let domain_amount_leg = split_leg.creator;
                     protocol_cut_running_total = protocol_cut_running_total
-                        .checked_add(protocol_cut_leg)
+                        .checked_add(split_leg.protocol)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    lp_cut_running_total = lp_cut_running_total
+                        .checked_add(split_leg.lp)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    insurance_cut_running_total = insurance_cut_running_total
+                        .checked_add(split_leg.insurance)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                     if taker_paid {
                         // account_a is always the engine's first (long_account)
@@ -7855,14 +7868,25 @@ pub mod processor {
             if reconstructed_total != engine_total {
                 return Err(PercolatorError::EngineArithmeticOverflow.into());
             }
-            if protocol_cut_running_total != 0 {
+            if protocol_cut_running_total != 0
+                || lp_cut_running_total != 0
+                || insurance_cut_running_total != 0
+            {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
                     .checked_add(protocol_cut_running_total)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                cfg.lp_fee_accrued_atoms = cfg
+                    .lp_fee_accrued_atoms
+                    .checked_add(lp_cut_running_total)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                cfg.insurance_reserve_accrued_atoms = cfg
+                    .insurance_reserve_accrued_atoms
+                    .checked_add(insurance_cut_running_total)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 // CRITICAL: same write-back-forcing requirement as the
                 // single-trade site -- a missed write-back here would
-                // silently discard accrued protocol fees.
+                // silently discard accrued fees for all three legs.
                 cfg_dirty = true;
             }
             if cfg_dirty {

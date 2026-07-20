@@ -9130,11 +9130,22 @@ fn v16_bpf_batch_trade_nocpi_subatom_leg_charges_fee_on_ceil_notional() {
     );
 
     let (cfg_after, group_after) = env.market_state();
+    // Four-way split (2026-07-19, Task 5): a 1-atom fee floors to 0 on all of
+    // protocol/creator/lp (each share_bps * 1 / 10_000 floors to 0), so
+    // split_trade_fee's remainder rule routes the whole atom to the insurance
+    // leg instead of the domain budget -- verified directly (not asserted
+    // away): domain=0, protocol=0, lp=0, insurance=1, and
+    // group_after.insurance (header-level total) still receives the full
+    // atom, so nothing is lost, only re-routed to the new destination this
+    // task wires up.
     assert_eq!(
-        group_after.insurance_domain_budget[0] + cfg_after.protocol_fee_accrued_atoms,
+        group_after.insurance_domain_budget[0]
+            + cfg_after.protocol_fee_accrued_atoms
+            + cfg_after.lp_fee_accrued_atoms
+            + cfg_after.insurance_reserve_accrued_atoms,
         1,
-        "the reconstructed 1-atom fee must be credited somewhere (domain budget or protocol \
-         cut), not silently dropped"
+        "the reconstructed 1-atom fee must be credited somewhere (domain budget, protocol cut, \
+         lp, or insurance reserve), not silently dropped"
     );
 }
 
