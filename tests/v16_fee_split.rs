@@ -1533,3 +1533,139 @@ fn tag87_succeeds_with_asset_admin_live_proving_the_burn_gate_is_gone() {
         "conservation: tokens only moved between the two vaults"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TAG 88 — UpdateMaintenanceFeePerSlot.
+//
+// `maintenance_fee_per_slot` was an InitMarket constructor argument with NO
+// setter anywhere in the dispatch table, so it was frozen for the life of the
+// market. Tag 88 restores optionality only; the default stays 0.
+// ════════════════════════════════════════════════════════════════════════════
+
+impl FeeEnv {
+    /// Send tag 88 as `signer`. Returns the raw result so the negative cases
+    /// can pin their code rather than merely observing "some error".
+    fn set_maintenance_fee_per_slot_as(
+        &mut self,
+        signer: &Keypair,
+        rate: u128,
+    ) -> Result<(), solana_sdk::transaction::TransactionError> {
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            data: ProgInstruction::UpdateMaintenanceFeePerSlot {
+                maintenance_fee_per_slot: rate,
+            }
+            .encode(),
+        };
+        let payer = self.payer.insecure_clone();
+        send_ixs(&mut self.svm, &payer, vec![ix], &[signer])
+    }
+
+    /// `cfg.maintenance_fee_per_slot`, read back from the live account.
+    fn maintenance_fee_per_slot(&self) -> u128 {
+        let acct = self.svm.get_account(&self.market).unwrap();
+        let (cfg, _, _, _) = state::read_market_config_mode_and_capacity(&acct.data).unwrap();
+        cfg.maintenance_fee_per_slot
+    }
+}
+
+/// The defect this closes: the value must actually be settable and must
+/// PERSIST to the account, re-read from chain rather than from a local copy.
+#[test]
+fn tag88_marketauth_sets_maintenance_fee_per_slot_and_it_persists() {
+    let mut env = FeeEnv::new(1_000_000);
+
+    assert_eq!(
+        env.maintenance_fee_per_slot(),
+        0,
+        "InitMarket must leave the default at 0"
+    );
+
+    let admin = env.admin.insecure_clone();
+    env.set_maintenance_fee_per_slot_as(&admin, 7_777)
+        .expect("marketauth must be able to set the maintenance fee");
+
+    assert_eq!(
+        env.maintenance_fee_per_slot(),
+        7_777,
+        "the new rate must be readable back from the account"
+    );
+
+    // Settable more than once, and back down to 0 — this is a policy lever,
+    // not a one-shot latch.
+    env.set_maintenance_fee_per_slot_as(&admin, 0)
+        .expect("marketauth must be able to set it back to 0");
+    assert_eq!(env.maintenance_fee_per_slot(), 0, "must be resettable to 0");
+}
+
+/// The payload is a `u128`, matching storage and InitMarket's own encoding. A
+/// `u64` payload would silently cap the settable range ~1.8e19 while the
+/// accepted bound is MAX_PROTOCOL_FEE_ABS == 1e36. This pins the wire width:
+/// a value above u64::MAX must round-trip intact.
+#[test]
+fn tag88_accepts_a_rate_above_u64_max_proving_the_payload_is_u128() {
+    let mut env = FeeEnv::new(1_000_000);
+    let admin = env.admin.insecure_clone();
+
+    let big = (u64::MAX as u128) + 1;
+    env.set_maintenance_fee_per_slot_as(&admin, big)
+        .expect("a u128 rate below MAX_PROTOCOL_FEE_ABS must be accepted");
+    assert_eq!(
+        env.maintenance_fee_per_slot(),
+        big,
+        "a value above u64::MAX must round-trip intact, not truncate"
+    );
+}
+
+/// A setter must not be able to store a value InitMarket itself would reject,
+/// and must reject it with InitMarket's own code.
+#[test]
+fn tag88_rejects_a_rate_above_max_protocol_fee_abs() {
+    let mut env = FeeEnv::new(1_000_000);
+    let admin = env.admin.insecure_clone();
+
+    assert_custom(
+        env.set_maintenance_fee_per_slot_as(&admin, percolator::MAX_PROTOCOL_FEE_ABS + 1),
+        14, // EngineInvalidConfig — the same code InitMarket uses for this bound
+        "a rate above MAX_PROTOCOL_FEE_ABS",
+    );
+    assert_eq!(
+        env.maintenance_fee_per_slot(),
+        0,
+        "a rejected call must not have written anything"
+    );
+
+    // The boundary itself is accepted — the bound is inclusive, as at InitMarket.
+    env.set_maintenance_fee_per_slot_as(&admin, percolator::MAX_PROTOCOL_FEE_ABS)
+        .expect("exactly MAX_PROTOCOL_FEE_ABS must be accepted");
+    assert_eq!(
+        env.maintenance_fee_per_slot(),
+        percolator::MAX_PROTOCOL_FEE_ABS
+    );
+}
+
+/// AUTHORITY: tag 88 is marketauth-gated, with the same code the sibling
+/// marketauth setters use. A funded, valid, but unrelated signer must not be
+/// able to turn on a recurring fee that drains every portfolio in the market.
+#[test]
+fn tag88_rejects_a_non_marketauth_signer_with_unauthorized() {
+    let mut env = FeeEnv::new(1_000_000);
+
+    let interloper = Keypair::new();
+    env.svm.airdrop(&interloper.pubkey(), 1_000_000_000).unwrap();
+
+    assert_custom(
+        env.set_maintenance_fee_per_slot_as(&interloper, 7_777),
+        8, // Unauthorized — same code as the sibling marketauth setters
+        "a non-marketauth signer must not set the maintenance fee",
+    );
+    assert_eq!(
+        env.maintenance_fee_per_slot(),
+        0,
+        "a rejected call must not have written anything"
+    );
+}

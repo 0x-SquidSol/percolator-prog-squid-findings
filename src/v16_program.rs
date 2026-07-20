@@ -4046,6 +4046,24 @@ pub mod ix {
         /// the accrued insurance/staker leg into the stake vault, producing
         /// exactly the vault surplus percolator-stake's AccrueFees measures.
         WithdrawInsuranceReserveToStake,
+        /// UpdateMaintenanceFeePerSlot (tag 88) — marketauth-gated.
+        /// Closes a real defect: the value was an InitMarket constructor
+        /// argument with NO setter anywhere in the dispatch table, so it was
+        /// permanently frozen per market. Default remains 0; this restores
+        /// optionality only and does not enable the maintenance fee.
+        ///
+        /// The payload is a `u128`, matching the storage type
+        /// (`WrapperConfigV16::maintenance_fee_per_slot`) and InitMarket's own
+        /// wire encoding. A `u64` payload would leave all but the bottom
+        /// ~1.8e19 of the `MAX_PROTOCOL_FEE_ABS` (1e36) valid range
+        /// unreachable and would disagree with InitMarket's `read_u128`.
+        ///
+        /// REACHABILITY: gated on `cfg.marketauth`, which `StakeInitPool`
+        /// irreversibly rotates to the stake-pool PDA. On a staked market this
+        /// tag is therefore unreachable until a CPI proxy exists.
+        UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: u128,
+        },
     }
 
     impl Instruction {
@@ -4366,6 +4384,9 @@ pub mod ix {
                     insurance_share_bps: read_u16(&mut rest)?,
                 },
                 87 => Self::WithdrawInsuranceReserveToStake,
+                88 => Self::UpdateMaintenanceFeePerSlot {
+                    maintenance_fee_per_slot: read_u128(&mut rest)?,
+                },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -4860,6 +4881,12 @@ pub mod ix {
                     push_u16(&mut out, insurance_share_bps);
                 }
                 Self::WithdrawInsuranceReserveToStake => out.push(87),
+                Self::UpdateMaintenanceFeePerSlot {
+                    maintenance_fee_per_slot,
+                } => {
+                    out.push(88);
+                    push_u128(&mut out, maintenance_fee_per_slot);
+                }
             }
             out
         }
@@ -7227,6 +7254,13 @@ pub mod processor {
             Instruction::WithdrawInsuranceReserveToStake => {
                 handle_withdraw_insurance_reserve_to_stake(program_id, accounts)
             }
+            Instruction::UpdateMaintenanceFeePerSlot {
+                maintenance_fee_per_slot,
+            } => handle_update_maintenance_fee_per_slot(
+                program_id,
+                accounts,
+                maintenance_fee_per_slot,
+            ),
         }
     }
 
@@ -12367,6 +12401,45 @@ pub mod processor {
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
         cfg.maintenance_cranker_fee_share_bps = cranker_share_bps;
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+    }
+
+    /// UpdateMaintenanceFeePerSlot (tag 88) — marketauth-gated.
+    ///
+    /// `maintenance_fee_per_slot` was an InitMarket constructor argument with
+    /// no setter anywhere in the dispatch table, so it was frozen for the life
+    /// of the market. This restores optionality only; the default stays 0 and
+    /// nothing here enables the maintenance fee.
+    ///
+    /// Mirrors the marketauth idiom of the neighbouring single-field setters
+    /// (`handle_update_maintenance_fee_policy`, `handle_update_fee_redirect_policy`):
+    /// signer/writable/owner checks, load cfg via
+    /// `read_market_config_mode_and_capacity`, gate on `cfg.marketauth` via
+    /// `expect_live_authority`, mutate, write back. NOTE:
+    /// `handle_update_trade_fee_policy` gates on asset-0's insurance authority
+    /// instead, so despite the shared "fee policy" naming it is NOT the
+    /// pattern to mirror here (same caveat as `handle_update_fee_split`).
+    ///
+    /// Range check mirrors InitMarket's: a setter must not be able to store a
+    /// value InitMarket itself would reject.
+    #[inline(never)]
+    fn handle_update_maintenance_fee_per_slot<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        maintenance_fee_per_slot: u128,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        expect_signer(admin)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        if maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        let (mut cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        expect_live_authority(&cfg.marketauth, admin.key)?;
+        cfg.maintenance_fee_per_slot = maintenance_fee_per_slot;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }
 
