@@ -7454,40 +7454,59 @@ pub mod processor {
                 } else {
                     0
                 };
-            // Protocol-fee skim (design §1/§2): 20% off the top of every
-            // trade-fee-mechanism credit, before any domain sees it. Taker-only
-            // (§1A) already guarantees exactly one of outcome.fee_a/fee_b is
-            // nonzero, so skimming 20% of 0 is 0 -- the maker's domain gets
-            // exactly the 0 credit it should (§1A.6), no special-casing needed.
-            // The skimmed amount is deliberately left uncredited to ANY domain
-            // (not withdrawn/moved elsewhere here) -- it stays in
-            // `header.insurance` as unbudgeted surplus, which is exactly where
-            // `withdraw_insurance_surplus_not_atomic` (engine) draws from.
-            let protocol_cut_a =
-                fee_share_floor(outcome.fee_a, constants::PROTOCOL_FEE_BPS)?;
-            let protocol_cut_b =
-                fee_share_floor(outcome.fee_b, constants::PROTOCOL_FEE_BPS)?;
-            let domain_fee_a = outcome
-                .fee_a
-                .checked_sub(protocol_cut_a)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            let domain_fee_b = outcome
-                .fee_b
-                .checked_sub(protocol_cut_b)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            let protocol_cut_total = protocol_cut_a
-                .checked_add(protocol_cut_b)
+            // Four-way split (2026-07-19 design). Taker-only (§1A) guarantees
+            // exactly one of outcome.fee_a/fee_b is nonzero, so splitting 0 is
+            // all-zeros and the maker's domain gets exactly the 0 credit it
+            // should -- no special-casing needed.
+            let split_a = policy_v16::split_trade_fee(
+                outcome.fee_a,
+                constants::PROTOCOL_FEE_BPS,
+                cfg.creator_share_bps,
+                cfg.lp_share_bps,
+                cfg.insurance_share_bps,
+            )?;
+            let split_b = policy_v16::split_trade_fee(
+                outcome.fee_b,
+                constants::PROTOCOL_FEE_BPS,
+                cfg.creator_share_bps,
+                cfg.lp_share_bps,
+                cfg.insurance_share_bps,
+            )?;
+            // The creator leg keeps the pre-existing domain-budget path; only
+            // its AMOUNT changes (a configured share, not "everything left").
+            let domain_fee_a = split_a.creator;
+            let domain_fee_b = split_b.creator;
+
+            let protocol_cut_total = split_a
+                .protocol
+                .checked_add(split_b.protocol)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            if protocol_cut_total != 0 {
+            let lp_cut_total = split_a
+                .lp
+                .checked_add(split_b.lp)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let insurance_cut_total = split_a
+                .insurance
+                .checked_add(split_b.insurance)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+            if protocol_cut_total != 0 || lp_cut_total != 0 || insurance_cut_total != 0 {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
                     .checked_add(protocol_cut_total)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                // CRITICAL: force the write-back below even if nothing else
-                // in this instruction would otherwise have dirtied cfg (the
-                // pre-existing cfg_after pattern was opt-in per mutation --
-                // a missed write-back here would silently discard accrued
-                // protocol fees, so this is unconditional on protocol_cut_total != 0).
+                cfg.lp_fee_accrued_atoms = cfg
+                    .lp_fee_accrued_atoms
+                    .checked_add(lp_cut_total)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                cfg.insurance_reserve_accrued_atoms = cfg
+                    .insurance_reserve_accrued_atoms
+                    .checked_add(insurance_cut_total)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // CRITICAL: force the write-back below even if nothing else in
+                // this instruction would otherwise have dirtied cfg. The cfg_after
+                // pattern is opt-in per mutation -- a missed write-back here
+                // SILENTLY DISCARDS accrued fees for all three legs.
                 cfg_after = Some(cfg);
             }
             credit_trade_fees_to_market_budgets_view(
