@@ -227,6 +227,65 @@ pub mod constants {
     /// capability.
     pub const TAG_UNWRAP_ESCROWED_PORTFOLIO: u8 = 82;
 
+    // ── SHARED LAYOUT CONTRACT with the percolator-stake program (tag 87) ────
+    //
+    // `WithdrawInsuranceReserveToStake` pushes the accrued insurance/staker fee
+    // leg out of `header.insurance` and into the stake pool's SPL vault, where
+    // percolator-stake's `AccrueFees` measures it as surplus over
+    // `total_pool_value()` and distributes it to stakers.
+    //
+    // percolator-prog CANNOT take a Cargo dependency on percolator-stake (the
+    // zeroize/solana-2.2 clash documented at
+    // `tests/v16_five_program_crosscut.rs:1655`), so the pool is validated by
+    // reading raw bytes at pinned offsets — the same technique the crosscut
+    // test uses to hand-craft one. These constants mirror
+    // `percolator-stake/src/state.rs` (`StakePool`, `STAKE_POOL_SIZE`) and MUST
+    // be updated in lockstep with any layout change there.
+    // NO HARDCODED STAKE PROGRAM ID — deliberate. percolator-stake has no
+    // `declare_id!`, and the candidate ids in this tree disagree with each
+    // other (`tests/common/mod.rs::STAKE_ID` = 9tbLt8fs…, the local
+    // `percolator_stake-keypair.json` = BQ6SP1oZ…, the TS SDK's mainnet
+    // DC5fovFQ… / devnet 6aJb1F9C…). Pinning any one of them would make tag 87
+    // dead on every cluster that uses a different one, silently.
+    //
+    // Instead the stake program is identified PER MARKET from state the stake
+    // program itself established: `BindInsuranceAuthority` CPIs this wrapper to
+    // set the asset's `insurance_authority` to the pool's `vault_auth` PDA, so
+    // that stored value is a cryptographic commitment to (stake_program, pool).
+    // `load_bound_stake_pool` re-derives it and requires a match. See there.
+
+    /// SHARED SEED CONTRACT with percolator-stake: the pool PDA is derived from
+    /// the wrapper market it is bound to, so there is exactly ONE pool per
+    /// market and the wrapper can compute it rather than trust the caller.
+    pub const STAKE_POOL_SEED: &[u8] = b"stake_pool";
+    /// SHARED SEED CONTRACT: SPL authority over the pool's vault token account.
+    pub const STAKE_VAULT_AUTHORITY_SEED: &[u8] = b"vault_auth";
+
+    /// `percolator-stake::state::STAKE_POOL_SIZE` (v3 — `state.rs:688` asserts
+    /// 392). NOTE: `tests/v16_five_program_crosscut.rs:1662` still crafts the
+    /// v2 384-byte shape; that harness is stale, not this constant.
+    pub const STAKE_POOL_LEN: usize = 392;
+    pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = *b"SPOOL_V1";
+    /// `StakePool::CURRENT_VERSION` (`state.rs:464`). Checked EXACTLY, never
+    /// ignored: the `_reserved` sub-layout has been recarved at every version
+    /// bump (352 -> 384 -> 392), so a future v4 must fail loudly here rather
+    /// than misread `vault` out of a moved field.
+    pub const STAKE_POOL_VERSION: u8 = 3;
+    /// Byte offsets into `StakePool` (percolator-stake `state.rs:19-114`).
+    pub const STAKE_POOL_OFF_IS_INITIALIZED: usize = 0;
+    /// The wrapper market this pool is bound to.
+    pub const STAKE_POOL_OFF_SLAB: usize = 8;
+    /// The pool's SPL vault token account — the ONLY legal tag-87 destination.
+    pub const STAKE_POOL_OFF_VAULT: usize = 136;
+    /// The wrapper program this pool CPIs; must equal our own `program_id`.
+    pub const STAKE_POOL_OFF_PERCOLATOR_PROGRAM: usize = 224;
+    /// 0 = insurance-LP mode (the mode whose stakers absorb losses via
+    /// `FlushToInsurance` and are therefore owed this fee leg).
+    pub const STAKE_POOL_OFF_MODE: usize = 280;
+    pub const STAKE_POOL_MODE_INSURANCE_LP: u8 = 0;
+    pub const STAKE_POOL_OFF_DISCRIMINATOR: usize = 320;
+    pub const STAKE_POOL_OFF_VERSION: usize = 328;
+
     // ── Sweep NET-NEW: KIND-byte futures guard ──────────────────────────────
     // Toly's frozen target has no KIND > 4. Our fork KINDs 5/6/7 are safe NOW.
     // This assert fires if a future toly sync introduces KIND_LP_VAULT_REGISTRY=5,
@@ -3887,6 +3946,10 @@ pub mod ix {
             lp_share_bps: u16,
             insurance_share_bps: u16,
         },
+        /// WithdrawInsuranceReserveToStake (tag 87) — permissionless. Pushes
+        /// the accrued insurance/staker leg into the stake vault, producing
+        /// exactly the vault surplus percolator-stake's AccrueFees measures.
+        WithdrawInsuranceReserveToStake,
     }
 
     impl Instruction {
@@ -4206,6 +4269,7 @@ pub mod ix {
                     lp_share_bps: read_u16(&mut rest)?,
                     insurance_share_bps: read_u16(&mut rest)?,
                 },
+                87 => Self::WithdrawInsuranceReserveToStake,
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -4699,6 +4763,7 @@ pub mod ix {
                     push_u16(&mut out, lp_share_bps);
                     push_u16(&mut out, insurance_share_bps);
                 }
+                Self::WithdrawInsuranceReserveToStake => out.push(87),
             }
             out
         }
@@ -7063,6 +7128,9 @@ pub mod processor {
                 lp_share_bps,
                 insurance_share_bps,
             ),
+            Instruction::WithdrawInsuranceReserveToStake => {
+                handle_withdraw_insurance_reserve_to_stake(program_id, accounts)
+            }
         }
     }
 
@@ -10505,6 +10573,312 @@ pub mod processor {
         cfg.lp_share_bps = lp_share_bps;
         cfg.insurance_share_bps = insurance_share_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+    }
+
+    /// Reads and validates a percolator-stake `StakePool` account, returning
+    /// its `vault` token-account key and its `vault_authority` PDA.
+    ///
+    /// EVERY value that decides where tokens land is DERIVED here, never taken
+    /// from the caller. The caller supplies account handles; it does not get to
+    /// choose what they are allowed to be.
+    ///
+    /// THE TRUST ROOT is `bound_insurance_authority` — the asset's
+    /// `insurance_authority`, which percolator-stake's `BindInsuranceAuthority`
+    /// (tag 19) set by CPIing this wrapper's `UpdateAssetAuthority` while
+    /// signing as the pool's `vault_auth` PDA. Because that PDA had to sign,
+    /// the stored value is a commitment to a specific (stake_program, pool)
+    /// pair that only the real stake program could have produced.
+    ///
+    /// So instead of pinning a stake program id as a constant (see the note in
+    /// `constants`), the stake program is recovered from `pool_ai.owner` and
+    /// then PROVEN correct by re-deriving `["vault_auth", pool]` under it and
+    /// requiring the result to equal the bound authority. Forging that would
+    /// mean finding a program id whose derived PDA hits a chosen 32-byte
+    /// target — a second-preimage attack on the PDA hash, not a validation gap.
+    /// An unbound market (`insurance_authority == 0`) has no staker
+    /// constituency absorbing its losses and is rejected outright.
+    fn load_bound_stake_pool(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo,
+        pool_ai: &AccountInfo,
+        bound_insurance_authority: &[u8; 32],
+    ) -> Result<(Pubkey, Pubkey), ProgramError> {
+        // (0) No bound stake pool ⇒ nobody is owed this leg. Fail closed; the
+        // atoms simply stay in `header.insurance`.
+        if *bound_insurance_authority == [0u8; 32] {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // (1) Recover the stake program from the account's owner, then prove it
+        // is the one that bound itself to this market. `find_program_address`
+        // on an owner we do not yet trust is safe: nothing is authorised by the
+        // derivation itself, only by the equality test that follows.
+        let stake_program = *pool_ai.owner;
+        let (vault_authority, _) = Pubkey::find_program_address(
+            &[
+                crate::constants::STAKE_VAULT_AUTHORITY_SEED,
+                pool_ai.key.as_ref(),
+            ],
+            &stake_program,
+        );
+        if vault_authority.to_bytes() != *bound_insurance_authority {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // (2) …and it must be THE pool for THIS market. One pool per market by
+        // construction of the seed, so this is an equality test, not a search.
+        let (expected_pool, _) = Pubkey::find_program_address(
+            &[crate::constants::STAKE_POOL_SEED, market_ai.key.as_ref()],
+            &stake_program,
+        );
+        expect_key(pool_ai, &expected_pool)?;
+
+        let data = pool_ai.try_borrow_data()?;
+        if data.len() < crate::constants::STAKE_POOL_LEN {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // (3) Discriminator + version + init flag: refuse to parse a stake
+        // account of some other kind, or a layout we do not know.
+        if data[crate::constants::STAKE_POOL_OFF_DISCRIMINATOR
+            ..crate::constants::STAKE_POOL_OFF_DISCRIMINATOR + 8]
+            != crate::constants::STAKE_POOL_DISCRIMINATOR
+            || data[crate::constants::STAKE_POOL_OFF_VERSION]
+                != crate::constants::STAKE_POOL_VERSION
+            || data[crate::constants::STAKE_POOL_OFF_IS_INITIALIZED] != 1
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // (4) The pool's own record of its bindings must agree with ours.
+        // Redundant with (2) for `slab` — kept because it costs nothing and
+        // makes a future seed change fail closed instead of silently
+        // redirecting funds.
+        let mut slab = [0u8; 32];
+        slab.copy_from_slice(
+            &data[crate::constants::STAKE_POOL_OFF_SLAB..crate::constants::STAKE_POOL_OFF_SLAB + 32],
+        );
+        if slab != market_ai.key.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // (5) The pool must CPI *this* wrapper deployment. A pool bound to a
+        // different wrapper program is not this market's staker constituency.
+        let mut cpi_target = [0u8; 32];
+        cpi_target.copy_from_slice(
+            &data[crate::constants::STAKE_POOL_OFF_PERCOLATOR_PROGRAM
+                ..crate::constants::STAKE_POOL_OFF_PERCOLATOR_PROGRAM + 32],
+        );
+        if cpi_target != program_id.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // (6) Insurance-LP mode only. That is the mode whose stakers absorb
+        // this market's losses via `FlushToInsurance`; this fee leg is their
+        // compensation for exactly that exposure. Paying it to a pool that
+        // carries no such exposure would be an unearned transfer.
+        if data[crate::constants::STAKE_POOL_OFF_MODE]
+            != crate::constants::STAKE_POOL_MODE_INSURANCE_LP
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // (7) The destination, read out of the validated pool.
+        let mut vault = [0u8; 32];
+        vault.copy_from_slice(
+            &data[crate::constants::STAKE_POOL_OFF_VAULT
+                ..crate::constants::STAKE_POOL_OFF_VAULT + 32],
+        );
+        // `vault_authority` was proven equal to the bound `insurance_authority`
+        // in (1); returning it lets the caller assert the destination token
+        // account's SPL owner is that same PDA.
+        Ok((Pubkey::new_from_array(vault), vault_authority))
+    }
+
+    /// WithdrawInsuranceReserveToStake (tag 87) — permissionless.
+    ///
+    /// Transfers `insurance_reserve_accrued - insurance_reserve_withdrawn` out
+    /// of the market vault and into the bound stake pool's vault, where
+    /// percolator-stake's `AccrueFees` measures it as surplus over
+    /// `total_pool_value()` and distributes it to stakers. Stakers absorb this
+    /// market's losses via `FlushToInsurance`; this leg is their compensation.
+    ///
+    /// PERMISSIONLESS, SAFELY. The destination is not an argument and is not
+    /// caller-chosen: it is `pool.vault` read out of the pool at
+    /// `["stake_pool", market]` under the pinned stake program id (see
+    /// `load_bound_stake_pool`). Every candidate destination a caller could
+    /// substitute fails one of those checks, so there is nothing to redirect —
+    /// the only thing a caller decides is *when* the push happens.
+    ///
+    /// MODE GATE — Live-only, matching tag 78 (the other permissionless leg)
+    /// and deliberately STRICTER than `handle_withdraw_protocol_fee`'s
+    /// Live-or-wound-down-Resolved (`:10369-10378`).
+    ///
+    /// Why not the protocol-fee model. Tag 84 may run in Resolved because it is
+    /// signer-gated on `protocol_fee_authority` AND because W12 applies to it:
+    /// ResolveMarket is one-way, so a Live-only gate there would strand the
+    /// protocol's backlog forever, as tag 84 is its ONLY exit. Neither premise
+    /// holds here. This instruction carries no authority signature at all, and
+    /// the staker claim has a second, already-proven exit: when a stake pool is
+    /// bound via `BindInsuranceAuthority`, `cfg.insurance_authority` IS the
+    /// pool's `vault_auth` PDA, so on a resolved market the residual insurance
+    /// — including any un-pushed reserve — is reclaimable by the stake program
+    /// through `WithdrawInsurance` (tag 41), whose Resolved terminal path is
+    /// exercised by
+    /// `v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance`.
+    /// Nothing is stranded by refusing to run here, so the W12 argument that
+    /// bought tag 84 its Resolved exception buys tag 87 nothing.
+    ///
+    /// Concretely blocked:
+    ///   * Recovery (mode 2) — the important one, and worse here than for tag
+    ///     78. Post-solvency-event, `header.insurance` IS the recovery buffer,
+    ///     and stakers are precisely the party contractually meant to be
+    ///     FUNDING it (`FlushToInsurance` pushes stake INTO insurance). Letting
+    ///     any signer run the pump backwards during a shortfall would drain the
+    ///     buffer covering the loss into the pockets of the constituency whose
+    ///     job is to cover it. Tag 78 at least leaves the atoms inside the
+    ///     market as a junior LP claim; here they leave the program entirely as
+    ///     SPL tokens and stakers can withdraw them.
+    ///   * Resolved (mode 1) — same drain, before trader portfolios are
+    ///     materialised, and with the tag-41 exit available instead.
+    ///   * Live-but-matured — `reject_permissionless_resolve_matured_live_view`,
+    ///     as tag 78 uses: no permissionless token movement out of a market
+    ///     that is past its stale-resolve horizon and merely awaiting a
+    ///     resolve.
+    ///
+    /// The claim is NOT lost in any of these states: nothing is marked
+    /// withdrawn on a rejected call, so `accrued - withdrawn` stays fully
+    /// claimable if the market returns to Live.
+    ///
+    /// MANDATORY CLAMP. The protocol leg (tag 84), the LP leg (tag 78) and this
+    /// stake leg ALL draw from one pool: `insurance −
+    /// source_insurance_credit_reserved_total_atoms −
+    /// insurance_domain_budget_remaining_total`. Nothing checks that the three
+    /// wrapper-side counters sum within it, so whichever leg cranks last would
+    /// get `EngineLockActive` out of the engine unless each clamps its own
+    /// claim first. Mirrors `handle_withdraw_protocol_fee` (`:10405-10411`),
+    /// then advances `insurance_reserve_withdrawn_atoms` by the amount
+    /// ACTUALLY TRANSFERRED — never the pre-clamp capacity — so a partial fill
+    /// leaves the remainder claimable next call instead of marking it paid
+    /// without paying it.
+    ///
+    /// NO RESERVATION. `insurance_reserve_accrued - withdrawn` is deliberately
+    /// NOT added to `additional_reserved` at the
+    /// `credit_account_from_insurance_not_atomic` call sites. That was tried
+    /// for the LP leg and reverted (`9a6502ae`): it makes fee claims senior to
+    /// bad-debt/socialized-loss coverage, contradicting the decision that these
+    /// claims are at-risk, and it reverts the whole `SyncMaintenanceFee` on
+    /// distressed markets. The clamp above is what keeps this leg honest.
+    #[inline(never)]
+    fn handle_withdraw_insurance_reserve_to_stake<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let cranker = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let stake_pool_ai = account(accounts, 2)?;
+        let stake_vault_ai = account(accounts, 3)?;
+        let vault_token = account(accounts, 4)?;
+        let vault_authority_ai = account(accounts, 5)?;
+        let token_program = account(accounts, 6)?;
+        expect_signer(cranker)?;
+        expect_writable(market_ai)?;
+        expect_writable(stake_vault_ai)?;
+        expect_writable(vault_token)?;
+        expect_owner(market_ai, program_id)?;
+        verify_token_program(token_program)?;
+
+        let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+
+        let (transfer_amount_u64, cfg_after) = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // MODE GATE — see the doc comment. Live-only, plus matured-Live.
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+
+            // Destination: derived, then pinned. The trust root is asset 0's
+            // bound `insurance_authority` (domain 0 = asset 0's long domain) —
+            // the stake pool's `vault_auth` PDA, as recorded by
+            // `BindInsuranceAuthority`. `pool_vault` then comes out of the
+            // validated pool's own bytes, so the account the caller passed at
+            // index 3 must BE that account or we stop here.
+            let authorities = domain_authorities_from_view(&group, &cfg, 0)?;
+            let (pool_vault, stake_vault_authority) = load_bound_stake_pool(
+                program_id,
+                market_ai,
+                stake_pool_ai,
+                &authorities.insurance_authority,
+            )?;
+            expect_key(stake_vault_ai, &pool_vault)?;
+            // Mint/owner/state/canonical-ATA checks on both sides. The dest
+            // owner is asserted to be the stake pool's `vault_auth` PDA, so a
+            // token account that merely happens to sit at `pool.vault` while
+            // being owned by someone else is rejected too.
+            verify_withdrawable_token_accounts(
+                stake_vault_ai,
+                &stake_vault_authority,
+                vault_token,
+                &vault_authority,
+                &cfg,
+            )?;
+            // W5: this payout is permissionless, so a poisoned destination
+            // (delegate / close_authority) must not be usable as a sweep hook.
+            verify_permissionless_payout_dest_token_account(stake_vault_ai)?;
+
+            // Claim capacity. Monotonic invariant
+            // `insurance_reserve_withdrawn_atoms <= insurance_reserve_accrued_atoms`
+            // holds always, so this can only underflow on a corrupt config,
+            // which fails closed.
+            let claim_capacity = cfg
+                .insurance_reserve_accrued_atoms
+                .checked_sub(cfg.insurance_reserve_withdrawn_atoms)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            // MANDATORY CLAMP — mirrors handle_withdraw_protocol_fee:10405-10411
+            // verbatim. `.min(vault)` mirrors `protocol_fee_withdraw_amount`'s
+            // second bound: `withdraw_insurance_surplus_delta` rejects
+            // `amount > vault` too.
+            let engine_available = group
+                .header
+                .insurance
+                .get()
+                .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+            let transfer_amount = claim_capacity
+                .min(engine_available)
+                .min(group.header.vault.get());
+            // Zero case: nothing accrued, or the shared surplus pool is dry
+            // because another leg got there first. Same error either way — the
+            // claim is NOT marked withdrawn, so it stays fully claimable.
+            if transfer_amount == 0 {
+                return Err(PercolatorError::NoInsuranceReserveToClaim.into());
+            }
+            let transfer_amount_u64 = amount_to_u64(transfer_amount)?;
+            require_token_balance(vault_token, transfer_amount_u64)?;
+            // I−a, V−a: the atoms leave both the insurance fund and the vault,
+            // because unlike tag 78 they really do leave the program.
+            group
+                .withdraw_insurance_surplus_not_atomic(transfer_amount)
+                .map_err(map_v16_error)?;
+            // Advance by the TRANSFERRED amount, never `claim_capacity`.
+            cfg.insurance_reserve_withdrawn_atoms = cfg
+                .insurance_reserve_withdrawn_atoms
+                .checked_add(transfer_amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            group.validate_shape().map_err(map_v16_error)?;
+            (transfer_amount_u64, cfg)
+        };
+        // Unconditional write-back, as in `handle_withdraw_protocol_fee`: every
+        // successful call here mutates `insurance_reserve_withdrawn_atoms` (a
+        // zero-transfer call returned Err above). Without it the counter resets
+        // and the SAME atoms are transferred again on the next call.
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
+        let bump_arr = [bump];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            stake_vault_ai,
+            vault_authority_ai,
+            transfer_amount_u64,
+            signer_seeds,
+        )
     }
 
     #[inline(never)]
