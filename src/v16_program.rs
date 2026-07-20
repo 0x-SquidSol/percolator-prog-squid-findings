@@ -55,7 +55,7 @@ pub mod constants {
     pub const KIND_INSURANCE_LEDGER: u8 = 4;
 
     pub const HEADER_LEN: usize = 16;
-    pub const WRAPPER_CONFIG_LEN: usize = 496;
+    pub const WRAPPER_CONFIG_LEN: usize = 576;
     pub const ASSET_ORACLE_PROFILE_LEN: usize = 400;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -113,6 +113,21 @@ pub mod constants {
     // never settable by anyone short of a program upgrade -- there is
     // deliberately no `SetProtocolFeeBps` instruction (design §3.3).
     pub const PROTOCOL_FEE_BPS: u16 = 2000;
+    /// Fee-split defaults (2026-07-19 design). Written unconditionally at
+    /// InitMarket, never caller-supplied -- a market that never calls
+    /// UpdateFeeSplit still pays all four legs correctly from its first trade.
+    pub const DEFAULT_CREATOR_SHARE_BPS: u16 = 1600;
+    pub const DEFAULT_LP_SHARE_BPS: u16 = 4800;
+    pub const DEFAULT_INSURANCE_SHARE_BPS: u16 = 1600;
+    /// The three stored shares must sum to exactly this (= 10_000 - PROTOCOL_FEE_BPS).
+    pub const FEE_SHARE_TOTAL_BPS: u16 = 10_000 - PROTOCOL_FEE_BPS;
+    /// Decided floors (creator <=45%, LP >=40%, insurance >=15%) are
+    /// percentages of the POST-PROTOCOL REMAINDER. Shares are stored as bps of
+    /// T summing to FEE_SHARE_TOTAL_BPS (8000), so each floor is `pct * 8000`.
+    /// These three sum to exactly 8000, i.e. they are precisely complementary.
+    pub const MAX_CREATOR_SHARE_BPS: u16 = 3600; // 45% of the remainder
+    pub const MIN_LP_SHARE_BPS: u16 = 3200;      // 40% of the remainder
+    pub const MIN_INSURANCE_SHARE_BPS: u16 = 1200; // 15% of the remainder
     /// Hardcoded fallback destination for the protocol's accrued fee share,
     /// set unconditionally at `InitMarket` (never an instruction argument).
     /// Rotatable later only via the upgrade-authority-gated
@@ -944,6 +959,32 @@ pub mod state {
         /// Monotonic, always `<= protocol_fee_accrued_atoms`. The claim
         /// capacity is `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`.
         pub protocol_fee_withdrawn_atoms: u128,
+        // ── Fee-collection split (2026-07-19 design; 496 -> 576 B) ──────────
+        // FIELD ORDER IS LOAD-BEARING. This struct derives bytemuck::Pod, which
+        // forbids IMPLICIT padding. The struct ends at 496 B (a multiple of 16,
+        // so u128-aligned). Placing the u16 shares first would push these u128s
+        // to offset 502, forcing the compiler to insert implicit padding and
+        // FAILING the Pod derive. Counters first (496->560), then shares (566),
+        // then explicit padding to the 16-byte alignment boundary (576).
+        /// Cumulative atoms accrued to the LP vault's claim. Monotonic.
+        /// Claimed via `LpVaultCrankFees` (tag 78) into vault NAV.
+        pub lp_fee_accrued_atoms: u128,
+        /// Cumulative atoms already credited to the vault. `<= lp_fee_accrued_atoms`.
+        pub lp_fee_withdrawn_atoms: u128,
+        /// Cumulative atoms accrued to the insurance/staker leg. Monotonic.
+        /// Claimed via `WithdrawInsuranceReserveToStake` (tag 87).
+        pub insurance_reserve_accrued_atoms: u128,
+        /// Cumulative atoms already pushed to the stake vault. `<= accrued`.
+        pub insurance_reserve_withdrawn_atoms: u128,
+        /// Creator's share of T in bps. Floor: <= MAX_CREATOR_SHARE_BPS.
+        pub creator_share_bps: u16,
+        /// LP's share of T in bps. Floor: >= MIN_LP_SHARE_BPS.
+        pub lp_share_bps: u16,
+        /// Insurance/staker share of T in bps. Floor: >= MIN_INSURANCE_SHARE_BPS.
+        pub insurance_share_bps: u16,
+        /// Explicit padding to the struct's 16-byte alignment. Explicit because
+        /// bytemuck::Pod forbids implicit padding.
+        pub _padding_split: [u8; 10],
     }
 
     // Compile-time guard (design §5.1 recommendation): a future field addition to
@@ -7071,6 +7112,17 @@ pub mod processor {
             protocol_fee_authority: constants::PROTOCOL_FEE_AUTHORITY_DEFAULT.to_bytes(),
             protocol_fee_accrued_atoms: 0,
             protocol_fee_withdrawn_atoms: 0,
+            // Fee-split: hardcoded defaults, never caller-supplied, so no market
+            // can be created with a zero or hostile split. A market that never
+            // calls UpdateFeeSplit still pays all four legs correctly.
+            lp_fee_accrued_atoms: 0,
+            lp_fee_withdrawn_atoms: 0,
+            insurance_reserve_accrued_atoms: 0,
+            insurance_reserve_withdrawn_atoms: 0,
+            creator_share_bps: constants::DEFAULT_CREATOR_SHARE_BPS,
+            lp_share_bps: constants::DEFAULT_LP_SHARE_BPS,
+            insurance_share_bps: constants::DEFAULT_INSURANCE_SHARE_BPS,
+            _padding_split: [0u8; 10],
         };
         state::init_market_account_zero_copy(
             &mut market_ai.try_borrow_mut_data()?,

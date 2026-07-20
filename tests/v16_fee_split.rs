@@ -54,3 +54,24 @@ fn conservation_holds_across_many_amounts() {
         );
     }
 }
+
+#[test]
+fn config_size_is_576_and_16_byte_aligned() {
+    use percolator_prog::constants::WRAPPER_CONFIG_LEN;
+    use percolator_prog::state::WrapperConfigV16;
+    assert_eq!(core::mem::size_of::<WrapperConfigV16>(), 576);
+    assert_eq!(WRAPPER_CONFIG_LEN, 576);
+    assert_eq!(576 % core::mem::align_of::<WrapperConfigV16>(), 0);
+}
+
+#[test]
+fn default_shares_sum_to_total_and_satisfy_floors() {
+    use percolator_prog::constants::*;
+    assert_eq!(
+        DEFAULT_CREATOR_SHARE_BPS + DEFAULT_LP_SHARE_BPS + DEFAULT_INSURANCE_SHARE_BPS,
+        FEE_SHARE_TOTAL_BPS
+    );
+    assert!(DEFAULT_CREATOR_SHARE_BPS <= MAX_CREATOR_SHARE_BPS);
+    assert!(DEFAULT_LP_SHARE_BPS >= MIN_LP_SHARE_BPS);
+    assert!(DEFAULT_INSURANCE_SHARE_BPS >= MIN_INSURANCE_SHARE_BPS);
+}
