@@ -241,18 +241,68 @@ pub mod constants {
     // test uses to hand-craft one. These constants mirror
     // `percolator-stake/src/state.rs` (`StakePool`, `STAKE_POOL_SIZE`) and MUST
     // be updated in lockstep with any layout change there.
-    // NO HARDCODED STAKE PROGRAM ID — deliberate. percolator-stake has no
-    // `declare_id!`, and the candidate ids in this tree disagree with each
-    // other (`tests/common/mod.rs::STAKE_ID` = 9tbLt8fs…, the local
-    // `percolator_stake-keypair.json` = BQ6SP1oZ…, the TS SDK's mainnet
-    // DC5fovFQ… / devnet 6aJb1F9C…). Pinning any one of them would make tag 87
-    // dead on every cluster that uses a different one, silently.
+    // ── PINNED STAKE PROGRAM ID (O1) ────────────────────────────────────────
+    // THE STAKE PROGRAM IS PINNED, NOT DISCOVERED. `load_bound_stake_pool`
+    // requires `pool_ai.owner == STAKE_PROGRAM_ID` BEFORE it reads a single
+    // byte of the account, and derives both PDAs under this constant.
     //
-    // Instead the stake program is identified PER MARKET from state the stake
-    // program itself established: `BindInsuranceAuthority` CPIs this wrapper to
-    // set the asset's `insurance_authority` to the pool's `vault_auth` PDA, so
-    // that stored value is a cryptographic commitment to (stake_program, pool).
-    // `load_bound_stake_pool` re-derives it and requires a match. See there.
+    // This replaces an earlier design that recovered the stake program from
+    // `*pool_ai.owner` — i.e. from an account the CALLER supplies — and then
+    // validated the pool self-consistently against it. That was forgeable end
+    // to end: a market creator deploys program `X`, computes
+    // `pool = PDA(["stake_pool", market], X)` and
+    // `vault_auth = PDA(["vault_auth", pool], X)`, points asset 0's
+    // `insurance_authority` at `vault_auth` (see below), has `X` write a
+    // well-formed 392-byte pool with the right discriminator/version/slab/
+    // wrapper-id/mode and a `vault` they control, and every check passed —
+    // because every check was relative to a program THEY chose. Pinning the id
+    // is what makes the rest of the validation mean anything.
+    //
+    // The old comment justified NOT pinning on the grounds that percolator-stake
+    // "has no `declare_id!`" and that candidate ids in this tree disagree
+    // (`tests/common/mod.rs::STAKE_ID`, the local keypair, the TS SDK's ids).
+    // That was a real problem and it is now fixed at the source:
+    // `percolator-stake/src/lib.rs` carries the authoritative `declare_id!`,
+    // and this constant mirrors it. The disagreeing ids were stale/local
+    // artifacts, not deployments.
+    //
+    // LINEAGE — verified 2026-07-20 by rebuild-and-compare, NOT taken on trust:
+    //   deployed devnet program `GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3`
+    //   `solana program dump` -u d, hashed at the ELF's TRUE length (222624 B;
+    //   the dump is zero-padded to the allocated length, so a naive sha256 of
+    //   the whole buffer is meaningless):
+    //     sha256 0e9c25725615c3f11fa4db0cd53a3220f8d7d6f24fc4631bc9975c8970fd6e9c
+    //   rebuild of percolator-stake@1e08d35, `cargo build-sbf --features devnet`:
+    //     sha256 0e9c25725615c3f11fa4db0cd53a3220f8d7d6f24fc4631bc9975c8970fd6e9c
+    //   ⇒ MATCH. GCHhcgw IS percolator-stake@1e08d35.
+    //   GOTCHA: the build is PATH-DEPENDENT (root-crate `-C metadata` hash).
+    //   Rebuilding at any path other than the canonical `~/v17/percolator-stake`
+    //   yields a function-REORDERED ELF (identical `.rodata`, identical section
+    //   sizes, different `.text` layout) that will NOT match. Re-verify at the
+    //   canonical path or you will chase a phantom mismatch.
+    //
+    // CLUSTER GATING (mirrors percolator-stake `processor.rs`'s
+    // PERCOLATOR_MAINNET/PERCOLATOR_DEVNET allowlist and its N-3 note): the
+    // devnet id is behind `#[cfg(feature = "devnet")]` so it cannot compile
+    // into a mainnet binary — a compromised devnet deploy keypair must not be
+    // able to deploy a malicious binary at that address on mainnet and inherit
+    // tag-87 payouts.
+    //
+    // NO MAINNET ID EXISTS. v17 percolator-stake has no mainnet deployment, and
+    // inventing an address would be strictly worse than having none: it would
+    // hand tag 87 a destination nobody controls (or worse, one someone else
+    // can squat). A default build therefore has NO `STAKE_PROGRAM_ID` at all,
+    // and tag 87 FAILS CLOSED at runtime with `StakeProgramNotPinned` — the
+    // atoms simply stay in `header.insurance`, which is exactly where they are
+    // safe. This is a compile-time-absent / runtime-fail-closed pair rather
+    // than a hard `compile_error!`, because the wrapper must still build and
+    // deploy for mainnet: tag 87 is one of ~99 instruction tags and the other
+    // 98 have no reason to be blocked on a stake deployment that has not
+    // happened yet. When stake ships to mainnet, add the mainnet arm HERE and
+    // the matching `declare_id!` arm in percolator-stake, in the same change.
+    #[cfg(feature = "devnet")]
+    pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        solana_program::pubkey!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 
     /// SHARED SEED CONTRACT with percolator-stake: the pool PDA is derived from
     /// the wrapper market it is bound to, so there is exactly ONE pool per
@@ -409,16 +459,23 @@ pub mod error {
         /// been bound to this market, so no staker constituency is owed the
         /// insurance leg. Fail closed.
         StakePoolNotBound, // Custom(54)
-        /// Asset 0's `asset_admin` is NOT burned, so the market creator can still
-        /// rotate `insurance_authority` to an arbitrary key (including a PDA of a
-        /// program they deployed) via `UpdateAssetAuthority` (tag 65) and redirect
-        /// this leg to themselves. The trust root is only sound once the admin is
-        /// burned. See the SECURITY block on `load_bound_stake_pool`.
+        /// The supplied stake-pool account is not owned by the pinned
+        /// `constants::STAKE_PROGRAM_ID`. THIS IS THE FORGERY GATE: it is
+        /// checked before any byte of the account is read, so a pool written by
+        /// an attacker-deployed program is rejected outright rather than being
+        /// validated self-consistently against that program.
         ///
-        /// OPERATIONAL: market creation MUST burn asset 0's `asset_admin`
-        /// (`UpdateAssetAuthority { asset_index: 0, kind: 0, new_pubkey: [0;32] }`)
-        /// or tag 87 never works and the insurance/staker leg has no exit.
-        StakePoolAssetAdminNotBurned, // Custom(55)
+        /// ORDINAL REUSE (deliberate, ordinals are wire-visible): slot 55 was
+        /// `StakePoolAssetAdminNotBurned`, an ineffective mitigation that
+        /// required asset 0's `asset_admin` to be burned. It never closed the
+        /// forgery — `handle_update_asset_authority`'s self-rotation branch let
+        /// the creator (who starts as `insurance_authority` holder via
+        /// `InitMarket`) rotate anyway — and it has been removed. That variant
+        /// was introduced on this unmerged branch and NEVER deployed
+        /// (`6b9c431c` is not an ancestor of the deployed `f6a83370`), so no
+        /// on-chain consumer has ever observed Custom(55). Reusing the slot
+        /// keeps every neighbouring ordinal (54, 56-59) fixed.
+        StakePoolOwnerMismatch, // Custom(55)
         /// `["vault_auth", pool]` derived under the pool account's owning program
         /// does not equal the bound `insurance_authority`. The supplied pool is
         /// not the one that bound itself to this market.
@@ -432,6 +489,12 @@ pub mod error {
         /// pools carry no `FlushToInsurance` loss exposure, so they are not owed
         /// this leg.
         StakePoolModeMismatch, // Custom(59)
+        /// This build has no pinned stake program id, so tag 87 has no
+        /// destination it is willing to trust and refuses to move tokens.
+        /// Emitted by every non-`devnet` build: v17 percolator-stake has no
+        /// mainnet deployment yet (see `constants::STAKE_PROGRAM_ID`). Appended
+        /// at the tail so no existing ordinal moves.
+        StakeProgramNotPinned, // Custom(60)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -10615,173 +10678,177 @@ pub mod processor {
     /// from the caller. The caller supplies account handles; it does not get to
     /// choose what they are allowed to be.
     ///
-    /// THE TRUST ROOT is `bound_insurance_authority` — the asset's
-    /// `insurance_authority` — but ONLY once asset 0's `asset_admin` is burned.
-    /// That precondition is enforced in step (0) below and is load-bearing.
+    /// THE TRUST ROOT is the PINNED `constants::STAKE_PROGRAM_ID`, asserted
+    /// against `pool_ai.owner` in step (1) BEFORE any byte of the account is
+    /// read. Everything downstream — both PDA derivations and every field read
+    /// — is anchored to that constant, never to caller-supplied data.
     ///
-    /// SECURITY — why the burn check exists. An earlier version of this comment
-    /// claimed the stored `insurance_authority` was a value "only the real stake
-    /// program could have produced", because percolator-stake's
-    /// `BindInsuranceAuthority` (tag 19) sets it by CPIing this wrapper's
-    /// `UpdateAssetAuthority` while signing as the pool's `vault_auth` PDA.
-    /// THAT REASONING WAS FALSE, in two compounding ways:
+    /// SECURITY — the hole this closes, and why the previous mitigation did not.
+    /// An earlier version recovered the stake program as `*pool_ai.owner` and
+    /// then validated the pool self-consistently against it. Every check
+    /// (vault_auth derivation, pool PDA, discriminator, version, slab, wrapper
+    /// id, pool_mode, vault) passed — with respect to a program the ATTACKER
+    /// chose. The full forgery: deploy program `X`; compute
+    /// `pool = PDA(["stake_pool", market], X)` and
+    /// `vault_auth = PDA(["vault_auth", pool], X)`; point asset 0's
+    /// `insurance_authority` at `vault_auth`; have `X` write a
+    /// `STAKE_POOL_LEN`-byte account at `pool` with the right discriminator,
+    /// version, `is_initialized`, `slab == market`, `percolator_program == `
+    /// this wrapper, `pool_mode == 0`, and `vault == ` a token account owned by
+    /// `vault_auth`. Tag 87 then paid out to `X`'s vault. On a market with a
+    /// real bound pool the creator could rotate away, crank, and rotate back,
+    /// so stakers never even observed the theft.
     ///
-    ///   1. `insurance_authority` is NOT zero on an unbound market. `InitMarket`
-    ///      bootstraps asset 0's profile with `insurance_authority =
-    ///      config.marketauth` (`state::asset_oracle_profile_from_config`), and
-    ///      `marketauth` is the creating admin's own key. So the "never bound"
-    ///      test in step (0) never actually fires on a fresh market; it failed
-    ///      closed only incidentally, because a wallet key is on-curve and no
-    ///      PDA can equal one.
-    ///   2. `handle_update_asset_authority` (tag 65) lets asset 0's
-    ///      `asset_admin` — ALSO bootstrapped to `marketauth` — set
-    ///      `insurance_authority` to ANY 32 bytes. The incoming key must
-    ///      co-sign, but a PDA co-signs perfectly well via `invoke_signed`.
+    /// The previous mitigation — requiring asset 0's `asset_admin` to be burned
+    /// — did NOT close this, and has been REMOVED. `handle_update_asset_authority`
+    /// has two branches: the `admin_signed` branch, and self-rotation by the
+    /// authority's CURRENT holder (`if !admin_signed { expect_live_authority(
+    /// &current_value, current.key)? }`). Burning `asset_admin` kills only the
+    /// first. `InitMarket` bootstraps `insurance_authority = cfg.marketauth` =
+    /// the creator's own wallet, so AFTER the burn the creator is still the
+    /// current holder and simply self-rotates `insurance_authority` to the
+    /// forged `vault_auth`. The burn bought zero security and imposed a
+    /// bind-then-burn ordering footgun (tag 87 failed closed until an operator
+    /// ran a burn that was never actually load-bearing).
     ///
-    /// Together those give the market creator a full forgery: deploy program
-    /// `X`; compute `pool = PDA(["stake_pool", market], X)` and `vault_auth =
-    /// PDA(["vault_auth", pool], X)`; rotate asset 0's `insurance_authority` to
-    /// `vault_auth` (co-signed by `X`); have `X` write a `STAKE_POOL_LEN`-byte
-    /// account at `pool` with the right discriminator, version, `is_initialized`,
-    /// `slab == market`, `percolator_program == ` this wrapper, `pool_mode == 0`,
-    /// and `vault == ` a token account owned by `vault_auth`. Every check in
-    /// steps (1)–(7) then PASSES, and `X` signs as `vault_auth` to sweep the
-    /// proceeds. On a market with a real bound pool the creator can rotate away,
-    /// crank, and rotate back, so stakers never even observe the theft.
+    /// With the owner pinned, `insurance_authority` is only a POINTER, and
+    /// rotating it is harmless: to pass step (2) the rotated value must equal
+    /// `PDA(["vault_auth", pool], STAKE_PROGRAM_ID)` — a PDA under a program the
+    /// attacker does not control and cannot sign for. Forging that would mean
+    /// finding a preimage for a chosen 32-byte PDA target, not exploiting a
+    /// validation gap. So the creator may rotate `insurance_authority` freely;
+    /// the only thing they can do is make tag 87 fail.
     ///
-    /// This is NOT redundant with power the creator already has.
-    /// `WithdrawInsurance` (tag 41) is Resolved-only and budget-scoped
+    /// This matters because tag 87 reaches a fund `WithdrawInsurance` (tag 41)
+    /// cannot: tag 41 is Resolved-only and budget-scoped
     /// (`terminal_insurance_withdraw_capacity_for_authority_view`), whereas tag
-    /// 87 draws the UNBUDGETED surplus that this handler's clamp specifically
-    /// isolates. Without the burn check, tag 87 would be a NEW Live-mode
-    /// extraction path reaching a fund tag 41 cannot touch — and it would let a
-    /// creator recapture the exact insurance leg the fee-split floors exist to
-    /// guarantee.
-    ///
-    /// THE FIX: require `bound_asset_admin == [0u8; 32]`. Once asset 0's
-    /// `asset_admin` is burned, `handle_update_asset_authority`'s `admin_signed`
-    /// branch is permanently dead for this asset and the only remaining way to
-    /// change `insurance_authority` is self-rotation by its CURRENT holder —
-    /// i.e. by the bound `vault_auth` PDA, which only the real stake program can
-    /// sign for. The trust root is sound from that point on, and only from that
-    /// point on.
-    ///
-    /// ⚠ OPERATIONAL CONSEQUENCE: tag 87 FAILS CLOSED
-    /// (`StakePoolAssetAdminNotBurned`) until the burn has run. The
-    /// market-creation / seed sequence MUST burn asset 0's `asset_admin` —
-    /// `UpdateAssetAuthority { asset_index: 0, kind: ASSET_AUTH_ADMIN,
-    /// new_pubkey: [0u8; 32] }`, AFTER `BindInsuranceAuthority` — or the
-    /// insurance/staker fee leg accrues with no exit whatsoever.
-    ///
-    /// Given the burn, the stake program is recovered from `pool_ai.owner` and
-    /// then PROVEN correct by re-deriving `["vault_auth", pool]` under it and
-    /// requiring the result to equal the bound authority (rather than pinning a
-    /// stake program id as a constant; see the note in `constants`). Forging
-    /// THAT, with rotation closed, would mean finding a program id whose derived
-    /// PDA hits a chosen 32-byte target — a second-preimage attack on the PDA
-    /// hash, not a validation gap.
+    /// 87 draws the UNBUDGETED Live-mode surplus this handler's clamp isolates.
+    /// Left unpinned it was a NEW extraction path that let a creator recapture
+    /// the exact insurance leg the fee-split floors exist to guarantee.
     fn load_bound_stake_pool(
         program_id: &Pubkey,
         market_ai: &AccountInfo,
         pool_ai: &AccountInfo,
         bound_insurance_authority: &[u8; 32],
-        bound_asset_admin: &[u8; 32],
     ) -> Result<(Pubkey, Pubkey), ProgramError> {
-        // (0a) THE TRUST-ROOT PRECONDITION. While asset 0's `asset_admin` is
-        // live, the creator can point `insurance_authority` at a PDA of a
-        // program they deployed and drain this leg (see the SECURITY block).
-        // Refuse to trust `insurance_authority` at all until the admin is
-        // burned. Fail closed: the atoms stay in `header.insurance`.
-        if *bound_asset_admin != [0u8; 32] {
-            return Err(PercolatorError::StakePoolAssetAdminNotBurned.into());
+        // (0) THE PIN. On a build with no pinned stake program id (i.e. any
+        // non-`devnet` build — v17 percolator-stake has no mainnet deployment)
+        // there is no program we are willing to send tokens to, so refuse
+        // before touching anything. Fail closed: the atoms stay in
+        // `header.insurance`. See `constants::STAKE_PROGRAM_ID`.
+        #[cfg(not(feature = "devnet"))]
+        {
+            let _ = (program_id, market_ai, pool_ai, bound_insurance_authority);
+            return Err(PercolatorError::StakeProgramNotPinned.into());
         }
-        // (0b) No bound stake pool ⇒ nobody is owed this leg. NOTE: on a fresh
-        // market this is `marketauth`, not zero, so this test is a backstop for
-        // an explicitly-zeroed authority rather than the "never bound" check it
-        // reads as. The real "never bound" rejection comes from step (1): an
-        // unbound `insurance_authority` is a wallet key, which is on-curve and
-        // therefore can never equal a derived `vault_auth` PDA.
-        if *bound_insurance_authority == [0u8; 32] {
-            return Err(PercolatorError::StakePoolNotBound.into());
-        }
-        // (1) Recover the stake program from the account's owner, then prove it
-        // is the one that bound itself to this market. `find_program_address`
-        // on an owner we do not yet trust is safe: nothing is authorised by the
-        // derivation itself, only by the equality test that follows.
-        let stake_program = *pool_ai.owner;
-        let (vault_authority, _) = Pubkey::find_program_address(
-            &[
-                crate::constants::STAKE_VAULT_AUTHORITY_SEED,
-                pool_ai.key.as_ref(),
-            ],
-            &stake_program,
-        );
-        if vault_authority.to_bytes() != *bound_insurance_authority {
-            return Err(PercolatorError::StakePoolAuthorityMismatch.into());
-        }
-        // (2) …and it must be THE pool for THIS market. One pool per market by
-        // construction of the seed, so this is an equality test, not a search.
-        let (expected_pool, _) = Pubkey::find_program_address(
-            &[crate::constants::STAKE_POOL_SEED, market_ai.key.as_ref()],
-            &stake_program,
-        );
-        expect_key(pool_ai, &expected_pool)?;
+        #[cfg(feature = "devnet")]
+        {
+            let stake_program = crate::constants::STAKE_PROGRAM_ID;
+            // (1) OWNER PIN — FIRST, BEFORE ANY BYTE IS READ. This is the check
+            // the whole handler rests on. Without it every subsequent test is
+            // merely self-consistent with respect to a program the caller
+            // chose, and the pool is forgeable end to end (see the SECURITY
+            // block). Ordering matters: reading fields out of an account owned
+            // by an unknown program and only later asking who owns it would let
+            // attacker bytes influence anything that happens in between.
+            if *pool_ai.owner != stake_program {
+                return Err(PercolatorError::StakePoolOwnerMismatch.into());
+            }
+            // (2) No bound stake pool ⇒ nobody is owed this leg. NOTE: on a
+            // fresh market this is `marketauth`, not zero, so this test is a
+            // backstop for an explicitly-zeroed authority rather than the
+            // "never bound" check it reads as. The real "never bound"
+            // rejection comes from step (3): an unbound `insurance_authority`
+            // is a wallet key, which is on-curve and therefore can never equal
+            // a derived `vault_auth` PDA.
+            if *bound_insurance_authority == [0u8; 32] {
+                return Err(PercolatorError::StakePoolNotBound.into());
+            }
+            // (3) The bound authority must be THIS pool's `vault_auth` under
+            // the PINNED program. Because the program is pinned, a creator who
+            // rotates `insurance_authority` (which they can still do, via
+            // self-rotation — burning `asset_admin` never prevented that) can
+            // only point it at something that fails this test. They can break
+            // their own payout; they cannot redirect it.
+            let (vault_authority, _) = Pubkey::find_program_address(
+                &[
+                    crate::constants::STAKE_VAULT_AUTHORITY_SEED,
+                    pool_ai.key.as_ref(),
+                ],
+                &stake_program,
+            );
+            if vault_authority.to_bytes() != *bound_insurance_authority {
+                return Err(PercolatorError::StakePoolAuthorityMismatch.into());
+            }
+            // (4) …and it must be THE pool for THIS market, again derived under
+            // the pinned program. One pool per market by construction of the
+            // seed, so this is an equality test, not a search.
+            let (expected_pool, _) = Pubkey::find_program_address(
+                &[crate::constants::STAKE_POOL_SEED, market_ai.key.as_ref()],
+                &stake_program,
+            );
+            expect_key(pool_ai, &expected_pool)?;
 
-        let data = pool_ai.try_borrow_data()?;
-        if data.len() < crate::constants::STAKE_POOL_LEN {
-            return Err(PercolatorError::InvalidInstruction.into());
+            // Only NOW is it safe to read bytes: the account is owned by the
+            // pinned stake program, so its contents are that program's state,
+            // not attacker-authored data.
+            let data = pool_ai.try_borrow_data()?;
+            if data.len() < crate::constants::STAKE_POOL_LEN {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // (5) Discriminator + version + init flag: refuse to parse a stake
+            // account of some other kind, or a layout we do not know.
+            if data[crate::constants::STAKE_POOL_OFF_DISCRIMINATOR
+                ..crate::constants::STAKE_POOL_OFF_DISCRIMINATOR + 8]
+                != crate::constants::STAKE_POOL_DISCRIMINATOR
+                || data[crate::constants::STAKE_POOL_OFF_VERSION]
+                    != crate::constants::STAKE_POOL_VERSION
+                || data[crate::constants::STAKE_POOL_OFF_IS_INITIALIZED] != 1
+            {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // (6) The pool's own record of its bindings must agree with ours.
+            // Redundant with (4) for `slab` — kept because it costs nothing and
+            // makes a future seed change fail closed instead of silently
+            // redirecting funds.
+            let mut slab = [0u8; 32];
+            slab.copy_from_slice(
+                &data[crate::constants::STAKE_POOL_OFF_SLAB
+                    ..crate::constants::STAKE_POOL_OFF_SLAB + 32],
+            );
+            if slab != market_ai.key.to_bytes() {
+                return Err(PercolatorError::StakePoolMarketMismatch.into());
+            }
+            // (7) The pool must CPI *this* wrapper deployment. A pool bound to a
+            // different wrapper program is not this market's staker constituency.
+            let mut cpi_target = [0u8; 32];
+            cpi_target.copy_from_slice(
+                &data[crate::constants::STAKE_POOL_OFF_PERCOLATOR_PROGRAM
+                    ..crate::constants::STAKE_POOL_OFF_PERCOLATOR_PROGRAM + 32],
+            );
+            if cpi_target != program_id.to_bytes() {
+                return Err(PercolatorError::StakePoolWrapperMismatch.into());
+            }
+            // (8) Insurance-LP mode only. That is the mode whose stakers absorb
+            // this market's losses via `FlushToInsurance`; this fee leg is their
+            // compensation for exactly that exposure. Paying it to a pool that
+            // carries no such exposure would be an unearned transfer.
+            if data[crate::constants::STAKE_POOL_OFF_MODE]
+                != crate::constants::STAKE_POOL_MODE_INSURANCE_LP
+            {
+                return Err(PercolatorError::StakePoolModeMismatch.into());
+            }
+            // (9) The destination, read out of the validated pool.
+            let mut vault = [0u8; 32];
+            vault.copy_from_slice(
+                &data[crate::constants::STAKE_POOL_OFF_VAULT
+                    ..crate::constants::STAKE_POOL_OFF_VAULT + 32],
+            );
+            // `vault_authority` was proven equal to the bound
+            // `insurance_authority` in (3); returning it lets the caller assert
+            // the destination token account's SPL owner is that same PDA.
+            Ok((Pubkey::new_from_array(vault), vault_authority))
         }
-        // (3) Discriminator + version + init flag: refuse to parse a stake
-        // account of some other kind, or a layout we do not know.
-        if data[crate::constants::STAKE_POOL_OFF_DISCRIMINATOR
-            ..crate::constants::STAKE_POOL_OFF_DISCRIMINATOR + 8]
-            != crate::constants::STAKE_POOL_DISCRIMINATOR
-            || data[crate::constants::STAKE_POOL_OFF_VERSION]
-                != crate::constants::STAKE_POOL_VERSION
-            || data[crate::constants::STAKE_POOL_OFF_IS_INITIALIZED] != 1
-        {
-            return Err(PercolatorError::InvalidInstruction.into());
-        }
-        // (4) The pool's own record of its bindings must agree with ours.
-        // Redundant with (2) for `slab` — kept because it costs nothing and
-        // makes a future seed change fail closed instead of silently
-        // redirecting funds.
-        let mut slab = [0u8; 32];
-        slab.copy_from_slice(
-            &data[crate::constants::STAKE_POOL_OFF_SLAB..crate::constants::STAKE_POOL_OFF_SLAB + 32],
-        );
-        if slab != market_ai.key.to_bytes() {
-            return Err(PercolatorError::StakePoolMarketMismatch.into());
-        }
-        // (5) The pool must CPI *this* wrapper deployment. A pool bound to a
-        // different wrapper program is not this market's staker constituency.
-        let mut cpi_target = [0u8; 32];
-        cpi_target.copy_from_slice(
-            &data[crate::constants::STAKE_POOL_OFF_PERCOLATOR_PROGRAM
-                ..crate::constants::STAKE_POOL_OFF_PERCOLATOR_PROGRAM + 32],
-        );
-        if cpi_target != program_id.to_bytes() {
-            return Err(PercolatorError::StakePoolWrapperMismatch.into());
-        }
-        // (6) Insurance-LP mode only. That is the mode whose stakers absorb
-        // this market's losses via `FlushToInsurance`; this fee leg is their
-        // compensation for exactly that exposure. Paying it to a pool that
-        // carries no such exposure would be an unearned transfer.
-        if data[crate::constants::STAKE_POOL_OFF_MODE]
-            != crate::constants::STAKE_POOL_MODE_INSURANCE_LP
-        {
-            return Err(PercolatorError::StakePoolModeMismatch.into());
-        }
-        // (7) The destination, read out of the validated pool.
-        let mut vault = [0u8; 32];
-        vault.copy_from_slice(
-            &data[crate::constants::STAKE_POOL_OFF_VAULT
-                ..crate::constants::STAKE_POOL_OFF_VAULT + 32],
-        );
-        // `vault_authority` was proven equal to the bound `insurance_authority`
-        // in (1); returning it lets the caller assert the destination token
-        // account's SPL owner is that same PDA.
-        Ok((Pubkey::new_from_array(vault), vault_authority))
     }
 
     /// WithdrawInsuranceReserveToStake (tag 87) — permissionless.
@@ -10904,15 +10971,17 @@ pub mod processor {
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
 
-            // Destination: derived, then pinned. The trust root is asset 0's
-            // bound `insurance_authority` — the stake pool's `vault_auth` PDA,
-            // as recorded by `BindInsuranceAuthority` — but ONLY once asset 0's
-            // `asset_admin` is burned, because a live `asset_admin` can rotate
-            // `insurance_authority` to anything (see the SECURITY block on
-            // `load_bound_stake_pool`). Both fields therefore come from the SAME
-            // profile read, so the burn check and the authority it guards can
-            // never be read from different states. `pool_vault` then comes out
-            // of the validated pool's own bytes, so the account the caller
+            // Destination: derived, never caller-chosen. The trust root is the
+            // PINNED `constants::STAKE_PROGRAM_ID`, asserted against
+            // `stake_pool_ai.owner` before any byte of that account is read.
+            // Asset 0's bound `insurance_authority` — the stake pool's
+            // `vault_auth` PDA, as recorded by `BindInsuranceAuthority` — then
+            // only has to MATCH the PDA re-derived under that pinned program,
+            // so it is a pointer we verify rather than a value we trust. A
+            // creator can still rotate it (self-rotation is always available;
+            // burning `asset_admin` never prevented that), but rotating it can
+            // only make this fail, never redirect it. `pool_vault` then comes
+            // out of the validated pool's own bytes, so the account the caller
             // passed at index 3 must BE that account or we stop here.
             let asset0_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
             let (pool_vault, stake_vault_authority) = load_bound_stake_pool(
@@ -10920,7 +10989,6 @@ pub mod processor {
                 market_ai,
                 stake_pool_ai,
                 &asset0_profile.insurance_authority,
-                &asset0_profile.asset_admin,
             )?;
             expect_key(stake_vault_ai, &pool_vault)?;
             // Mint/owner/state/canonical-ATA checks on both sides. The dest

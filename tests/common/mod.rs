@@ -45,9 +45,25 @@ pub const PERCOLATOR_MAINNET: Pubkey = pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP1
 /// NFT program id (derived from `percolator_nft-keypair.json`).
 pub const NFT_PROGRAM_ID: Pubkey = pubkey!("2kYRqexMf5JnwTK15Vj8qxQX3qkBDzBZvH45SVFRmKYU");
 
-/// Stake program id (derived from `percolator_stake-keypair.json`; verified
-/// against `solana address -k` at Phase 3A.0).
-pub const STAKE_ID: Pubkey = pubkey!("9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6");
+/// Stake program id. MUST equal the wrapper's pinned
+/// `constants::STAKE_PROGRAM_ID` — tag 87 (`WithdrawInsuranceReserveToStake`)
+/// asserts `pool_ai.owner == STAKE_PROGRAM_ID` before reading a single byte of
+/// the pool, so mounting the stake `.so` anywhere else makes every tag-87 test
+/// fail with `StakePoolOwnerMismatch` (Custom(55)).
+///
+/// Was `9tbLt8fs…` (the local `percolator_stake-keypair.json`), which is a
+/// throwaway dev key that was never deployed anywhere. It is now the real
+/// DEPLOYED devnet program, lineage-verified by rebuild-and-compare
+/// (see `constants::STAKE_PROGRAM_ID`). `tests/v16_fee_split.rs::
+/// pinned_stake_program_id_matches_the_id_the_harness_mounts` asserts the two
+/// stay in lockstep, so this can never drift silently.
+///
+/// ⚠ Tag-87 tests therefore require BOTH the `.so` and the host lib to carry
+/// the pin: `cargo build-sbf --features devnet` and
+/// `cargo test --features devnet`. Without the feature the wrapper has no
+/// pinned id at all and tag 87 fails closed with `StakeProgramNotPinned`
+/// (Custom(60)) — correct behaviour, but it makes the tag-87 suite red.
+pub const STAKE_ID: Pubkey = pubkey!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 
 /// Token-2022 program id (loaded via `with_spl_programs()`).
 pub const TOKEN_2022: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");

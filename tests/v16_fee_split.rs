@@ -94,11 +94,30 @@ fn fee_split_error_ordinals_are_pinned() {
     assert_eq!(PercolatorError::NoInsuranceReserveToClaim as u32, 53);
     // `load_bound_stake_pool` diagnostics — appended, never reordered.
     assert_eq!(PercolatorError::StakePoolNotBound as u32, 54);
-    assert_eq!(PercolatorError::StakePoolAssetAdminNotBurned as u32, 55);
+    // Slot 55 REUSED: was `StakePoolAssetAdminNotBurned` (an ineffective
+    // mitigation, removed), now the forgery gate. Ordinals are wire-visible, so
+    // the slot is reused rather than vacated — 56-59 must not shift.
+    assert_eq!(PercolatorError::StakePoolOwnerMismatch as u32, 55);
     assert_eq!(PercolatorError::StakePoolAuthorityMismatch as u32, 56);
     assert_eq!(PercolatorError::StakePoolMarketMismatch as u32, 57);
     assert_eq!(PercolatorError::StakePoolWrapperMismatch as u32, 58);
     assert_eq!(PercolatorError::StakePoolModeMismatch as u32, 59);
+    // Appended at the tail — nothing above may move.
+    assert_eq!(PercolatorError::StakeProgramNotPinned as u32, 60);
+}
+
+/// The harness mounts the stake `.so` at `STAKE_ID`; tag 87 pins
+/// `constants::STAKE_PROGRAM_ID`. If these ever diverge every tag-87 test
+/// starts failing with `StakePoolOwnerMismatch` for a reason that has nothing
+/// to do with the behaviour under test, so pin them together, loudly.
+#[test]
+fn pinned_stake_program_id_matches_the_id_the_harness_mounts() {
+    assert_eq!(
+        percolator_prog::constants::STAKE_PROGRAM_ID.to_bytes(),
+        common::STAKE_ID.to_bytes(),
+        "tests/common/mod.rs::STAKE_ID must equal the wrapper's pinned \
+         STAKE_PROGRAM_ID (both are the lineage-verified devnet deployment)"
+    );
 }
 
 #[test]
@@ -244,10 +263,15 @@ struct FeeEnv {
 
 impl FeeEnv {
     /// Market at MAINNET + a bound v3 stake pool + asset 0's `asset_admin`
-    /// BURNED. That last step is not cosmetic: tag 87 refuses to trust
-    /// `insurance_authority` as a trust root while `asset_admin` is live,
-    /// because a live admin can rotate the authority to a PDA of a program the
-    /// creator deployed (see `tag87_blocks_the_creator_forged_stake_pool_exploit`).
+    /// BURNED.
+    ///
+    /// The burn is NO LONGER REQUIRED by tag 87 — the trust root is the pinned
+    /// `constants::STAKE_PROGRAM_ID`, not the burn (see the SECURITY section at
+    /// the foot of this file, and
+    /// `tag87_succeeds_with_asset_admin_live_proving_the_burn_gate_is_gone`,
+    /// which asserts the unburned path works). It is kept here only so the
+    /// default fixture exercises the burned state too, since a burned
+    /// `asset_admin` remains a perfectly legitimate production configuration.
     fn new(insurance_atoms: u64) -> Self {
         Self::build(insurance_atoms, true)
     }
@@ -1167,9 +1191,23 @@ fn tag87_on_a_resolved_market_is_rejected_without_marking_the_claim_paid() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECURITY — the trust root is only sound once asset 0's `asset_admin` is
-// burned. Without that, the market CREATOR can forge the entire stake-pool
-// binding and redirect this leg to a program they control.
+// SECURITY — the stake program is PINNED, not discovered.
+//
+// Tag 87's destination used to be reachable by forgery: the handler recovered
+// "the stake program" from `*pool_ai.owner` — an account the CALLER supplies —
+// and then validated everything else self-consistently against it. A market
+// creator could deploy their own program, derive matching PDAs, write a
+// well-formed 392-byte pool, and take the payout.
+//
+// The tests below establish, in order:
+//   1. the creator starts out holding `insurance_authority` (`InitMarket`
+//      bootstraps it to `marketauth`), so the `== [0;32]` test never fires;
+//   2. burning `asset_admin` does NOT stop them rotating it — self-rotation by
+//      the current holder is a separate branch — which is why the previous
+//      "burn the admin" mitigation bought exactly zero security;
+//   3. the forged pool is nevertheless REJECTED, because the owner is pinned;
+//   4. and tag 87 works fine with `asset_admin` still LIVE, proving the burn
+//      requirement is genuinely gone rather than merely relocated.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// PREMISE 1 of the exploit: on a market that has never bound a stake pool,
@@ -1197,80 +1235,114 @@ fn unbound_market_has_creator_key_as_insurance_authority_not_zero() {
     );
 }
 
-/// PREMISE 2 of the exploit: while `asset_admin` is live, the creator can
-/// rotate asset 0's `insurance_authority` to any key that co-signs. A PDA
-/// co-signs fine via `invoke_signed`, which is what turns this into a drain.
+/// PREMISE 2, and THE REASON THE OLD MITIGATION WAS WORTHLESS.
+///
+/// `handle_update_asset_authority` has two branches: the `admin_signed` branch,
+/// and self-rotation by the authority's CURRENT holder. Burning `asset_admin`
+/// kills only the first. Because `InitMarket` makes the creator the current
+/// holder of `insurance_authority`, the creator can still rotate it AFTER the
+/// burn — so requiring the burn never closed the forgery, it only added an
+/// ordering footgun.
+///
+/// This runs the REAL instruction with REAL signatures both before and after
+/// the burn, so it is not an argument about the code, it is a demonstration.
 #[test]
-fn live_asset_admin_can_rotate_insurance_authority_to_an_arbitrary_key() {
+fn burning_asset_admin_does_not_stop_the_creator_rotating_insurance_authority() {
     let mut env = FeeEnv::new_with_asset_admin_live(0);
-    let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    // Put the market in its true post-InitMarket state: the creator holds
+    // insurance_authority (the harness's bind would otherwise have moved it).
+    let mut profile = env.asset0_profile();
+    profile.insurance_authority = env.admin.pubkey().to_bytes();
+    env.set_asset0_profile(&profile);
 
     let admin = env.admin.insecure_clone();
     let payer = env.payer.insecure_clone();
-    let ix = Instruction {
-        program_id: PERCOLATOR_MAINNET,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new_readonly(attacker.pubkey(), true),
-            AccountMeta::new(env.market, false),
-        ],
-        data: ProgInstruction::UpdateAssetAuthority {
-            asset_index: 0,
-            kind: 1, // ASSET_AUTH_INSURANCE
-            new_pubkey: attacker.pubkey().to_bytes(),
-        }
-        .encode(),
+    let rotate_to = |env: &mut FeeEnv, target: &Keypair| {
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(target.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            data: ProgInstruction::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 1, // ASSET_AUTH_INSURANCE
+                new_pubkey: target.pubkey().to_bytes(),
+            }
+            .encode(),
+        };
+        send_ixs(&mut env.svm, &payer, vec![ix], &[&admin, target])
     };
-    send_ixs(&mut env.svm, &payer, vec![ix], &[&admin, &attacker])
-        .expect("a live asset_admin CAN retarget insurance_authority");
 
+    // Before the burn: rotation works (the `admin_signed` branch).
+    let first = Keypair::new();
+    env.svm.airdrop(&first.pubkey(), 1_000_000_000).unwrap();
+    rotate_to(&mut env, &first).expect("a live asset_admin can retarget insurance_authority");
     assert_eq!(
         env.asset0_profile().insurance_authority,
-        attacker.pubkey().to_bytes(),
-        "the rotation really lands — the trust root is creator-rotatable while \
-         asset_admin is live"
+        first.pubkey().to_bytes()
     );
-    // And burning asset_admin closes it: the same rotation must now fail.
+
+    // Hand the authority back to the creator so they are once again the CURRENT
+    // holder, then burn `asset_admin` — the supposed lock.
+    let mut profile = env.asset0_profile();
+    profile.insurance_authority = admin.pubkey().to_bytes();
+    env.set_asset0_profile(&profile);
     env.burn_asset_admin();
-    let attacker2 = Keypair::new();
-    env.svm.airdrop(&attacker2.pubkey(), 1_000_000_000).unwrap();
-    let ix2 = Instruction {
-        program_id: PERCOLATOR_MAINNET,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new_readonly(attacker2.pubkey(), true),
-            AccountMeta::new(env.market, false),
-        ],
-        data: ProgInstruction::UpdateAssetAuthority {
-            asset_index: 0,
-            kind: 1,
-            new_pubkey: attacker2.pubkey().to_bytes(),
-        }
-        .encode(),
-    };
-    assert!(
-        send_ixs(&mut env.svm, &payer, vec![ix2], &[&admin, &attacker2]).is_err(),
-        "once asset_admin is burned the creator can no longer rotate \
-         insurance_authority — only its current holder can self-rotate"
+    assert_eq!(
+        env.asset0_profile().asset_admin,
+        [0u8; 32],
+        "fixture precondition: asset_admin really is burned"
+    );
+
+    // AFTER the burn: rotation STILL works, via self-rotation by the current
+    // holder. This is the branch the burn does not touch.
+    let second = Keypair::new();
+    env.svm.airdrop(&second.pubkey(), 1_000_000_000).unwrap();
+    rotate_to(&mut env, &second).expect(
+        "THE POINT: burning asset_admin does NOT make insurance_authority \
+         unrotatable — the current holder self-rotates, so the old \
+         'burn the admin' mitigation closed nothing",
+    );
+    assert_eq!(
+        env.asset0_profile().insurance_authority,
+        second.pubkey().to_bytes(),
+        "the post-burn rotation really lands"
     );
 }
 
-/// THE EXPLOIT, blocked. Constructs the exact end state a malicious creator
-/// reaches — a fully forged stake-pool binding under a program THEY control —
-/// and asserts tag 87 refuses it, with not one atom moving.
+/// THE EXPLOIT, blocked by the OWNER PIN.
 ///
-/// Every check in `load_bound_stake_pool` steps (1)-(7) PASSES against this
-/// fixture. `attacker_program` is never CPI'd into by the wrapper; it is only
-/// used as a PDA derivation base and as the pool account's owner, so an
-/// arbitrary (even non-executable) key models a program the attacker deployed.
-/// The ONLY thing that stops the drain is the `asset_admin`-burned
-/// precondition, which is exactly what makes this the mutation-proof target.
+/// Constructs the exact end state a malicious creator reaches — a fully forged
+/// stake-pool binding under a program THEY control — and asserts tag 87 refuses
+/// it with not one atom moving.
+///
+/// CRITICALLY, this fixture BURNS `asset_admin` first. That is what makes it a
+/// real regression test rather than a restatement of the old one: with the burn
+/// satisfied, the previous `StakePoolAssetAdminNotBurned` gate is out of the
+/// way, and every remaining check in the OLD `load_bound_stake_pool` — the
+/// `vault_auth` derivation, the pool PDA, discriminator, version, `slab`,
+/// `percolator_program`, `pool_mode`, `vault` — passes, because every one of
+/// them was derived from `*pool_ai.owner`, i.e. from the attacker's own
+/// program. Against the pre-fix build this test DRAINS (250_000 atoms land in
+/// `forged_vault`). It passes only because the owner is now pinned.
+///
+/// `attacker_program` is never CPI'd into by the wrapper; it is only a PDA
+/// derivation base and the pool account's owner, so an arbitrary
+/// (non-executable) key faithfully models a program the attacker deployed.
 #[test]
 fn tag87_blocks_the_creator_forged_stake_pool_exploit() {
-    let mut env = FeeEnv::new_with_asset_admin_live(1_000_000);
+    // asset_admin BURNED — the old mitigation is satisfied and therefore inert.
+    let mut env = FeeEnv::new(1_000_000);
     env.unbudget_insurance();
     env.set_reserve_accrued(250_000);
+    assert_eq!(
+        env.asset0_profile().asset_admin,
+        [0u8; 32],
+        "fixture precondition: asset_admin is burned, so the OLD gate cannot be \
+         what blocks this — the owner pin must be"
+    );
 
     // (1) The creator's own program, and the pool/authority it would derive.
     let attacker_program = Pubkey::new_unique();
@@ -1322,16 +1394,15 @@ fn tag87_blocks_the_creator_forged_stake_pool_exploit() {
         )
         .unwrap();
 
-    // (4) The rotation (premise 2, proven executable above): point asset 0's
-    // insurance_authority at the forged vault_auth PDA.
+    // (4) The rotation (premise 2, proven executable post-burn above): point
+    // asset 0's insurance_authority at the forged vault_auth PDA. Written
+    // directly because a PDA cannot sign a top-level tx in this harness; the
+    // rotation's REACHABILITY is what
+    // `burning_asset_admin_does_not_stop_the_creator_rotating_insurance_authority`
+    // establishes with real signatures.
     let mut profile = env.asset0_profile();
     profile.insurance_authority = forged_vault_auth.to_bytes();
     env.set_asset0_profile(&profile);
-    assert_ne!(
-        env.asset0_profile().asset_admin,
-        [0u8; 32],
-        "fixture precondition: asset_admin is still LIVE"
-    );
 
     // (5) Crank tag 87 at the forged pool.
     env.pool_pda = forged_pool;
@@ -1341,9 +1412,9 @@ fn tag87_blocks_the_creator_forged_stake_pool_exploit() {
 
     assert_custom(
         env.withdraw_to_stake(),
-        55, // StakePoolAssetAdminNotBurned
-        "the forged-pool exploit must be blocked by the asset_admin-burn \
-         precondition — every other check in load_bound_stake_pool passes",
+        55, // StakePoolOwnerMismatch
+        "the forged-pool exploit must be blocked by the pinned-owner check — \
+         every other check in load_bound_stake_pool passes against it",
     );
     assert_eq!(
         env.token_amount(forged_vault),
@@ -1359,18 +1430,106 @@ fn tag87_blocks_the_creator_forged_stake_pool_exploit() {
     assert_eq!(withdrawn, 0, "nothing may be marked paid");
 }
 
-/// The burn precondition must fire BEFORE any pool bytes are read, so an
-/// unburned market cannot even be probed for pool-shape oracles.
+/// The owner pin must fire BEFORE any pool bytes are read, so an attacker's
+/// account cannot be probed for pool-shape oracles and no attacker-authored
+/// byte can influence anything. A pool owned by the wrong program but otherwise
+/// EMPTY (zero-length data, so every field read would panic or mis-parse) must
+/// still produce exactly `StakePoolOwnerMismatch`.
 #[test]
-fn tag87_reports_asset_admin_not_burned_even_with_a_perfectly_valid_pool() {
+fn tag87_owner_pin_fires_before_any_pool_byte_is_read() {
+    let mut env = FeeEnv::new(1_000_000);
+    env.unbudget_insurance();
+    env.set_reserve_accrued(250_000);
+
+    let attacker_program = Pubkey::new_unique();
+    let (forged_pool, _) =
+        Pubkey::find_program_address(&[b"stake_pool", env.market.as_ref()], &attacker_program);
+    let (forged_vault_auth, _) =
+        Pubkey::find_program_address(&[b"vault_auth", forged_pool.as_ref()], &attacker_program);
+
+    // Deliberately EMPTY: no discriminator, no version, not even 392 bytes.
+    env.svm
+        .set_account(
+            forged_pool,
+            Account {
+                lamports: 1_000_000_000,
+                data: Vec::new(),
+                owner: attacker_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let mut profile = env.asset0_profile();
+    profile.insurance_authority = forged_vault_auth.to_bytes();
+    env.set_asset0_profile(&profile);
+
+    env.pool_pda = forged_pool;
+    env.vault_auth = forged_vault_auth;
+
+    assert_custom(
+        env.withdraw_to_stake(),
+        55, // StakePoolOwnerMismatch — NOT InvalidInstruction from a length check
+        "the owner check must precede the length/discriminator reads, so a \
+         wrong-owner account never gets parsed at all",
+    );
+    let (_, withdrawn) = env.reserve_counters();
+    assert_eq!(withdrawn, 0);
+}
+
+/// PROOF THE BURN REQUIREMENT IS GONE.
+///
+/// Tag 87 must succeed end to end on a legitimately bound pool while asset 0's
+/// `asset_admin` is still LIVE. Under the previous build this exact scenario
+/// failed closed with `StakePoolAssetAdminNotBurned` (Custom(55)), stranding
+/// the whole insurance/staker fee leg behind an operational burn step that
+/// protected nothing.
+///
+/// Asserted on REAL SPL balances, not counters: the stake vault must actually
+/// receive the atoms and the market vault must actually lose them.
+#[test]
+fn tag87_succeeds_with_asset_admin_live_proving_the_burn_gate_is_gone() {
     let mut env = FeeEnv::new_with_asset_admin_live(1_000_000);
     env.unbudget_insurance();
     env.set_reserve_accrued(250_000);
-    // The genuinely bound, genuinely valid pool from the harness.
-    assert_custom(
-        env.withdraw_to_stake(),
-        55,
-        "a real bound pool is still refused while asset_admin is live",
+
+    assert_ne!(
+        env.asset0_profile().asset_admin,
+        [0u8; 32],
+        "fixture precondition: asset_admin is LIVE — the old build refused this"
     );
-    assert_eq!(env.token_amount(env.stake_vault), 0);
+
+    let stake_before = env.token_amount(env.stake_vault);
+    let vault_before = env.token_amount(env.vault);
+    let (_, withdrawn_before) = env.reserve_counters();
+
+    env.withdraw_to_stake()
+        .expect("tag 87 must work with asset_admin LIVE — the burn gate is gone");
+
+    let stake_after = env.token_amount(env.stake_vault);
+    let vault_after = env.token_amount(env.vault);
+    let (_, withdrawn_after) = env.reserve_counters();
+
+    assert_eq!(
+        stake_after - stake_before,
+        250_000,
+        "the stake vault must really receive the atoms"
+    );
+    assert_eq!(
+        vault_before - vault_after,
+        250_000,
+        "and the market vault must really lose them"
+    );
+    assert_eq!(
+        withdrawn_after - withdrawn_before,
+        250_000,
+        "the claim must be marked paid for exactly what moved"
+    );
+    // CONSERVATION: nothing created, nothing destroyed.
+    assert_eq!(
+        stake_after + vault_after,
+        stake_before + vault_before,
+        "conservation: tokens only moved between the two vaults"
+    );
 }

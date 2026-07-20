@@ -25,6 +25,14 @@ anchor-v2 = ["dep:anchor-lang-v2"]
 # changing the deployed code shape.
 small = []
 medium = []
+# Compiles the DEVNET percolator-stake program id into `constants::STAKE_PROGRAM_ID`,
+# which tag 87 (`WithdrawInsuranceReserveToStake`) pins its stake-pool owner check
+# and PDA derivations to. Mirrors percolator-stake's own `devnet` feature and its
+# N-3 rationale: a devnet id must never compile into a mainnet binary, so that a
+# compromised devnet deploy keypair cannot inherit mainnet authority. v17
+# percolator-stake has NO mainnet deployment, so a default (non-devnet) build has
+# no pinned id and tag 87 fails closed with `StakeProgramNotPinned`.
+devnet = []
 
 [dependencies]
 solana-program = "1.18"
