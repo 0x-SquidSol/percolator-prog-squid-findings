@@ -92,6 +92,13 @@ fn fee_split_error_ordinals_are_pinned() {
     assert_eq!(PercolatorError::FeeSplitFloorViolation as u32, 51);
     assert_eq!(PercolatorError::FeeSplitSumInvalid as u32, 52);
     assert_eq!(PercolatorError::NoInsuranceReserveToClaim as u32, 53);
+    // `load_bound_stake_pool` diagnostics — appended, never reordered.
+    assert_eq!(PercolatorError::StakePoolNotBound as u32, 54);
+    assert_eq!(PercolatorError::StakePoolAssetAdminNotBurned as u32, 55);
+    assert_eq!(PercolatorError::StakePoolAuthorityMismatch as u32, 56);
+    assert_eq!(PercolatorError::StakePoolMarketMismatch as u32, 57);
+    assert_eq!(PercolatorError::StakePoolWrapperMismatch as u32, 58);
+    assert_eq!(PercolatorError::StakePoolModeMismatch as u32, 59);
 }
 
 #[test]
@@ -236,10 +243,23 @@ struct FeeEnv {
 }
 
 impl FeeEnv {
-    /// Market at MAINNET + a bound v3 stake pool. `insurance` is funded with
-    /// `insurance_atoms` of REAL tokens before the bind (TopUpInsurance is
-    /// gated on asset 0's insurance_authority, which is `admin` until bound).
+    /// Market at MAINNET + a bound v3 stake pool + asset 0's `asset_admin`
+    /// BURNED. That last step is not cosmetic: tag 87 refuses to trust
+    /// `insurance_authority` as a trust root while `asset_admin` is live,
+    /// because a live admin can rotate the authority to a PDA of a program the
+    /// creator deployed (see `tag87_blocks_the_creator_forged_stake_pool_exploit`).
     fn new(insurance_atoms: u64) -> Self {
+        Self::build(insurance_atoms, true)
+    }
+
+    /// Same, but leaves asset 0's `asset_admin` LIVE — the pre-burn state a
+    /// freshly created market is in, and the state the forged-pool exploit
+    /// needs. Only the security tests use this.
+    fn new_with_asset_admin_live(insurance_atoms: u64) -> Self {
+        Self::build(insurance_atoms, false)
+    }
+
+    fn build(insurance_atoms: u64, burn_asset_admin: bool) -> Self {
         let matcher_program = Pubkey::new_unique();
         let mut svm = assemble_five_program_svm(matcher_program);
         let program_id = PERCOLATOR_MAINNET;
@@ -301,7 +321,64 @@ impl FeeEnv {
             env.top_up_insurance(admin_token, insurance_atoms);
         }
         env.setup_and_bind_stake_pool();
+        // MUST come after the bind: BindInsuranceAuthority itself is authorised
+        // by asset 0's `asset_admin`/`insurance_authority` (both `marketauth`
+        // pre-bind), so burning first would make the bind impossible.
+        if burn_asset_admin {
+            env.burn_asset_admin();
+        }
         env
+    }
+
+    /// Burn asset 0's `asset_admin` via the REAL instruction (tag 65,
+    /// `UpdateAssetAuthority { asset_index: 0, kind: ASSET_AUTH_ADMIN,
+    /// new_pubkey: [0; 32] }`). This is the operational step a market-creation
+    /// sequence MUST perform for tag 87 to ever work.
+    fn burn_asset_admin(&mut self) {
+        let admin = self.admin.insecure_clone();
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                // Burning to zero needs no co-signer; this handle is unused.
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            data: ProgInstruction::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 0, // ASSET_AUTH_ADMIN
+                new_pubkey: [0u8; 32],
+            }
+            .encode(),
+        };
+        let payer = self.payer.insecure_clone();
+        send_ixs(&mut self.svm, &payer, vec![ix], &[&admin])
+            .expect("burn asset 0 asset_admin (tag 65)");
+        assert_eq!(
+            self.asset0_profile().asset_admin,
+            [0u8; 32],
+            "asset_admin must actually be burned"
+        );
+    }
+
+    fn asset0_profile(&self) -> state::AssetOracleProfileV16 {
+        let mut data = self.svm.get_account(&self.market).unwrap().data;
+        let (_, group) = state::market_view_mut(&mut data).unwrap();
+        let n = core::mem::size_of::<state::AssetOracleProfileV16>();
+        bytemuck::pod_read_unaligned(&group.markets[0].wrapper[..n])
+    }
+
+    /// Overwrite asset 0's stored profile. Used by the security tests to
+    /// construct an exploit's END STATE directly, so the assertion is about what
+    /// tag 87 accepts rather than about how the state was reached.
+    fn set_asset0_profile(&mut self, profile: &state::AssetOracleProfileV16) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, group) = state::market_view_mut(&mut acct.data).unwrap();
+            let n = core::mem::size_of::<state::AssetOracleProfileV16>();
+            group.markets[0].wrapper[..n].copy_from_slice(bytemuck::bytes_of(profile));
+        }
+        self.svm.set_account(self.market, acct).unwrap();
     }
 
     fn init_market(&mut self) {
@@ -487,6 +564,132 @@ impl FeeEnv {
             .amount
     }
 
+    /// `header.insurance_domain_budget_remaining_total`, read from the live
+    /// account. The whole point of the real-accrual test is that this stays 0
+    /// while `header.insurance` rises.
+    fn header_domain_budget(&self) -> u128 {
+        let mut data = self.svm.get_account(&self.market).unwrap().data;
+        let (_, group) = state::market_view_mut(&mut data).unwrap();
+        group.header.insurance_domain_budget_remaining_total.get()
+    }
+
+    /// Zero the creator leg so trade fees produce NO domain budget at all.
+    /// `validate_fee_split` has no creator minimum, only a max, so 0/3200/4800
+    /// is a legal split (sum 8000 == FEE_SHARE_TOTAL_BPS).
+    fn set_fee_split(&mut self, creator: u16, lp: u16, insurance: u16) {
+        let admin = self.admin.insecure_clone();
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            data: ProgInstruction::UpdateFeeSplit {
+                creator_share_bps: creator,
+                lp_share_bps: lp,
+                insurance_share_bps: insurance,
+            }
+            .encode(),
+        };
+        let payer = self.payer.insecure_clone();
+        send_ixs(&mut self.svm, &payer, vec![ix], &[&admin]).expect("UpdateFeeSplit");
+    }
+
+    fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let portfolio = Pubkey::new_unique();
+        let len = state::portfolio_account_len_for_market_slots(FS_MAX_ASSETS as usize).unwrap();
+        self.svm
+            .set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; len],
+                    owner: PERCOLATOR_MAINNET,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let payer = self.payer.insecure_clone();
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data: ProgInstruction::InitPortfolio.encode(),
+        };
+        send_ixs(&mut self.svm, &payer, vec![ix], &[owner]).expect("InitPortfolio");
+        portfolio
+    }
+
+    /// Real `Deposit`: moves real SPL tokens into the market vault.
+    fn deposit(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) {
+        let source = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, owner.pubkey(), amount as u64),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let payer = self.payer.insecure_clone();
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+            ],
+            data: ProgInstruction::Deposit { amount }.encode(),
+        };
+        send_ixs(&mut self.svm, &payer, vec![ix], &[owner]).expect("Deposit");
+    }
+
+    /// Real `TradeNoCpi`. The effective fee is
+    /// `max(fee_bps, cfg.trade_fee_base_bps)`, so passing `fee_bps` directly is
+    /// enough to make a market with a zero base fee charge one.
+    fn trade(
+        &mut self,
+        owner_a: &Keypair,
+        account_a: Pubkey,
+        owner_b: &Keypair,
+        account_b: Pubkey,
+        size_q: i128,
+        exec_price: u64,
+        fee_bps: u64,
+    ) -> Result<(), solana_sdk::transaction::TransactionError> {
+        let payer = self.payer.insecure_clone();
+        let ix = Instruction {
+            program_id: PERCOLATOR_MAINNET,
+            accounts: vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(account_a, false),
+                AccountMeta::new(account_b, false),
+            ],
+            data: ProgInstruction::TradeNoCpi {
+                asset_index: 0,
+                size_q,
+                exec_price,
+                fee_bps,
+            }
+            .encode(),
+        };
+        send_ixs(&mut self.svm, &payer, vec![ix], &[owner_a, owner_b])
+    }
+
     fn withdraw_to_stake(&mut self) -> Result<(), solana_sdk::transaction::TransactionError> {
         let cranker = Keypair::new();
         self.svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
@@ -579,6 +782,139 @@ fn tag87_moves_real_tokens_into_the_stake_vault_and_conserves_value() {
 
     // Fully drained ⇒ a second crank has nothing left and says so.
     assert_custom(env.withdraw_to_stake(), 53, "second crank after full drain");
+}
+
+/// THE PRODUCTION TEST. Every other tag-87 test seeds the claim with
+/// `set_reserve_accrued()` + `unbudget_insurance()`, which means the
+/// production-critical assumption — that a real trade fee raises
+/// `header.insurance` WITHOUT raising any domain budget, leaving
+/// `engine_available > 0` — was asserted in prose and never executed. That is
+/// exactly the seam where the clamp could silently pin to zero forever and
+/// every fixture-based test would still pass.
+///
+/// This test uses NEITHER shortcut. Real deposits, a real `TradeNoCpi`, real
+/// fee accrual, then a real tag-87 crank, asserted on the stake vault's real
+/// SPL balance.
+#[test]
+fn tag87_end_to_end_from_a_real_trade_fee_with_no_seeding() {
+    // No TopUpInsurance: `header.insurance` must start at zero and rise ONLY
+    // from the trade fee. TopUpInsurance would book a domain budget, which is
+    // precisely the thing under test.
+    let mut env = FeeEnv::new(0);
+
+    // Zero the creator leg so the fee produces no domain budget whatsoever.
+    // (With the default 1600 creator share the budget would rise too; the
+    // surplus would merely be smaller, not absent. Zeroing makes the
+    // "budget stays 0" assertion below exact rather than approximate.)
+    env.set_fee_split(0, 3200, 4800);
+
+    let (ins_start, vault_start) = env.header_insurance_and_vault();
+    assert_eq!(ins_start, 0, "no insurance before any trade");
+    assert_eq!(vault_start, 0, "no vault before any deposit");
+    assert_eq!(env.header_domain_budget(), 0, "no domain budget to begin with");
+    assert_eq!(env.reserve_counters(), (0, 0), "nothing accrued yet");
+
+    // Two real traders with real collateral.
+    let taker = Keypair::new();
+    let maker = Keypair::new();
+    let taker_pf = env.create_portfolio(&taker);
+    let maker_pf = env.create_portfolio(&maker);
+    const DEPOSIT: u128 = 30_000_000_000;
+    env.deposit(&taker, taker_pf, DEPOSIT);
+    env.deposit(&maker, maker_pf, DEPOSIT);
+
+    let vault_spl_after_deposits = env.token_amount(env.vault);
+    assert_eq!(
+        vault_spl_after_deposits as u128,
+        DEPOSIT * 2,
+        "deposits must be real SPL tokens in the market vault"
+    );
+
+    // A real trade. notional = size_q * price / POS_SCALE
+    //              = 100_000 * POS_SCALE * 100 / POS_SCALE = 10_000_000
+    // fee (taker-only, ceil) = 10_000_000 * 500 / 10_000 = 500_000
+    const POS_SCALE: i128 = 1_000_000;
+    const SIZE_Q: i128 = POS_SCALE * 100_000;
+    const PRICE: u64 = 100;
+    const FEE_BPS: u64 = 500;
+    env.trade(&taker, taker_pf, &maker, maker_pf, SIZE_Q, PRICE, FEE_BPS)
+        .expect("a real trade must execute");
+
+    // ── The production assumption, now EXECUTED rather than asserted in prose ──
+    let (accrued, withdrawn) = env.reserve_counters();
+    let (ins_after_trade, _) = env.header_insurance_and_vault();
+    assert!(
+        accrued > 0,
+        "a real trade must accrue a real insurance leg; got {accrued}"
+    );
+    assert_eq!(withdrawn, 0, "nothing withdrawn yet");
+    assert!(
+        ins_after_trade > 0,
+        "the trade fee must raise header.insurance; got {ins_after_trade}"
+    );
+    assert_eq!(
+        env.header_domain_budget(),
+        0,
+        "THE LOAD-BEARING ASSERTION: a trade fee must NOT raise the insurance \
+         domain budget, or engine_available is 0 and the clamp pins this leg to \
+         zero forever in production"
+    );
+    // engine_available, computed exactly as the handler does, must cover the claim.
+    assert!(
+        ins_after_trade >= accrued,
+        "engine_available ({ins_after_trade}) must cover the accrued leg ({accrued})"
+    );
+    println!("EVIDENCE real-accrual: insurance={ins_after_trade} accrued={accrued} domain_budget=0");
+
+    // ── The crank, on genuinely earned atoms. ──
+    let stake_before = env.token_amount(env.stake_vault);
+    let market_vault_before = env.token_amount(env.vault);
+    assert_eq!(stake_before, 0, "stake vault starts empty");
+
+    env.withdraw_to_stake()
+        .expect("tag 87 must succeed on genuinely accrued fees");
+
+    let stake_after = env.token_amount(env.stake_vault);
+    let market_vault_after = env.token_amount(env.vault);
+    let (accrued_after, withdrawn_after) = env.reserve_counters();
+
+    // THE assertion this test exists for: real SPL tokens actually landed.
+    assert!(
+        stake_after > stake_before,
+        "the stake vault's real SPL balance must RISE — this is the only proof \
+         the leg works in production rather than in a fixture"
+    );
+    assert_eq!(
+        (stake_after - stake_before) as u128,
+        accrued,
+        "and it must rise by exactly the fee-accrued insurance leg"
+    );
+    assert_eq!(
+        market_vault_before - market_vault_after,
+        stake_after - stake_before,
+        "the tokens came out of the market vault"
+    );
+    assert_eq!(
+        market_vault_before + stake_before,
+        market_vault_after + stake_after,
+        "conservation across market vault + stake vault"
+    );
+    assert_eq!(
+        withdrawn_after, accrued_after,
+        "the whole earned leg is now marked paid, because it was fully paid"
+    );
+    assert!(withdrawn_after <= accrued_after, "invariant: withdrawn <= accrued");
+    println!(
+        "EVIDENCE real-accrual crank: stake_vault_spl {stake_before} -> {stake_after}, \
+         market_vault_spl {market_vault_before} -> {market_vault_after}"
+    );
+
+    // Nothing left to claim.
+    assert_custom(
+        env.withdraw_to_stake(),
+        53,
+        "second crank after the earned leg is fully paid",
+    );
 }
 
 /// Partial fill: the shared surplus pool is smaller than the claim, so the
@@ -734,22 +1070,65 @@ fn tag87_rejects_a_market_with_no_bound_stake_pool() {
     pool.data[8..40].copy_from_slice(Pubkey::new_unique().as_ref());
     env.svm.set_account(env.pool_pda, pool).unwrap();
 
-    assert!(
-        env.withdraw_to_stake().is_err(),
-        "a pool whose slab no longer names this market must be rejected"
+    assert_custom(
+        env.withdraw_to_stake(),
+        57, // StakePoolMarketMismatch — NOT a generic Unauthorized
+        "a pool whose slab no longer names this market must be rejected",
     );
     let (_, withdrawn) = env.reserve_counters();
     assert_eq!(withdrawn, 0);
 }
 
-/// MODE GATE: a resolved market must refuse to push surplus out to stakers,
-/// even though the sibling protocol leg (tag 84) permits Resolved. The
-/// justification is in the handler doc comment: tag 84 is signer-gated and has
-/// no other exit (W12), whereas tag 87 is permissionless and the staker claim
-/// survives resolution through the bound insurance authority's tag-41 path.
-/// Nothing is stranded by refusing here — the claim stays fully unwithdrawn.
+/// Each `load_bound_stake_pool` rejection must be individually diagnosable — a
+/// keeper seeing a bare `Unauthorized` cannot tell "never bound" from "wrong
+/// wrapper" from "mode-1 pool". These drive the two remaining pool-content
+/// failures and pin their distinct codes.
 #[test]
-fn tag87_is_rejected_on_a_resolved_market_and_strands_nothing() {
+fn tag87_pool_content_failures_have_distinct_codes() {
+    // (a) A pool whose recorded CPI target is a DIFFERENT wrapper deployment.
+    let mut env = FeeEnv::new(1_000_000);
+    env.unbudget_insurance();
+    env.set_reserve_accrued(250_000);
+    let mut pool = env.svm.get_account(&env.pool_pda).unwrap();
+    pool.data[224..256].copy_from_slice(Pubkey::new_unique().as_ref());
+    env.svm.set_account(env.pool_pda, pool).unwrap();
+    assert_custom(
+        env.withdraw_to_stake(),
+        58, // StakePoolWrapperMismatch
+        "a pool bound to another wrapper is not this market's constituency",
+    );
+    assert_eq!(env.token_amount(env.stake_vault), 0);
+
+    // (b) A trading-mode (mode 1) pool: no FlushToInsurance loss exposure, so
+    // not owed this leg.
+    let mut env = FeeEnv::new(1_000_000);
+    env.unbudget_insurance();
+    env.set_reserve_accrued(250_000);
+    let mut pool = env.svm.get_account(&env.pool_pda).unwrap();
+    pool.data[280] = 1; // pool_mode = trading
+    env.svm.set_account(env.pool_pda, pool).unwrap();
+    assert_custom(
+        env.withdraw_to_stake(),
+        59, // StakePoolModeMismatch
+        "a trading-mode pool must be refused with its own code",
+    );
+    assert_eq!(env.token_amount(env.stake_vault), 0);
+}
+
+/// MODE GATE: a resolved market must refuse to push surplus out to stakers,
+/// even though the sibling protocol leg (tag 84) permits Resolved.
+///
+/// SCOPE OF THIS TEST — read the name literally. It asserts exactly three
+/// things: the call is rejected with `EngineLockActive`, no tokens move, and
+/// `insurance_reserve_withdrawn_atoms` is NOT advanced (so the claim is not
+/// marked paid without paying). It says NOTHING about whether the claim is
+/// still RECOVERABLE, and the earlier name ("...and_strands_nothing") wrongly
+/// implied it did. It does not, and in fact the claim IS forfeited: tag 41's
+/// capacity is budget-scoped while this leg is unbudgeted by construction of
+/// the clamp, and `ResolveMarket` is one-way. See the FORFEITED note in
+/// `handle_withdraw_insurance_reserve_to_stake`'s doc comment.
+#[test]
+fn tag87_on_a_resolved_market_is_rejected_without_marking_the_claim_paid() {
     let mut env = FeeEnv::new(1_000_000);
     env.unbudget_insurance();
     env.set_reserve_accrued(250_000);
@@ -783,6 +1162,215 @@ fn tag87_is_rejected_on_a_resolved_market_and_strands_nothing() {
     assert_eq!(
         accrued - withdrawn,
         250_000,
-        "the whole claim must remain outstanding, not be stranded as paid"
+        "the whole claim must remain outstanding, not be marked paid"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECURITY — the trust root is only sound once asset 0's `asset_admin` is
+// burned. Without that, the market CREATOR can forge the entire stake-pool
+// binding and redirect this leg to a program they control.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// PREMISE 1 of the exploit: on a market that has never bound a stake pool,
+/// asset 0's `insurance_authority` is NOT zero — `InitMarket` bootstraps it to
+/// `marketauth`, i.e. the creator's own wallet. So the `== [0; 32]` test is not
+/// what makes an unbound market fail closed.
+#[test]
+fn unbound_market_has_creator_key_as_insurance_authority_not_zero() {
+    let mut env = FeeEnv::new_with_asset_admin_live(0);
+    // Undo the harness's bind so we observe the true post-InitMarket state.
+    let mut profile = env.asset0_profile();
+    profile.insurance_authority = env.admin.pubkey().to_bytes();
+    env.set_asset0_profile(&profile);
+
+    assert_ne!(
+        env.asset0_profile().insurance_authority,
+        [0u8; 32],
+        "InitMarket bootstraps insurance_authority to marketauth, so the zero \
+         test can never fire on a fresh market"
+    );
+    assert_eq!(
+        env.asset0_profile().insurance_authority,
+        env.admin.pubkey().to_bytes(),
+        "and the value it holds is the CREATOR'S key"
+    );
+}
+
+/// PREMISE 2 of the exploit: while `asset_admin` is live, the creator can
+/// rotate asset 0's `insurance_authority` to any key that co-signs. A PDA
+/// co-signs fine via `invoke_signed`, which is what turns this into a drain.
+#[test]
+fn live_asset_admin_can_rotate_insurance_authority_to_an_arbitrary_key() {
+    let mut env = FeeEnv::new_with_asset_admin_live(0);
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    let admin = env.admin.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let ix = Instruction {
+        program_id: PERCOLATOR_MAINNET,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        data: ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 1, // ASSET_AUTH_INSURANCE
+            new_pubkey: attacker.pubkey().to_bytes(),
+        }
+        .encode(),
+    };
+    send_ixs(&mut env.svm, &payer, vec![ix], &[&admin, &attacker])
+        .expect("a live asset_admin CAN retarget insurance_authority");
+
+    assert_eq!(
+        env.asset0_profile().insurance_authority,
+        attacker.pubkey().to_bytes(),
+        "the rotation really lands — the trust root is creator-rotatable while \
+         asset_admin is live"
+    );
+    // And burning asset_admin closes it: the same rotation must now fail.
+    env.burn_asset_admin();
+    let attacker2 = Keypair::new();
+    env.svm.airdrop(&attacker2.pubkey(), 1_000_000_000).unwrap();
+    let ix2 = Instruction {
+        program_id: PERCOLATOR_MAINNET,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(attacker2.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        data: ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 1,
+            new_pubkey: attacker2.pubkey().to_bytes(),
+        }
+        .encode(),
+    };
+    assert!(
+        send_ixs(&mut env.svm, &payer, vec![ix2], &[&admin, &attacker2]).is_err(),
+        "once asset_admin is burned the creator can no longer rotate \
+         insurance_authority — only its current holder can self-rotate"
+    );
+}
+
+/// THE EXPLOIT, blocked. Constructs the exact end state a malicious creator
+/// reaches — a fully forged stake-pool binding under a program THEY control —
+/// and asserts tag 87 refuses it, with not one atom moving.
+///
+/// Every check in `load_bound_stake_pool` steps (1)-(7) PASSES against this
+/// fixture. `attacker_program` is never CPI'd into by the wrapper; it is only
+/// used as a PDA derivation base and as the pool account's owner, so an
+/// arbitrary (even non-executable) key models a program the attacker deployed.
+/// The ONLY thing that stops the drain is the `asset_admin`-burned
+/// precondition, which is exactly what makes this the mutation-proof target.
+#[test]
+fn tag87_blocks_the_creator_forged_stake_pool_exploit() {
+    let mut env = FeeEnv::new_with_asset_admin_live(1_000_000);
+    env.unbudget_insurance();
+    env.set_reserve_accrued(250_000);
+
+    // (1) The creator's own program, and the pool/authority it would derive.
+    let attacker_program = Pubkey::new_unique();
+    let (forged_pool, _) =
+        Pubkey::find_program_address(&[b"stake_pool", env.market.as_ref()], &attacker_program);
+    let (forged_vault_auth, forged_bump) =
+        Pubkey::find_program_address(&[b"vault_auth", forged_pool.as_ref()], &attacker_program);
+
+    // (2) A destination token account owned by that PDA — so the attacker's
+    // program can sign for it and sweep afterwards.
+    let forged_vault = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            forged_vault,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, forged_vault_auth, 0),
+                owner: spl_token_classic_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // (3) A byte-perfect pool at the derived address, owned by the attacker's
+    // program: right discriminator, version 3, initialized, slab == market,
+    // percolator_program == this wrapper, pool_mode == 0.
+    let pool_bytes = craft_stake_pool_v3(
+        &env.market,
+        &env.admin.pubkey(),
+        &env.mint,
+        &Pubkey::new_unique(),
+        &forged_vault,
+        0,
+        1_000,
+        &PERCOLATOR_MAINNET,
+        forged_bump,
+    );
+    env.svm
+        .set_account(
+            forged_pool,
+            Account {
+                lamports: 1_000_000_000,
+                data: pool_bytes,
+                owner: attacker_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // (4) The rotation (premise 2, proven executable above): point asset 0's
+    // insurance_authority at the forged vault_auth PDA.
+    let mut profile = env.asset0_profile();
+    profile.insurance_authority = forged_vault_auth.to_bytes();
+    env.set_asset0_profile(&profile);
+    assert_ne!(
+        env.asset0_profile().asset_admin,
+        [0u8; 32],
+        "fixture precondition: asset_admin is still LIVE"
+    );
+
+    // (5) Crank tag 87 at the forged pool.
+    env.pool_pda = forged_pool;
+    env.vault_auth = forged_vault_auth;
+    let real_stake_vault = env.stake_vault;
+    env.stake_vault = forged_vault;
+
+    assert_custom(
+        env.withdraw_to_stake(),
+        55, // StakePoolAssetAdminNotBurned
+        "the forged-pool exploit must be blocked by the asset_admin-burn \
+         precondition — every other check in load_bound_stake_pool passes",
+    );
+    assert_eq!(
+        env.token_amount(forged_vault),
+        0,
+        "not one atom may reach the attacker's PDA-owned vault"
+    );
+    assert_eq!(
+        env.token_amount(real_stake_vault),
+        0,
+        "and the genuine stake vault is untouched"
+    );
+    let (_, withdrawn) = env.reserve_counters();
+    assert_eq!(withdrawn, 0, "nothing may be marked paid");
+}
+
+/// The burn precondition must fire BEFORE any pool bytes are read, so an
+/// unburned market cannot even be probed for pool-shape oracles.
+#[test]
+fn tag87_reports_asset_admin_not_burned_even_with_a_perfectly_valid_pool() {
+    let mut env = FeeEnv::new_with_asset_admin_live(1_000_000);
+    env.unbudget_insurance();
+    env.set_reserve_accrued(250_000);
+    // The genuinely bound, genuinely valid pool from the harness.
+    assert_custom(
+        env.withdraw_to_stake(),
+        55,
+        "a real bound pool is still refused while asset_admin is live",
+    );
+    assert_eq!(env.token_amount(env.stake_vault), 0);
 }
