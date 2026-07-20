@@ -10822,30 +10822,24 @@ pub mod processor {
             // the engine primitive itself refuses to let this reward dip
             // insurance below the protocol's claim.
             //
-            // LP LEG (Finding 2). The amendment reserved only the protocol leg,
-            // but `split_trade_fee` earmarks THREE wrapper-side claims out of the
-            // same unbudgeted surplus -- protocol, LP (`lp_fee_accrued`, drained
-            // by tag 78) and stake (`insurance_reserve_accrued`, Task 8). Only
-            // the creator leg is budgeted (`credit_domain_insurance_budget_
-            // not_atomic`), so `insurance_domain_budget_remaining_total` does not
-            // cover the other three. Reserving the protocol leg alone leaves the
-            // LP claim exposed to every `credit_account_from_insurance_not_atomic`
-            // caller. The shortfall would be PERMANENT if it ever opened: each
-            // subsequent trade fee raises `lp_fee_accrued_atoms` by its own LP leg
-            // at the same time as it raises insurance, so the deficit is carried
-            // forward rather than closed, and the tag-78 clamp silently converts
-            // it into LP yield that crankers keep. Reserve both legs.
+            // The LP leg (`lp_fee_accrued - lp_fee_withdrawn`, drained by tag 78)
+            // is deliberately NOT reserved here. A maintenance crank is
+            // `engine_available`-neutral: `charge_account_fee_current_not_atomic`
+            // does `c_tot -= charged; insurance += charged` (engine
+            // `v16.rs:13781-13800`), `maintenance_cranker_reward` is bounded by
+            // `bps <= 10_000` (validated at `:1462`) so `reward <= charged`, and
+            // the retained remainder is credited to the domain budgets 1:1 --
+            // hence `d(engine_available) = (c-r) - (c-r) = 0` and this path
+            // cannot reduce the surplus the LP claim sits in. Reserving the LP
+            // leg here would also make LP fees SENIOR to bad-debt/socialized-loss
+            // coverage (this reservation binds only via
+            // `credit_account_from_insurance_not_atomic`), contradicting the
+            // decision that LP yield is at-risk JUNIOR backing capital, and it
+            // would revert the entire `SyncMaintenanceFee` on exactly the
+            // distressed markets that most need cranking.
             let protocol_owed = cfg_pre
                 .protocol_fee_accrued_atoms
                 .saturating_sub(cfg_pre.protocol_fee_withdrawn_atoms);
-            let lp_owed = cfg_pre
-                .lp_fee_accrued_atoms
-                .saturating_sub(cfg_pre.lp_fee_withdrawn_atoms);
-            // `saturating_add`: matches the `saturating_sub` style above and the
-            // engine's own `budget_remaining.saturating_add(additional_reserved)`.
-            // A saturated floor fails CLOSED (rejects the reward), which is the
-            // safe direction.
-            let reserved_fee_claims = protocol_owed.saturating_add(lp_owed);
             if let Some(cranker_portfolio_ai) = accounts.get(2) {
                 if cranker_portfolio_ai.key == portfolio_ai.key {
                     let charged = group
@@ -10862,7 +10856,7 @@ pub mod processor {
                             .credit_account_from_insurance_not_atomic(
                                 &mut portfolio,
                                 reward,
-                                reserved_fee_claims,
+                                protocol_owed,
                             )
                             .map_err(map_v16_error)?;
                         group.validate_shape().map_err(map_v16_error)?;
@@ -10913,7 +10907,7 @@ pub mod processor {
                             .credit_account_from_insurance_not_atomic(
                                 &mut cranker,
                                 reward,
-                                reserved_fee_claims,
+                                protocol_owed,
                             )
                             .map_err(map_v16_error)?;
                         group.validate_shape().map_err(map_v16_error)?;
@@ -12963,23 +12957,19 @@ pub mod processor {
                     // able to dip insurance below the protocol's
                     // accrued-but-unwithdrawn claim.
                     //
-                    // LP LEG (Finding 2): the LP claim (`lp_fee_accrued -
-                    // lp_fee_withdrawn`, drained by tag 78) lives in the SAME
-                    // unbudgeted surplus and was reserved nowhere. Mirrors the
-                    // `SyncMaintenanceFee` site verbatim -- see the long comment
-                    // there for why an LP shortfall, once opened, never closes.
+                    // The LP leg is deliberately NOT reserved here -- see the
+                    // `SyncMaintenanceFee` site above for why (this reward is
+                    // `engine_available`-neutral, and reserving LP fees against
+                    // `credit_account_from_insurance_not_atomic` would make them
+                    // senior to loss coverage).
                     let protocol_owed = cfg
                         .protocol_fee_accrued_atoms
                         .saturating_sub(cfg.protocol_fee_withdrawn_atoms);
-                    let lp_owed = cfg
-                        .lp_fee_accrued_atoms
-                        .saturating_sub(cfg.lp_fee_withdrawn_atoms);
-                    let reserved_fee_claims = protocol_owed.saturating_add(lp_owed);
                     group
                         .credit_account_from_insurance_not_atomic(
                             &mut cranker,
                             reward,
-                            reserved_fee_claims,
+                            protocol_owed,
                         )
                         .map_err(map_v16_error)?;
                 }
