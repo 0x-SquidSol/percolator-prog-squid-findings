@@ -1,3 +1,14 @@
+> # ⚠️ SUPERSEDED — DO NOT BUILD FROM THIS DOCUMENT
+>
+> This is the **planned** design (2026-07-19). Implementation diverged materially.
+> The authoritative record of what shipped is
+> **`2026-07-20-fee-collection-split-as-built.md`**.
+>
+> Known-wrong here: tag 78 does NOT credit vault NAV (no such call exists); LP yield is
+> junior at-risk backing capital, not a senior earnings claim; the stake program pin and
+> forgery gate are absent; the tag 78 mode/no-LP guards are absent; the CPI proxies are
+> absent, so this doc implies the fee split is settable on a staked market when it was not.
+
 # v17 Fee Collection Split — Design
 
 **Date:** 2026-07-19
