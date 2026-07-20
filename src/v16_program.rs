@@ -431,11 +431,17 @@ pub mod error {
         // ── Fee-split floor enforcement (on-chain mirror of the launch
         // wizard's `feeSplit.ts` floors) ────────────────────────────────
         // Appended after LpVaultDepositBelowMinimumLiquidity (ordinal 50). Do NOT reorder.
-        /// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy` would produce a
-        /// stored split that violates the non-protocol-remainder floors
-        /// (creator <=45%, LP >=40%, insurance >=15% of
-        /// `trade_fee_base_bps + backing_fee_bps`), outside the documented
-        /// rounding tolerance. See `policy_v16::fee_split_floor_ok`.
+        /// `UpdateFeeSplit` (tag 86) shares violate the non-protocol-remainder
+        /// floors: `creator > MAX_CREATOR_SHARE_BPS`, `lp < MIN_LP_SHARE_BPS`,
+        /// or `insurance < MIN_INSURANCE_SHARE_BPS`. Enforced by
+        /// `policy_v16::validate_fee_split`, exactly and with no tolerance.
+        ///
+        /// HISTORY: this code originally came from `fee_split_floor_ok`, a
+        /// tolerance-based check on the two-rate
+        /// (`trade_fee_base_bps + backing_fee_bps`) split, raised from
+        /// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy`. That function is
+        /// RETIRED and has no live call sites (see its doc comment); the
+        /// ordinal is reused rather than vacated because it is wire-visible.
         /// SDK agent: add `FeeSplitFloorViolation = 51` to the client error
         /// map.
         FeeSplitFloorViolation, // Custom(51)
@@ -1594,13 +1600,17 @@ pub mod state {
     // NOTE: this runs at LOAD time (every `read_wrapper_config_from_bytes` /
     // `read_wrapper_config_boxed_from_bytes` call, i.e. every instruction
     // that deserializes an existing market's config). The fee-split floor
-    // (creator<=45%/LP>=40%/insurance>=15%, `policy_v16::fee_split_floor_ok`)
-    // is deliberately NOT checked here: doing so would retroactively brick
-    // every market created before that floor existed, since their stored
-    // split may not satisfy it. The floor is enforced only in the setter
-    // handlers (`handle_update_backing_fee_policy` /
-    // `handle_update_trade_fee_policy`), at the moment a NEW split is
-    // written -- see those functions' comments.
+    // (creator<=45%/LP>=40%/insurance>=15%) is deliberately NOT checked here:
+    // doing so would retroactively brick every market created before that
+    // floor existed, since their stored split may not satisfy it. The floor is
+    // enforced only where a NEW split is written: `handle_update_fee_split`
+    // (tag 86), via `policy_v16::validate_fee_split`.
+    //
+    // CORRECTED: this used to name `handle_update_backing_fee_policy` /
+    // `handle_update_trade_fee_policy` and `policy_v16::fee_split_floor_ok` as
+    // the enforcement site. Both setters dropped that check, and
+    // `fee_split_floor_ok` is retired with no live call sites. Tag 86 is now
+    // the ONLY floor enforcement point in the program.
     #[inline]
     fn validate_wrapper_config(config: &WrapperConfigV16) -> Result<(), ProgramError> {
         if config.collateral_mint == [0u8; 32]
@@ -1723,12 +1733,15 @@ pub mod state {
     // `validate_asset_oracle_profile` -- i.e. on every deserialize of an
     // existing market's config/profile, not only when a setter runs. Only
     // basic shape (bounds + the fee==0-implies-share==0 pairing) belongs
-    // here. The fee-split FLOOR (creator<=45%/LP>=40%/insurance>=15%,
-    // `policy_v16::fee_split_floor_ok`) must never be added to this
-    // function: it would retroactively brick every market whose
-    // already-stored split doesn't satisfy the new floor. That floor is
-    // enforced only in the setter handlers themselves
-    // (`handle_update_backing_fee_policy` / `handle_update_trade_fee_policy`).
+    // here. The fee-split FLOOR (creator<=45%/LP>=40%/insurance>=15%) must
+    // never be added to this function: it would retroactively brick every
+    // market whose already-stored split doesn't satisfy the new floor. That
+    // floor is enforced only where a NEW split is written:
+    // `handle_update_fee_split` (tag 86), via `policy_v16::validate_fee_split`.
+    //
+    // CORRECTED: this used to name the two backing/trade-fee-policy setters and
+    // `policy_v16::fee_split_floor_ok`. Both setters dropped that check and
+    // `fee_split_floor_ok` is retired with no live call sites.
     #[inline]
     pub(crate) fn backing_trade_fee_policy_shape_ok(
         fee_bps: u16,
@@ -5961,6 +5974,18 @@ pub mod policy_v16 {
     /// <=`MAX_DYNAMIC_TRADE_FEE_BPS`) before calling this -- it does not
     /// re-validate that shape, only the joint floor. Pure, no side effects,
     /// safe to call from Kani proofs and unit tests.
+    ///
+    /// The "called ONLY from the two setter handlers" sentence above is
+    /// HISTORICAL and no longer true — see the RETIRED banner on the
+    /// declaration below. It is left in place because it documents the
+    /// reasoning that produced the function.
+    #[deprecated(
+        note = "RETIRED: no live call sites. `2b3a6a65` removed this from \
+                handle_update_backing_fee_policy / handle_update_trade_fee_policy. \
+                Live fee-split floors are enforced by `validate_fee_split`, called \
+                from `handle_update_fee_split` (tag 86). Retained only so its Kani \
+                proof and unit tests still compile."
+    )]
     pub fn fee_split_floor_ok(
         trade_fee_base_bps: u64,
         backing_fee_bps: u64,
@@ -7348,15 +7373,17 @@ pub mod processor {
             secondary_collateral_mint: [0u8; 32],
             maintenance_fee_per_slot,
             permissionless_market_init_fee: 0,
-            // No fee-split floor check applies here (unlike
-            // `handle_update_trade_fee_policy` / `handle_update_backing_fee_policy`,
-            // see `policy_v16::fee_split_floor_ok`): at InitMarket the backing
-            // fee is unconditionally zero (set below), so the three-way split
-            // isn't complete yet -- creator is momentarily 100% of a
-            // not-yet-finished config by construction, not a violation.
-            // Blocking on the floor here would make InitMarket itself
-            // unusable; the floor is enforced once backing/insurance shares
-            // are actually configured, via the two setters.
+            // No fee-split floor check applies here, and none is needed:
+            // InitMarket hardcodes the DEFAULT shares (1600/4800/1600), which
+            // sum to FEE_SHARE_TOTAL_BPS and clear every floor by construction.
+            // A market that never calls a setter is already compliant.
+            //
+            // CORRECTED: this used to say the floor "is enforced once
+            // backing/insurance shares are actually configured, via the two
+            // setters", pointing at `policy_v16::fee_split_floor_ok`. Both
+            // setters dropped that check and `fee_split_floor_ok` is retired.
+            // The only floor enforcement point is `handle_update_fee_split`
+            // (tag 86) via `policy_v16::validate_fee_split`.
             trade_fee_base_bps,
             permissionless_resolve_stale_slots: 0,
             force_close_delay_slots: 0,
@@ -17387,12 +17414,23 @@ pub mod processor {
             assert_eq!(policy_v16::premium_funding_rate_e9(150, 100, 0), Some(0));
         }
 
-        // fee_split_floor_ok: on-chain enforcement of the launch wizard's
-        // (feeSplit.ts) creator<=45%/LP>=40%/insurance>=15% floors. See the
-        // function's doc comment in `policy_v16` for the integer
-        // inequalities and the rounding-tolerance derivation.
+        // ── RETIRED: `fee_split_floor_ok` has no live call sites. ───────────
+        //
+        // These tests cover code no instruction can reach. They are NOT
+        // evidence that the fee-split floors are enforced on-chain; that is
+        // `validate_fee_split` (tag 86), covered by the `tag86_*` tests in
+        // `tests/v16_fee_split.rs`. Kept only because the function is kept.
+        //
+        // `#[allow(deprecated)]` is scoped to each of these tests rather than
+        // to the module, so the `#[deprecated]` attribute still fires loudly if
+        // anyone wires `fee_split_floor_ok` back into a live path.
+        //
+        // Historical description: on-chain enforcement of the launch wizard's
+        // (feeSplit.ts) creator<=45%/LP>=40%/insurance>=15% floors, as a share
+        // of the RETIRED two-rate `T = trade_fee_base_bps + backing_fee_bps`.
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_accepts_wizard_default_20_60_20() {
             // T=20bps, creatorPct=20/lpPct=60/insurancePct=20 ->
             // trade_fee_base_bps=round(20*0.20)=4, backing_fee_bps=16,
@@ -17402,6 +17440,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_rejects_insurance_below_floor() {
             // T=1000bps, tfb=100 (10% creator, well within the 45% cap),
             // bf=900, isb=1000 -> insurance% = 0.9 * 10% = 9% < 15%.
@@ -17409,6 +17448,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_rejects_lp_below_floor() {
             // T=1000bps, tfb=100 (10% creator), bf=900, isb=8000 -> LP share
             // is only 2000bps of the backing fee, so LP% = 0.9 * 20% = 18% < 40%.
@@ -17416,6 +17456,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_rejects_creator_above_cap() {
             // T=1000bps, tfb=600 -> creator% = 60% > 45%, regardless of the
             // backing-fee split (isb=5000 is otherwise a perfectly valid 50/50
@@ -17424,6 +17465,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_accepts_zero_creator_share() {
             // tfb=0 (all-to-backing): creator%=0 (<=45% trivially satisfied),
             // bf=1000, isb=2000 -> insurance%=20% (>=15%), LP%=80% (>=40%).
@@ -17431,6 +17473,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_skips_check_when_backing_fee_is_zero() {
             // backing_fee_bps==0 means the three-way split isn't configured
             // yet (e.g. right after InitMarket) -- the floor check is skipped
@@ -17447,6 +17490,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_accepts_wizard_boundary_point_with_rounding() {
             // The tightest realistic edge case: the wizard's own
             // *simultaneous* boundary selection (creatorPct=45, lpPct=40,
@@ -17464,6 +17508,7 @@ pub mod processor {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn fee_split_floor_still_rejects_a_genuinely_bad_split_at_the_same_scale() {
             // Non-vacuity companion to the boundary-point test above: at the
             // same small T=10bps scale, a split that is genuinely (not just

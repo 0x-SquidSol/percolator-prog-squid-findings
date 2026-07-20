@@ -2216,6 +2216,35 @@ fn kani_set_protocol_fee_authority_requires_upgrade_authority() {
     }
 }
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ RETIRED CODE. THIS PROOF VERIFIES A FUNCTION NO INSTRUCTION CAN REACH.   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// `policy_v16::fee_split_floor_ok` has NO live call sites. `2b3a6a65` removed
+// it from `handle_update_backing_fee_policy` and `handle_update_trade_fee_policy`,
+// the only two handlers that ever called it. It is retained solely so this
+// proof and its unit tests still compile (see the function's own doc comment
+// and the as-built spec §7).
+//
+// READ THIS BEFORE CITING THE PROOF. If you are asking "are the fee-split
+// floors formally verified on-chain?", the answer is NO. This harness proves a
+// property of dead code. The floors that actually run are enforced by
+// `policy_v16::validate_fee_split`, called from `handle_update_fee_split`
+// (tag 86) — a different function with different semantics: an EXACT integer
+// check on a SINGLE-rate split with no tolerance and no skip path, versus the
+// tolerance-based two-rate check proven below. Nothing here transfers to it.
+// Tag 86's enforcement is covered by on-chain tests in
+// `tests/v16_fee_split.rs` (`tag86_rejects_a_floor_violation_with_custom_51`,
+// `tag86_rejects_an_invalid_sum_with_custom_52`), not by formal verification.
+//
+// Kept rather than deleted because the function is kept: deleting the proof
+// would leave retained code entirely unverified, which is worse than a
+// correctly-labelled proof of a retired path. Delete both together or neither.
+//
+// The historical description follows, unchanged, and describes the RETIRED
+// two-rate design (`T = trade_fee_base_bps + backing_fee_bps`), which no
+// longer matches how fees are split.
+//
 // (e) fee_split_floor_ok (policy_v16): on-chain enforcement of the launch
 // wizard's (feeSplit.ts) fee-split floors -- creator at most 45%, LP at
 // least 40%, insurance at least 15%, all as a share of
@@ -2323,7 +2352,11 @@ fn kani_set_protocol_fee_authority_requires_upgrade_authority() {
 // so arithmetic overflow inside the function is not the residual risk left
 // by this bound -- CBMC's proof-engine tractability is.
 #[kani::proof]
-fn kani_fee_split_floor_ok_matches_tolerant_percentage_floors() {
+// Screaming-case RETIRED is deliberate: this name appears in `cargo kani`
+// output and in audit evidence, where it must be impossible to mistake this
+// proof for coverage of a live path.
+#[allow(non_snake_case)]
+fn kani_RETIRED_fee_split_floor_ok_matches_tolerant_percentage_floors() {
     let trade_fee_base_bps: u64 = kani::any::<u8>() as u64;
     let backing_fee_bps: u64 = kani::any::<u8>() as u64;
     let insurance_share_bps: u64 = kani::any::<u16>() as u64;
