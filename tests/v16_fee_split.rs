@@ -110,6 +110,15 @@ fn fee_split_error_ordinals_are_pinned() {
 /// `constants::STAKE_PROGRAM_ID`. If these ever diverge every tag-87 test
 /// starts failing with `StakePoolOwnerMismatch` for a reason that has nothing
 /// to do with the behaviour under test, so pin them together, loudly.
+///
+/// GATED on `devnet` to match `constants::STAKE_PROGRAM_ID` itself
+/// (`src/v16_program.rs:303`). A default build has no pin at all — that is the
+/// mainnet shape, where tag 87 fails closed with `StakeProgramNotPinned` — so
+/// there is nothing to compare against and this assertion is vacuous. Without
+/// this gate the whole `v16_fee_split` binary fails to COMPILE under a default
+/// `cargo test`, taking the split-conservation tests and the error-ordinal pins
+/// down with it.
+#[cfg(feature = "devnet")]
 #[test]
 fn pinned_stake_program_id_matches_the_id_the_harness_mounts() {
     assert_eq!(
