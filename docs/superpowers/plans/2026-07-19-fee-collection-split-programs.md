@@ -279,7 +279,9 @@ fn kani_fee_split_no_leg_exceeds_fee() {
 
 - [ ] **Step 2: Run the proofs**
 
-Run: `cd ~/v17/percolator-prog && cargo kani --harness kani_fee_split_conserves --harness kani_fee_split_no_leg_exceeds_fee 2>&1 | tail -30`
+Run: `cd ~/v17/percolator-prog && cargo kani --tests --harness kani_fee_split_conserves --harness kani_fee_split_no_leg_exceeds_fee 2>&1 | tail -30`
+
+**`--tests` is REQUIRED.** The harnesses live in `tests/v16_kani.rs`, and Kani does not scan integration-test targets without it. Omitting it fails with `error: no harnesses matched the harness filters` after a full dependency rebuild — which reads like a slow hang, not a flag error. This repo's convention is `cargo kani --tests` (see `README.md:654`, `kani_audit.md:3` — 81/81 harnesses in 11m05s).
 Expected: `VERIFICATION:- SUCCESSFUL` for both.
 
 If a harness runs past ~10 minutes, stop it: the cause is a declared width too wide, not a logic error. Narrow `fee` to `u32` and re-run.
@@ -1157,6 +1159,40 @@ Expected: all pass. Pay particular attention to any `FlushToInsurance` test asse
 - [ ] **Step 5: Mutation-proof**
 
 Change the new test's expected delta to `surplus + 1` → must FAIL → restore → PASS.
+
+- [ ] **Step 5b: THIRD EDIT (plan amendment, user-approved 2026-07-19) — extend the pre-accrual guard to mode 0**
+
+Review of the first two edits found a **Critical** front-running/dilution vector that those edits themselves arm. Confirmed in source:
+
+- `calc_lp_for_deposit` / `calc_collateral_for_withdraw` price off the **stored** `total_pool_value()` (`state.rs:642-652`), never the live vault balance
+- `pre_accrue_mode1` is gated `if pool.pool_mode == 1` (`processor.rs:2444`), so mode-0 pools never crystallize a pending vault surplus before pricing
+- `AccrueFees` requires only *a* signer, with no authority gate (`processor.rs:2544-2548`) — fully permissionless
+
+Attack: deposit while a surplus is pending (priced at the stale, lower share value) → self-call `AccrueFees` in the same transaction → the surplus distributes pro-rata over the **post-deposit** LP supply → the attacker captures fees that accrued before they staked, diluting every existing LP. Mirror case: an honest LP withdrawing in that window forfeits their share.
+
+This was inert before this task, because mode-0 `total_fees_earned` was structurally always 0. It becomes live the moment Task 8 (`WithdrawInsuranceReserveToStake`) starts funding mode-0 vaults — in this same plan. **Therefore it must be fixed before Task 8, not deferred.**
+
+Fix: extend the guard to run for both fee-accruing modes, and rename it so the name stops lying:
+
+```rust
+// Was: fn pre_accrue_mode1(...) { if pool.pool_mode == 1 { ... } }
+// Now: crystallize any pending vault surplus BEFORE deposit/withdraw pricing, for
+// every fee-accruing mode. Modes 0 (insurance backstop) and 1 (trading LP) both
+// accrue fees as of the 2026-07-19 fee-collection design; pricing off a stale
+// total_pool_value() while a surplus sits un-accrued in the vault lets a depositor
+// mint LP cheaply and then permissionlessly self-call AccrueFees to capture
+// pre-stake fees at existing holders' expense.
+fn pre_accrue_fee_modes(pool: &mut state::StakePool, vault: &AccountInfo) -> ProgramResult {
+    if pool.pool_mode <= 1 {
+        // ... existing body unchanged ...
+    }
+    Ok(())
+}
+```
+
+Update all call sites to the new name. Do **not** change the body's logic — only the mode predicate and the name.
+
+Add a test proving the exploit is closed: with a pending vault surplus on a **mode-0** pool, a deposit must be priced *after* crystallization — i.e. the depositor's minted LP must equal what they'd get at the post-accrual share price, and an existing holder's claim must not fall. Mutation-proof it.
 
 - [ ] **Step 6: Commit**
 

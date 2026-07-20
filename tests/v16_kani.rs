@@ -2496,3 +2496,52 @@ fn kani_batch_leg_fee_uses_ceil_notional_not_floor() {
         assert!(ceil_fee > floor_fee);
     }
 }
+
+/// Conservation: the four legs sum to exactly the input fee, for EVERY input.
+/// This is the invariant `header.insurance` accounting depends on.
+///
+/// Widths are declared honestly (u16 shares, u128 fee bounded to a realistic
+/// range) rather than assumed on wider types -- CBMC bit-blasts by DECLARED
+/// width, and an unbounded u128 previously caused a 10h57m non-convergence.
+///
+/// `fee` is narrowed to u32 (not the brief's original u64): with two
+/// symbolic bps operands (creator_bps, lp_bps) each multiplied against
+/// `fee` inside u128 `checked_mul`, CBMC bit-blasts the full-width u128
+/// multiplier circuit regardless of the symbol's declared bit-width, and
+/// the u64 version did not converge inside 11 minutes wall-clock (a single
+/// cbmc solve pegged at 100% CPU past the ~10-minute budget). u32 keeps
+/// the property meaningful (fee magnitudes here are bps-scaled trade fees,
+/// far below u32::MAX) while shrinking the multiplier enough to converge.
+#[cfg(kani)]
+#[kani::proof]
+fn kani_fee_split_conserves() {
+    let fee: u32 = kani::any();
+    let creator_bps: u16 = kani::any();
+    let lp_bps: u16 = kani::any();
+    kani::assume(creator_bps <= 8_000);
+    kani::assume(lp_bps <= 8_000);
+    kani::assume(creator_bps as u32 + lp_bps as u32 <= 8_000);
+    let insurance_bps: u16 = 8_000 - creator_bps - lp_bps;
+
+    let parts = percolator_prog::policy_v16::split_trade_fee(
+        fee as u128, 2_000, creator_bps, lp_bps, insurance_bps,
+    )
+    .unwrap();
+
+    assert!(parts.protocol + parts.creator + parts.lp + parts.insurance == fee as u128);
+}
+
+/// No single leg may exceed the whole fee (guards a sign/overflow regression).
+#[cfg(kani)]
+#[kani::proof]
+fn kani_fee_split_no_leg_exceeds_fee() {
+    let fee: u64 = kani::any();
+    let parts = percolator_prog::policy_v16::split_trade_fee(
+        fee as u128, 2_000, 1_600, 4_800, 1_600,
+    )
+    .unwrap();
+    assert!(parts.protocol <= fee as u128);
+    assert!(parts.creator <= fee as u128);
+    assert!(parts.lp <= fee as u128);
+    assert!(parts.insurance <= fee as u128);
+}
