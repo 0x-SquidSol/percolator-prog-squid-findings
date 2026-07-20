@@ -882,6 +882,55 @@ would retroactively brick existing markets."
 Run: `cd ~/v17/percolator-prog && sed -n '14060,14115p' src/v16_program.rs`
 Identify where it reads `bucket.utilization_fee_earnings` and where it credits the vault ledger.
 
+> **PLAN CORRECTION (2026-07-19, user-approved).** The steps below assumed tag 78 has a
+> "NAV-credit call." **It does not.** Its only sink, `registry.fee_distribution_total_atoms`,
+> is written and never read (4 refs: decl `:3173`, init `:13203`, self-increment `:14399`).
+> LP NAV is fed by `ledger.total_earnings_atoms` ← `bucket.utilization_fee_earnings` only.
+>
+> Crediting the ledger alone would brick redemption (`:13888` gate). Crediting bucket earnings
+> via `credit_backing_provider_earnings_not_atomic` eats the junior residual: trade fees are
+> `c_tot -= charged; insurance += charged` at constant vault (engine `v16.rs:13798-13805`), so
+> the senior sum `C+I+E+FB` is **exactly flat** across a fee — there is no slack to consume.
+>
+> **The correct mechanism (Option 1).** `withdraw_insurance_surplus_not_atomic`
+> (engine `v16.rs:7942`) does *only* `insurance -= a; vault -= a` — it does **not** move tokens.
+> Restore `header.vault` afterwards and the tokens never leave, giving exact conservation:
+>
+> ```rust
+> let a = /* claimable, CLAMPED — see the mandatory clamp below */;
+> let v_before = group.header.vault.get();
+> group.withdraw_insurance_surplus_not_atomic(a).map_err(map_v16_error)?;  // I−a, V−a
+> group.header.vault = percolator::V16PodU128::new(v_before);              // restore V
+> add_fresh_counterparty_backing_view(                                      // FB += a·BOUND_SCALE
+>     &mut group, domain,
+>     a.checked_mul(BOUND_SCALE).ok_or(PercolatorError::EngineArithmeticOverflow)?,
+>     crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+> )?;
+> ledger.total_principal_atoms = ledger.total_principal_atoms.checked_add(a)?;
+> group.validate_shape().map_err(map_v16_error)?;
+> ```
+>
+> Ledger arithmetic: `C + (I−a) + E + (FB+a) = S` against `V` — identical to the starting state.
+> Both primitives are already used by the wrapper (`:10421`, `:13419`); the manual vault write
+> has precedent at `:13433`. `earnings_portion` stays 0, so the `:13888` gate passes trivially
+> and all three earnings blocks are skipped — this **disarms** the `:13889` defect rather than
+> arming it.
+>
+> Credit `ledger.total_principal_atoms`, **not** `total_deposited` — no shares are minted.
+>
+> **MANDATORY CLAMP (applies to Task 8 too).** Protocol, LP, and stake legs now all draw from
+> one pool: `insurance − source_insurance_credit_reserved_total_atoms −
+> insurance_domain_budget_remaining_total`. Nothing checks the three wrapper counters sum within
+> it, so **whichever leg cranks last gets `EngineLockActive`** unless each clamps its claim to
+> the engine-available surplus exactly as `handle_withdraw_protocol_fee` does at `:10405-10411`.
+> Advance `lp_fee_withdrawn_atoms` by the CLAMPED amount actually applied, never the requested
+> amount — a partial fill must leave the remainder claimable.
+>
+> **Accepted trade-off (user decision):** LP fee yield lands as at-risk backing capital, not a
+> senior earnings claim, so it can be impaired by backing losses between crank and redemption.
+> The alternative (a ~15-line engine primitive making it senior) was rejected to preserve
+> zero upstream divergence.
+
 - [ ] **Step 2: Replace the earnings source**
 
 Change the source from `bucket.utilization_fee_earnings` to:
