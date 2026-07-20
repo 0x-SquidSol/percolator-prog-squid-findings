@@ -1210,6 +1210,51 @@ junior/senior tranche math are unchanged."
 
 ---
 
+### Task 13: Stake CPI proxies for the marketauth-gated setters (PLAN AMENDMENT, user-approved 2026-07-19)
+
+**Files:**
+- Modify: `~/v17/percolator-stake/src/instruction.rs` (new instruction variants)
+- Modify: `~/v17/percolator-stake/src/processor.rs` (new handlers, modelled on `process_admin_resolve_market`)
+- Modify: `~/v17/percolator-stake/src/cpi.rs` (new CPI helpers, modelled on the existing `AdminResolveMarket` path)
+- Test: `~/v17/percolator-stake/tests/`
+
+**Interfaces:**
+- Consumes: wrapper tags 86 (`UpdateFeeSplit`, Task 6) and 88 (`UpdateMaintenanceFeePerSlot`, Task 9).
+- Produces: two stake instructions that `invoke_signed` the stake-pool PDA to call wrapper tags 86 and 88 on a market whose `marketauth` the stake pool now holds.
+
+**Why this task exists.** `percolator-stake`'s `InitPool` irreversibly rotates `cfg.marketauth` from the human admin to the stake-pool PDA (`processor.rs:542-575` → `cpi.rs:160-183`). A PDA cannot sign a top-level transaction, so **every** marketauth-gated wrapper instruction is thereafter reachable only through a CPI proxy issued by this program. The stake program currently has exactly one such proxy (`AdminResolveMarket` → wrapper tag 19). Its own documentation states the consequence plainly:
+
+> *"Other wrapper admin operations gated on marketauth ... remain UNREACHABLE through this program and must be proxied here before they can ever be exercised on an InitPool market."* (`instruction.rs:1-22`, `lib.rs:6-21`)
+
+Without this task, `UpdateFeeSplit` and `UpdateMaintenanceFeePerSlot` ship **born unreachable on any staked market** — the exact promise-vs-reachability defect this entire plan exists to fix. The defaults are safe and the wizard can set a split pre-stake, so this is not a launch blocker; what it recovers is post-launch retuning.
+
+- [ ] **Step 1: Read the existing proxy end-to-end**
+
+Read `process_admin_resolve_market` and its `cpi.rs` helper in full. It is the *only* working example of this pattern in the repo. Mirror its account layout, authority checks, PDA seed derivation, and `invoke_signed` idiom exactly. **Do not invent a new proxy idiom** — this path signs as the authority that governs a live market, and a mistake here is a privilege-escalation bug.
+
+- [ ] **Step 2: Decide and document who may invoke each proxy**
+
+`AdminResolveMarket`'s existing authority model governs who can drive the pool. Apply the same model unless there is a documented reason not to, and state the reasoning in the commit message. A proxy that anyone may call would let a third party rewrite a market's fee policy.
+
+- [ ] **Step 3: Add the two proxy instructions**
+
+One forwarding to wrapper tag 86 (`UpdateFeeSplit`, args `creator_share_bps`/`lp_share_bps`/`insurance_share_bps`, all `u16`), one to tag 88 (`UpdateMaintenanceFeePerSlot`, arg `maintenance_fee_per_slot: u64`). Append new stake instruction tags; do not renumber existing ones.
+
+Validation stays in the wrapper — do not duplicate `validate_fee_split`'s floor logic here, or the two copies will drift.
+
+- [ ] **Step 4: Prove reachability end-to-end (this is the whole point)**
+
+A test that calls the proxy in isolation proves nothing. The test must:
+1. create a market, 2. run `StakeInitPool` so `marketauth` really is the pool PDA, 3. confirm a **direct** wrapper `UpdateFeeSplit` from the original admin now **fails** with the authority error, 4. confirm the **proxy** succeeds, 5. read the config back and assert the shares actually changed on chain.
+
+Step 3 is what distinguishes this from a test that would pass even if the proxy did nothing.
+
+- [ ] **Step 5: Run the full stake suite, mutation-proof the new assertions, commit**
+
+Compare failure name sets against the base commit, not counts.
+
+---
+
 ### Task 12: Build, hash, and hand off for user-gated deploy
 
 **Files:** none modified.
