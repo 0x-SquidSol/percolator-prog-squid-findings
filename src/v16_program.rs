@@ -330,6 +330,16 @@ pub mod error {
         /// SDK agent: add `FeeSplitFloorViolation = 51` to the client error
         /// map.
         FeeSplitFloorViolation, // Custom(51)
+        // ── Fee-collection split (2026-07-19) ───────────────────────────────
+        // Appended after FeeSplitFloorViolation (ordinal 51). Do NOT reorder.
+        /// `UpdateFeeSplit` shares do not sum to exactly
+        /// `FEE_SHARE_TOTAL_BPS` (= 10_000 - PROTOCOL_FEE_BPS).
+        /// SDK agent: add `FeeSplitSumInvalid = 52` to the client error map.
+        FeeSplitSumInvalid, // Custom(52)
+        /// `WithdrawInsuranceReserveToStake` called with nothing available
+        /// (`insurance_reserve_accrued == insurance_reserve_withdrawn`).
+        /// SDK agent: add `NoInsuranceReserveToClaim = 53` to the client error map.
+        NoInsuranceReserveToClaim, // Custom(53)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -3869,6 +3879,14 @@ pub mod ix {
         SetProtocolFeeAuthority {
             new_authority: [u8; 32],
         },
+        /// UpdateFeeSplit (tag 86) — sets the three fee-split shares.
+        /// Gated on `marketauth`. Shares must sum to FEE_SHARE_TOTAL_BPS and
+        /// satisfy the floors (creator <=45%, LP >=40%, insurance >=15%).
+        UpdateFeeSplit {
+            creator_share_bps: u16,
+            lp_share_bps: u16,
+            insurance_share_bps: u16,
+        },
     }
 
     impl Instruction {
@@ -4182,6 +4200,11 @@ pub mod ix {
                 },
                 85 => Self::SetProtocolFeeAuthority {
                     new_authority: read_bytes32(&mut rest)?,
+                },
+                86 => Self::UpdateFeeSplit {
+                    creator_share_bps: read_u16(&mut rest)?,
+                    lp_share_bps: read_u16(&mut rest)?,
+                    insurance_share_bps: read_u16(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -4665,6 +4688,16 @@ pub mod ix {
                 Self::SetProtocolFeeAuthority { new_authority } => {
                     out.push(85);
                     out.extend_from_slice(&new_authority);
+                }
+                Self::UpdateFeeSplit {
+                    creator_share_bps,
+                    lp_share_bps,
+                    insurance_share_bps,
+                } => {
+                    out.push(86);
+                    push_u16(&mut out, creator_share_bps);
+                    push_u16(&mut out, lp_share_bps);
+                    push_u16(&mut out, insurance_share_bps);
                 }
             }
             out
@@ -5443,7 +5476,10 @@ pub mod oracle_v16 {
 }
 
 pub mod policy_v16 {
-    use crate::constants::MAX_DYNAMIC_TRADE_FEE_BPS;
+    use crate::constants::{
+        FEE_SHARE_TOTAL_BPS, MAX_CREATOR_SHARE_BPS, MAX_DYNAMIC_TRADE_FEE_BPS,
+        MIN_INSURANCE_SHARE_BPS, MIN_LP_SHARE_BPS,
+    };
     use crate::error::PercolatorError;
     use solana_program::program_error::ProgramError;
 
@@ -5853,6 +5889,34 @@ pub mod policy_v16 {
             .checked_sub(assigned)
             .ok_or(PercolatorError::EngineCounterUnderflow)?;
         Ok(FeeSplitParts { protocol, creator, lp, insurance })
+    }
+
+    /// Exact fee-split validation for `UpdateFeeSplit` (2026-07-19 design).
+    ///
+    /// Replaces `fee_split_floor_ok`'s tolerance-based two-rate check: with a
+    /// single rate there is no cross-rate rounding to absorb, so this is an
+    /// exact integer comparison with no tolerance and no skip path.
+    ///
+    /// Returns Ok(()) or the specific error. MUST be called ONLY from the
+    /// UpdateFeeSplit handler -- never from a load-time validator, because
+    /// `validate_wrapper_config` runs on every deserialize and a floor there
+    /// would retroactively brick markets whose stored split predates it.
+    pub fn validate_fee_split(
+        creator_bps: u16,
+        lp_bps: u16,
+        insurance_bps: u16,
+    ) -> Result<(), ProgramError> {
+        let sum = creator_bps as u32 + lp_bps as u32 + insurance_bps as u32;
+        if sum != FEE_SHARE_TOTAL_BPS as u32 {
+            return Err(PercolatorError::FeeSplitSumInvalid.into());
+        }
+        if creator_bps > MAX_CREATOR_SHARE_BPS
+            || lp_bps < MIN_LP_SHARE_BPS
+            || insurance_bps < MIN_INSURANCE_SHARE_BPS
+        {
+            return Err(PercolatorError::FeeSplitFloorViolation.into());
+        }
+        Ok(())
     }
 }
 
@@ -6988,6 +7052,17 @@ pub mod processor {
             Instruction::SetProtocolFeeAuthority { new_authority } => {
                 handle_set_protocol_fee_authority(program_id, accounts, new_authority)
             }
+            Instruction::UpdateFeeSplit {
+                creator_share_bps,
+                lp_share_bps,
+                insurance_share_bps,
+            } => handle_update_fee_split(
+                program_id,
+                accounts,
+                creator_share_bps,
+                lp_share_bps,
+                insurance_share_bps,
+            ),
         }
     }
 
@@ -10394,6 +10469,41 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         cfg.protocol_fee_authority = new_authority;
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+    }
+
+    /// UpdateFeeSplit (tag 86) — marketauth-gated. Validates the shares, then
+    /// stores them. Validation lives ONLY here, never in a load-time
+    /// validator (see `policy_v16::validate_fee_split`'s doc comment).
+    ///
+    /// Marketauth-gated idiom mirrors the neighbouring single-field setters
+    /// (`handle_update_maintenance_fee_policy`, `handle_update_fee_redirect_policy`,
+    /// `handle_update_market_init_fee_policy`): signer/writable/owner checks,
+    /// load cfg via `read_market_config_mode_and_capacity`, gate on
+    /// `cfg.marketauth` via `expect_live_authority`, mutate, write back.
+    /// (`handle_update_trade_fee_policy` gates on asset-0's insurance
+    /// authority instead of `marketauth`, so it is not the pattern to mirror
+    /// here despite sharing the "policy setter" name.)
+    #[inline(never)]
+    fn handle_update_fee_split<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        creator_share_bps: u16,
+        lp_share_bps: u16,
+        insurance_share_bps: u16,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        expect_signer(admin)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        policy_v16::validate_fee_split(creator_share_bps, lp_share_bps, insurance_share_bps)?;
+        let (mut cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        expect_live_authority(&cfg.marketauth, admin.key)?;
+        cfg.creator_share_bps = creator_share_bps;
+        cfg.lp_share_bps = lp_share_bps;
+        cfg.insurance_share_bps = insurance_share_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }
 
