@@ -10821,9 +10821,31 @@ pub mod processor {
             // `protocol_owed` is threaded through as `additional_reserved` so
             // the engine primitive itself refuses to let this reward dip
             // insurance below the protocol's claim.
+            //
+            // LP LEG (Finding 2). The amendment reserved only the protocol leg,
+            // but `split_trade_fee` earmarks THREE wrapper-side claims out of the
+            // same unbudgeted surplus -- protocol, LP (`lp_fee_accrued`, drained
+            // by tag 78) and stake (`insurance_reserve_accrued`, Task 8). Only
+            // the creator leg is budgeted (`credit_domain_insurance_budget_
+            // not_atomic`), so `insurance_domain_budget_remaining_total` does not
+            // cover the other three. Reserving the protocol leg alone leaves the
+            // LP claim exposed to every `credit_account_from_insurance_not_atomic`
+            // caller. The shortfall would be PERMANENT if it ever opened: each
+            // subsequent trade fee raises `lp_fee_accrued_atoms` by its own LP leg
+            // at the same time as it raises insurance, so the deficit is carried
+            // forward rather than closed, and the tag-78 clamp silently converts
+            // it into LP yield that crankers keep. Reserve both legs.
             let protocol_owed = cfg_pre
                 .protocol_fee_accrued_atoms
                 .saturating_sub(cfg_pre.protocol_fee_withdrawn_atoms);
+            let lp_owed = cfg_pre
+                .lp_fee_accrued_atoms
+                .saturating_sub(cfg_pre.lp_fee_withdrawn_atoms);
+            // `saturating_add`: matches the `saturating_sub` style above and the
+            // engine's own `budget_remaining.saturating_add(additional_reserved)`.
+            // A saturated floor fails CLOSED (rejects the reward), which is the
+            // safe direction.
+            let reserved_fee_claims = protocol_owed.saturating_add(lp_owed);
             if let Some(cranker_portfolio_ai) = accounts.get(2) {
                 if cranker_portfolio_ai.key == portfolio_ai.key {
                     let charged = group
@@ -10840,7 +10862,7 @@ pub mod processor {
                             .credit_account_from_insurance_not_atomic(
                                 &mut portfolio,
                                 reward,
-                                protocol_owed,
+                                reserved_fee_claims,
                             )
                             .map_err(map_v16_error)?;
                         group.validate_shape().map_err(map_v16_error)?;
@@ -10891,7 +10913,7 @@ pub mod processor {
                             .credit_account_from_insurance_not_atomic(
                                 &mut cranker,
                                 reward,
-                                protocol_owed,
+                                reserved_fee_claims,
                             )
                             .map_err(map_v16_error)?;
                         group.validate_shape().map_err(map_v16_error)?;
@@ -12940,14 +12962,24 @@ pub mod processor {
                     // permissionless-crank/liquidation reward must not be
                     // able to dip insurance below the protocol's
                     // accrued-but-unwithdrawn claim.
+                    //
+                    // LP LEG (Finding 2): the LP claim (`lp_fee_accrued -
+                    // lp_fee_withdrawn`, drained by tag 78) lives in the SAME
+                    // unbudgeted surplus and was reserved nowhere. Mirrors the
+                    // `SyncMaintenanceFee` site verbatim -- see the long comment
+                    // there for why an LP shortfall, once opened, never closes.
                     let protocol_owed = cfg
                         .protocol_fee_accrued_atoms
                         .saturating_sub(cfg.protocol_fee_withdrawn_atoms);
+                    let lp_owed = cfg
+                        .lp_fee_accrued_atoms
+                        .saturating_sub(cfg.lp_fee_withdrawn_atoms);
+                    let reserved_fee_claims = protocol_owed.saturating_add(lp_owed);
                     group
                         .credit_account_from_insurance_not_atomic(
                             &mut cranker,
                             reward,
-                            protocol_owed,
+                            reserved_fee_claims,
                         )
                         .map_err(map_v16_error)?;
                 }
@@ -14397,11 +14429,84 @@ pub mod processor {
         expect_key(ledger_ai, &ledger_pda)?;
         let domain = registry.domain as usize;
 
+        // ORPHANED-ATOMS GUARD (Finding 3). The crank moves atoms out of
+        // `header.insurance` and into `ledger.total_principal_atoms` +
+        // `bucket.fresh_unliened_backing_num`, where they are claimable ONLY
+        // pro rata by LP shares. After the last real LP redeems, outstanding
+        // falls back to the irreducible `LP_VAULT_MINIMUM_LIQUIDITY` dead-share
+        // floor (never minted, never redeemable -- see BUG-2/N7 on
+        // `handle_deposit_to_lp_vault`) and the SPL mint supply returns to 0.
+        // `add_fresh_counterparty_backing_view` happily accepts an `Empty` or
+        // `Expired` bucket, so without this check a permissionless crank on a
+        // fully-exited vault credits principal that NO share can ever claim,
+        // and `handle_close_lp_vault` -- which inspects only shares and mint
+        // supply, never the backing ledger -- then tears the registry down with
+        // that principal stranded inside it. No solvency break, but the atoms
+        // leave the insurance fund and belong to nobody.
+        //
+        // Error choice: NOT `LpVaultNoFeesToCrank` (38) -- fees demonstrably DO
+        // exist here, and reporting "no fees" would send an operator hunting for
+        // a missing accrual instead of a missing LP. `LpVaultZeroSharesMinted`
+        // (41) is the existing variant for exactly this invariant: at
+        // `handle_deposit_to_lp_vault:13368` it refuses to absorb value when the
+        // operation would leave zero real shares behind it. Same failure mode,
+        // same remedy (deposit first) -- value in, no shares to claim it. No new
+        // variant is warranted.
+        if registry.total_lp_shares_outstanding <= crate::constants::LP_VAULT_MINIMUM_LIQUIDITY {
+            return Err(PercolatorError::LpVaultZeroSharesMinted.into());
+        }
+
         // Sync the ledger from the live bucket, persist, read current earnings,
         // and compute/consume the wrapper-side LP fee claim.
         let (total_earnings, available, cfg_after) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // MODE GATE (Finding 1) -- modelled on `handle_deposit_to_lp_vault`
+            // (`:13399-13402`), NOT on `handle_withdraw_protocol_fee`
+            // (`:10369-10378`), and deliberately the STRICTER of the two.
+            //
+            // Rationale. What this crank does is functionally a DEPOSIT into the
+            // LP backing domain: it calls the same
+            // `add_fresh_counterparty_backing_view` with the same
+            // `LP_VAULT_BACKING_EXPIRY_SLOT` and credits the same
+            // `ledger.total_principal_atoms`. It differs from a real deposit only
+            // in where the atoms come from (senior insurance rather than the
+            // depositor's token account) and in that NOBODY has to authorise it --
+            // tag 78 carries no authority signature at all, only
+            // `expect_signer(cranker)` on an arbitrary fee payer. A handler that
+            // anyone can fire at any moment should not be reachable in more market
+            // states than the same operation performed by its own beneficiary.
+            //
+            // Why not the protocol-fee model. `handle_withdraw_protocol_fee` may
+            // run in Resolved because it (a) requires the protocol fee authority's
+            // signature, and (b) EXTINGUISHES the claim -- atoms leave to an
+            // authority-owned token account and no downstream obligation survives,
+            // which is why the `materialized_portfolio_count == 0 && c_tot == 0`
+            // precondition is sufficient there. This crank does the opposite: it
+            // CONVERTS senior insurance into a junior LP claim that must still be
+            // paid out later through `RequestRedeemLpShares` -> `ExecuteRedemption`.
+            // "Safe to drain now" therefore does not transfer, and creating fresh
+            // backing on a market that is winding down is meaningless.
+            //
+            // Concretely blocked:
+            //   * Recovery (mode 2) -- the failure in the finding. Post-solvency-
+            //     event, `header.insurance` IS the recovery buffer; any signer
+            //     could otherwise convert up to `lp_fee_accrued - lp_fee_withdrawn`
+            //     of it into junior LP backing and have LPs redeem it out.
+            //   * Resolved (mode 1) -- same conversion, before trader portfolios
+            //     are materialised.
+            //   * Live-but-matured -- `reject_permissionless_resolve_matured_live_view`
+            //     is what `handle_deposit_to_lp_vault` uses to stop permissionless
+            //     writes to a market that is past its stale-resolve horizon and is
+            //     merely awaiting someone to resolve it.
+            //
+            // The claim is NOT lost in any of these states: nothing is marked
+            // withdrawn on a rejected crank, so `lp_fee_accrued - lp_fee_withdrawn`
+            // stays fully claimable if the market returns to Live.
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             // PROG-1: verify the vault is still the backing authority for this domain.
             // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
             // without the check here, a fee crank after an asset_admin authority rotation

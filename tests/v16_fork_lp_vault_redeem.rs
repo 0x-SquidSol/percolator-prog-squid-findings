@@ -1736,3 +1736,224 @@ fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_red
     execute(&mut env, &d2).expect("same request executes once the lien no longer makes it under-backed");
     assert_eq!(tok(&env.svm, d2.dest), 100_000, "d2 paid once solvency is restored");
 }
+
+// ── Finding 1 (mode gate) + Finding 3 (crank with no LPs) ───────────────────
+
+/// Force `header.mode` directly. Accepted direct-write boundary, and the same
+/// one `v16_wrapper.rs:3978` / `v16_cu.rs:8421` use to reach Recovery, which no
+/// wrapper instruction can enter on demand. Safe here because the mode gate
+/// under test returns BEFORE any engine call, so no shape validation is skipped
+/// on the rejecting path.
+fn set_mode(env: &mut Env, mode: MarketModeV16) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    group.mode = mode;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+fn lp_shares_outstanding(env: &Env) -> u128 {
+    state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data)
+        .unwrap()
+        .total_lp_shares_outstanding
+}
+
+/// FINDING 1: tag 78 is FULLY PERMISSIONLESS -- its only auth is
+/// `expect_signer(cranker)` on an arbitrary fee payer -- and before this fix it
+/// never read `group.header.mode`. It converts senior `header.insurance` into
+/// junior LP backing principal that LPs then redeem out.
+///
+/// The attack: a market enters Recovery after a solvency event with unbudgeted
+/// surplus still sitting in `header.insurance`. That surplus IS the recovery
+/// buffer. Any signer could call tag 78 and convert up to
+/// `lp_fee_accrued - lp_fee_withdrawn` of it into LP junior backing. Same
+/// exposure in Resolved, before trader portfolios are materialised.
+///
+/// Both are now rejected with `EngineLockActive` = Custom(21), the same code
+/// both sibling handlers use. The claim is NOT destroyed by the rejection --
+/// the Live control at the end drains it in full, proving the gate defers the
+/// crank rather than forfeiting LP yield.
+#[test]
+fn crank_fees_rejected_outside_live_mode() {
+    const LP_FEES: u128 = 250_000;
+
+    // ---- Recovery (mode 2): the headline failure. ----
+    let mut env = setup_vault(0);
+    let _d = new_depositor(&mut env, DEPOSIT);
+    seed_lp_fee_accrued(&mut env, LP_FEES);
+
+    let (vault_before, insurance_before) = vault_and_insurance(&env);
+    let counters_before = lp_fee_counters(&env);
+    assert_eq!(counters_before, (LP_FEES, 0), "a full claim is outstanding");
+    assert!(insurance_before >= LP_FEES, "the claim is fully backed, so ONLY the mode gate can reject");
+
+    set_mode(&mut env, MarketModeV16::Recovery);
+    env.svm.expire_blockhash();
+    let err = crank_fees(&mut env).expect_err("a permissionless crank in Recovery must reject");
+    assert!(
+        err.contains("Custom(21)"),
+        "Recovery crank must return EngineLockActive = Custom(21), got: {err}"
+    );
+    assert_eq!(
+        vault_and_insurance(&env),
+        (vault_before, insurance_before),
+        "the recovery buffer must be byte-identical after a rejected crank -- \
+         not one atom reclassified out of header.insurance"
+    );
+    assert_eq!(
+        lp_fee_counters(&env),
+        counters_before,
+        "nothing may be marked withdrawn on a rejected crank"
+    );
+
+    // ---- Resolved (mode 1), via the REAL ResolveMarket instruction. ----
+    let mut env2 = setup_vault(0);
+    let _d2 = new_depositor(&mut env2, DEPOSIT);
+    seed_lp_fee_accrued(&mut env2, LP_FEES);
+    let (v2_before, i2_before) = vault_and_insurance(&env2);
+    resolve_market(&mut env2).expect("resolve empty market with LP backing");
+    env2.svm.expire_blockhash();
+    let err2 = crank_fees(&mut env2).expect_err("a permissionless crank in Resolved must reject");
+    assert!(
+        err2.contains("Custom(21)"),
+        "Resolved crank must return EngineLockActive = Custom(21), got: {err2}"
+    );
+    assert_eq!(
+        vault_and_insurance(&env2),
+        (v2_before, i2_before),
+        "Resolved: header.insurance must be untouched by the rejected crank"
+    );
+    assert_eq!(lp_fee_counters(&env2), (LP_FEES, 0), "Resolved: claim intact");
+
+    // ---- Live-but-MATURED: still mode 0, but past the permissionless
+    //      stale-resolve horizon, i.e. a market anyone may resolve and that is
+    //      merely waiting for someone to do it. `handle_deposit_to_lp_vault`
+    //      refuses permissionless writes here via
+    //      `reject_permissionless_resolve_matured_live_view`; so must this. ----
+    let mut env3 = setup_vault(0);
+    let _d3 = new_depositor(&mut env3, DEPOSIT);
+    seed_lp_fee_accrued(&mut env3, LP_FEES);
+    let (v3_before, i3_before) = vault_and_insurance(&env3);
+    {
+        let mut acct = env3.svm.get_account(&env3.market).expect("market");
+        let (mut cfg, group) = state::read_market(&acct.data).expect("read market");
+        assert_eq!(group.mode, MarketModeV16::Live, "still Live -- only maturity differs");
+        // `permissionless_stale_matured`: stale_slots != 0 && now - last_good >= stale_slots.
+        cfg.permissionless_resolve_stale_slots = 1;
+        cfg.last_good_oracle_slot = 0;
+        state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+        env3.svm.set_account(env3.market, acct).unwrap();
+    }
+    // `permissionless_stale_matured` reads
+    // `authenticated_market_slot_or_fallback_view` = max(Clock.slot,
+    // header.current_slot); both are 0 in a fresh LiteSVM, so the horizon has to
+    // be crossed by actually advancing the chain.
+    env3.svm.warp_to_slot(50);
+    env3.svm.expire_blockhash();
+    let err3 = crank_fees(&mut env3).expect_err("a permissionless crank on a matured Live market must reject");
+    assert!(
+        err3.contains("Custom(27)"),
+        "matured-Live crank must return OracleStale = Custom(27), got: {err3}"
+    );
+    assert_eq!(
+        vault_and_insurance(&env3),
+        (v3_before, i3_before),
+        "matured Live: header.insurance must be untouched by the rejected crank"
+    );
+    assert_eq!(lp_fee_counters(&env3), (LP_FEES, 0), "matured Live: claim intact");
+
+    // ---- Live control (non-vacuity + claim-not-forfeited). ----
+    // The SAME market, SAME claim, SAME backing: only the mode differs. It must
+    // succeed and drain the claim IN FULL, which proves the gate defers rather
+    // than destroys, and that neither assertion above passed for some unrelated
+    // reason.
+    set_mode(&mut env, MarketModeV16::Live);
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("the identical crank in Live mode must succeed");
+    let (accrued_live, withdrawn_live) = lp_fee_counters(&env);
+    assert_eq!(accrued_live, LP_FEES, "accrued must not move on a crank");
+    assert_eq!(
+        withdrawn_live, LP_FEES,
+        "the deferred claim is drained IN FULL once the market is Live again"
+    );
+    let (vault_live, insurance_live) = vault_and_insurance(&env);
+    assert_eq!(
+        vault_live, vault_before,
+        "header.vault is unchanged across the crank -- the crank moves no tokens"
+    );
+    assert_eq!(
+        insurance_before - insurance_live,
+        LP_FEES,
+        "and NOW header.insurance falls by exactly the reclassified claim"
+    );
+}
+
+/// FINDING 3: a crank with no LPs left orphans the atoms.
+///
+/// `add_fresh_counterparty_backing_view` accepts an `Empty`/`Expired` bucket, so
+/// after every real LP has redeemed (outstanding back to the irreducible
+/// `LP_VAULT_MINIMUM_LIQUIDITY` dead-share floor, SPL mint supply 0) a
+/// permissionless crank used to move `header.insurance` into
+/// `ledger.total_principal_atoms` + `bucket.fresh_unliened_backing_num` with
+/// ZERO real shares able to claim it. `handle_close_lp_vault` inspects only
+/// shares and mint supply -- never the backing ledger -- so the registry could
+/// then be torn down with that principal permanently stranded inside it. No
+/// solvency break; the atoms simply leave the insurance fund and belong to
+/// nobody.
+///
+/// Now rejected with `LpVaultZeroSharesMinted` = Custom(41). NOT Custom(38)
+/// (`LpVaultNoFeesToCrank`): fees demonstrably DO exist here, and "no fees"
+/// would send an operator hunting for a missing accrual instead of a missing LP.
+#[test]
+fn crank_fees_after_full_lp_exit_rejects_and_leaves_atoms_in_insurance() {
+    const LP_FEES: u128 = 250_000;
+
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    seed_lp_fee_accrued(&mut env, LP_FEES);
+
+    // Full LP exit: the sole (genesis) depositor redeems every REAL share.
+    request(&mut env, &d, MINTED).expect("request full redemption");
+    execute(&mut env, &d).expect("execute full redemption");
+    assert_eq!(tok(&env.svm, d.lp_ata), 0, "no real LP shares left in any ATA");
+    assert_eq!(
+        lp_shares_outstanding(&env),
+        LP_VAULT_MINIMUM_LIQUIDITY,
+        "outstanding is back at the irreducible dead-share floor -- these were \
+         never minted and can never be redeemed, so they cannot claim anything"
+    );
+
+    // The fees are still there and still claimable-looking: this is exactly the
+    // state in which the pre-fix crank succeeded and orphaned them.
+    let (vault_before, insurance_before) = vault_and_insurance(&env);
+    let counters_before = lp_fee_counters(&env);
+    assert_eq!(counters_before, (LP_FEES, 0), "the full LP fee claim is still outstanding");
+    assert!(
+        insurance_before >= LP_FEES,
+        "and still fully backed -- so ONLY the no-LPs guard can reject this crank"
+    );
+    let principal_before = ledger(&env).total_principal_atoms;
+
+    env.svm.expire_blockhash();
+    let err = crank_fees(&mut env).expect_err("a crank with no real LP shares must reject");
+    assert!(
+        err.contains("Custom(41)"),
+        "crank after full LP exit must return LpVaultZeroSharesMinted = Custom(41), got: {err}"
+    );
+
+    // The atoms stayed in the insurance fund -- the whole point of the guard.
+    assert_eq!(
+        vault_and_insurance(&env),
+        (vault_before, insurance_before),
+        "header.insurance must still hold the fee atoms; nothing was reclassified"
+    );
+    assert_eq!(
+        ledger(&env).total_principal_atoms,
+        principal_before,
+        "no unclaimable principal was credited to the backing ledger"
+    );
+    assert_eq!(lp_fee_counters(&env), counters_before, "nothing marked withdrawn");
+
+    // And the vault can still be torn down cleanly, with no stranded principal.
+    close_lp_vault(&mut env).expect("CloseLpVault still succeeds at the dead-share floor");
+}

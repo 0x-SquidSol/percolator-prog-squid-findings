@@ -18704,3 +18704,153 @@ fn v16_wrapper_fee_split_floor_update_trade_fee_policy_checks_every_asset_not_ju
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_after.trade_fee_base_bps, 100);
 }
+
+// ── Finding 2 (RESERVE amendment): the LP fee claim must be reserved against
+//    permissionless crank-reward payouts, not just the protocol fee claim ────
+
+/// `split_trade_fee` earmarks THREE wrapper-side claims out of the same
+/// unbudgeted insurance surplus: protocol (`protocol_fee_accrued`, drained by
+/// tag 83), LP (`lp_fee_accrued`, drained by tag 78) and stake
+/// (`insurance_reserve_accrued`, Task 8). Only the creator leg is budgeted, so
+/// `insurance_domain_budget_remaining_total` does not cover the other three.
+/// The RESERVE amendment threaded ONLY the protocol leg into
+/// `credit_account_from_insurance_not_atomic`'s `additional_reserved`, leaving
+/// the LP claim unreserved against every permissionless cranker reward.
+///
+/// This test pins the LP leg of that reservation. Sequence (native harness, no
+/// LiteSVM needed -- the reservation lives entirely in the wrapper->engine call):
+///
+///   * capital 100, `maintenance_fee_per_slot` 5, cranker share 40%.
+///   * at slot 10 the crank charges `min(5*10, 100) = 50` into insurance and
+///     would pay the cranker `50 * 4000/10000 = 20` back out of it, leaving
+///     `next_insurance == 30`.
+///   * an outstanding LP claim of 100 exceeds that, so the reward must now be
+///     REFUSED by the engine (`reserved_floor > next_insurance` ->
+///     `V16Error::LockActive` -> `EngineLockActive` = Custom(21)) rather than
+///     paid out of atoms that are earmarked for LPs.
+///
+/// The claim must survive the rejection byte-for-byte (a failed instruction
+/// rolls every account write back), which is what makes it fully crankable by
+/// tag 78 afterwards -- tag 78 drains exactly
+/// `lp_fee_accrued_atoms - lp_fee_withdrawn_atoms`, so an unchanged pair is an
+/// unchanged claim.
+///
+/// NON-VACUITY / precision control: the same crank, on the same market, with
+/// the LP claim already fully withdrawn (`withdrawn == accrued`, owed 0) must
+/// still SUCCEED and pay the reward. The reservation is exactly the outstanding
+/// LP claim -- it is not a blanket block on maintenance cranks.
+#[test]
+fn v16_wrapper_maintenance_cranker_reward_reserves_outstanding_lp_fee_claim() {
+    // ---- Case A: an outstanding LP claim blocks the cranker reward. ----
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut payer_owner = signer();
+    let mut cranker_owner = signer();
+    let mut payer = portfolio_account();
+    let mut cranker = portfolio_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 5;
+            }
+        }),
+    );
+    init_portfolio(&mut payer_owner, &mut market, &mut payer);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker);
+    deposit(&mut payer_owner, &mut market, &mut payer, 100);
+    run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 4_000,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // Seed an outstanding LP fee claim. Accepted direct-write boundary (the
+    // production producer is `split_trade_fee`'s LP leg at the two trade fee
+    // sites, which needs a full trading env). 100 > the 30 that would remain in
+    // insurance after the reward, so the reservation must bind.
+    const LP_CLAIM: u128 = 100;
+    {
+        let (mut cfg, group) = state::read_market(&market.data).unwrap();
+        assert_eq!(group.insurance, 0, "no insurance before the first crank");
+        assert_eq!(
+            group.insurance_domain_budget_remaining_total, 0,
+            "no budgeted insurance either -- the ONLY thing that can reserve \
+             anything here is `additional_reserved`, so this test cannot pass \
+             for the wrong reason"
+        );
+        cfg.lp_fee_accrued_atoms = LP_CLAIM;
+        cfg.lp_fee_withdrawn_atoms = 0;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before = market.data.clone();
+    let payer_before = payer.data.clone();
+    let cranker_before = cranker.data.clone();
+    let rejected = run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 10 },
+        &mut [&mut market, &mut payer, &mut cranker, &mut cranker_owner],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(21)), // EngineLockActive
+        "a cranker reward that would dip insurance below the outstanding LP fee \
+         claim must be refused by the engine's reserved-floor check"
+    );
+    // The whole instruction rolled back: the LP claim is intact, the atoms are
+    // still where they were, and nobody was paid.
+    assert_eq!(
+        market.data, before,
+        "a rejected crank must leave the market account byte-identical -- \
+         insurance, the domain budgets and both LP fee counters included"
+    );
+    assert_eq!(payer.data, payer_before, "the fee payer must be untouched");
+    assert_eq!(cranker.data, cranker_before, "the cranker must not be paid");
+    {
+        let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+        assert_eq!(
+            cfg_after
+                .lp_fee_accrued_atoms
+                .saturating_sub(cfg_after.lp_fee_withdrawn_atoms),
+            LP_CLAIM,
+            "the FULL LP claim survives -- this is exactly what tag 78 drains, \
+             so it remains crankable in full"
+        );
+        assert_eq!(
+            group_after.insurance, 0,
+            "no atoms left insurance on the rejected path"
+        );
+    }
+
+    // ---- Case B (non-vacuity): with the LP claim already withdrawn, the very
+    //      same crank succeeds and pays the reward. ----
+    {
+        let (mut cfg, group) = state::read_market(&market.data).unwrap();
+        cfg.lp_fee_withdrawn_atoms = cfg.lp_fee_accrued_atoms; // owed == 0
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 10 },
+        &mut [&mut market, &mut payer, &mut cranker, &mut cranker_owner],
+    )
+    .expect(
+        "with no outstanding LP claim the identical crank must succeed -- the \
+         reservation is the LP claim, not a blanket block",
+    );
+    let (_, group_ok) = state::read_market(&market.data).unwrap();
+    let payer_ok = state::read_portfolio(&payer.data).unwrap();
+    let cranker_ok = state::read_portfolio(&cranker.data).unwrap();
+    assert_eq!(payer_ok.capital, 50, "charged 5/slot * 10 slots");
+    assert_eq!(cranker_ok.capital, 20, "cranker takes 40% of the 50 charged");
+    assert_eq!(
+        group_ok.insurance, 30,
+        "the retained 30 stays in insurance (budgeted to asset 0's domains)"
+    );
+}
