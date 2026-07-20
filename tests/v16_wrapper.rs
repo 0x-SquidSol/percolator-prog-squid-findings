@@ -18746,3 +18746,128 @@ fn v16_wrapper_update_trade_fee_policy_no_longer_enforces_the_two_rate_floor() {
     );
     assert_err_and_market_unchanged(result, &market, &before);
 }
+
+// =============================================================================
+// LP-SENIORITY PIN — this test enforces a DELIBERATE DECISION, not a bug fix.
+//
+// LP and staker fee claims are JUNIOR to bad-debt / socialized-loss coverage.
+// An LP-claim reservation at the `credit_account_from_insurance_not_atomic`
+// call sites was implemented (`d2f697fc`, Finding 2) and then deliberately
+// REVERTED (`9a6502ae`) for three stated reasons: the drain it defended against
+// is arithmetically unreachable (a maintenance crank is `engine_available`-
+// neutral), it made LP fees SENIOR to loss coverage, and it reverted the whole
+// `SyncMaintenanceFee` on exactly the distressed markets that most need
+// cranking.
+//
+// Nothing enforced that. `9a6502ae` deleted
+// `v16_wrapper_maintenance_cranker_reward_reserves_outstanding_lp_fee_claim`
+// (which pinned the reservation) and added no replacement, so re-adding the
+// reservation would have passed the entire suite. This test is the missing
+// counterweight: it is the SAME fixture, INVERTED, and it fails the moment
+// anyone reintroduces the reservation.
+//
+// IF THIS TEST FAILS, do not "fix" it by making the claim senior. Read
+// `9a6502ae` first — reversing this is a product decision about who eats
+// losses, not a test bug.
+// =============================================================================
+
+#[test]
+fn v16_wrapper_lp_fee_claim_is_junior_to_bad_debt_coverage() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut payer_owner = signer();
+    let mut cranker_owner = signer();
+    let mut payer = portfolio_account();
+    let mut cranker = portfolio_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 5;
+            }
+        }),
+    );
+    init_portfolio(&mut payer_owner, &mut market, &mut payer);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker);
+    deposit(&mut payer_owner, &mut market, &mut payer, 100);
+    run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 4_000,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // Seed an outstanding LP fee claim. Direct write is the accepted boundary
+    // here (the production producer is `split_trade_fee`'s LP leg at the two
+    // trade-fee sites, which needs a full trading env).
+    //
+    // 100 is chosen so the claim CANNOT be satisfied from what remains: the
+    // crank leaves only 30 in insurance. If the LP claim were reserved, the
+    // engine's reserved-floor check would refuse the reward and the whole
+    // instruction would revert with EngineLockActive (Custom 21) — which is
+    // precisely what the reverted `d2f697fc` asserted here.
+    const LP_CLAIM: u128 = 100;
+    {
+        let (mut cfg, group) = state::read_market(&market.data).unwrap();
+        assert_eq!(group.insurance, 0, "no insurance before the first crank");
+        assert_eq!(
+            group.insurance_domain_budget_remaining_total, 0,
+            "no budgeted insurance either -- the ONLY thing that could reserve \
+             anything here is `additional_reserved`, so this test cannot pass \
+             for the wrong reason"
+        );
+        cfg.lp_fee_accrued_atoms = LP_CLAIM;
+        cfg.lp_fee_withdrawn_atoms = 0;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    // THE JUNIOR PROPERTY: the draw must SUCCEED despite the outstanding claim.
+    run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 10 },
+        &mut [&mut market, &mut payer, &mut cranker, &mut cranker_owner],
+    )
+    .expect(
+        "an outstanding LP fee claim must NOT block a draw against insurance -- \
+         LP yield is at-risk junior backing capital, not a senior claim. If this \
+         now fails with Custom(21) EngineLockActive, the reservation reverted in \
+         9a6502ae has been reintroduced at a \
+         credit_account_from_insurance_not_atomic call site.",
+    );
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    let payer_after = state::read_portfolio(&payer.data).unwrap();
+    let cranker_after = state::read_portfolio(&cranker.data).unwrap();
+
+    // The draw actually happened and paid out.
+    assert_eq!(payer_after.capital, 50, "charged 5/slot * 10 slots");
+    assert_eq!(cranker_after.capital, 20, "cranker takes 40% of the 50 charged");
+
+    // AND the claimable surplus is now BELOW the outstanding claim. This is the
+    // seniority statement itself: the claim was not protected, and what backs it
+    // was reduced. A senior claim would have been reserved out of this.
+    assert_eq!(
+        group_after.insurance, 30,
+        "the retained 30 stays in insurance (budgeted to asset 0's domains)"
+    );
+    let still_owed = cfg_after
+        .lp_fee_accrued_atoms
+        .saturating_sub(cfg_after.lp_fee_withdrawn_atoms);
+    assert_eq!(
+        still_owed, LP_CLAIM,
+        "the claim itself is untouched -- it is not written down, it is simply \
+         not senior"
+    );
+    assert!(
+        group_after.insurance < still_owed,
+        "JUNIOR: insurance ({}) must be allowed to fall below the outstanding LP \
+         claim ({}). If these were kept in lockstep the claim would be senior.",
+        group_after.insurance,
+        still_owed,
+    );
+}
