@@ -5812,6 +5812,12 @@ pub mod policy_v16 {
         None
     }
 
+    /// DEPRECATED (2026-07-19 fee-collection design): tolerance constant for
+    /// `fee_split_floor_ok`, which no longer has any live call sites. Retained
+    /// only so that function's existing Kani proofs and unit tests keep
+    /// compiling. See `fee_split_floor_ok`'s doc comment for the full
+    /// rationale.
+    ///
     /// Fee-split floor tolerance derivation for `fee_split_floor_ok` below
     /// (house requirement: on-chain enforcement of the launch wizard's
     /// non-protocol-remainder floors: creator at most 45%, LP at least 40%,
@@ -5916,9 +5922,18 @@ pub mod policy_v16 {
     /// frontend-side minimum-T guard in the wizard, out of scope here.
     pub const FEE_SPLIT_SHARE_TOLERANCE_FLAT: u128 = 5_001;
 
+    /// DEPRECATED (2026-07-19 fee-collection design): validated a two-rate
+    /// split (`T = trade_fee_base_bps + backing_fee_bps`) that no longer
+    /// exists. Superseded by `validate_fee_split`, which is exact rather than
+    /// tolerance-based and has no `backing_fee_bps == 0` skip path -- that
+    /// skip meant this check never actually ran on a live market, since
+    /// `backing_trade_fee_bps` is 0 on every deployed market. Retained so its
+    /// existing proofs and tests keep compiling; NO LIVE CALL SITES REMAIN.
+    /// The historical description below is preserved for those proofs.
+    ///
     /// Joint on-chain floor check for the launch wizard's fee-split
     /// invariant (creator <=45%, LP >=40%, insurance >=15% of `T =
-    /// trade_fee_base_bps + backing_fee_bps`), applied by both
+    /// trade_fee_base_bps + backing_fee_bps`), formerly applied by both
     /// `UpdateBackingFeePolicy` and `UpdateTradeFeePolicy`'s handlers.
     ///
     /// Skips entirely (returns `true`) when `backing_fee_bps == 0` --
@@ -12477,22 +12492,12 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        // Fee-split floor (house requirement) -- see
-        // `policy_v16::fee_split_floor_ok`'s doc comment for the integer
-        // inequalities + rounding-tolerance derivation, and for why this is
-        // NOT enforced in the load-time shape validators. Validated against
-        // the ALREADY-STORED `trade_fee_base_bps` (this handler never
-        // changes it, regardless of `asset_index`, since it's a single
-        // market-wide field); `UpdateTradeFeePolicy` is the symmetric setter
-        // that validates a new `trade_fee_base_bps` against the
-        // already-stored backing-fee state instead.
-        if !policy_v16::fee_split_floor_ok(
-            cfg.trade_fee_base_bps,
-            fee_bps as u64,
-            insurance_share_bps as u64,
-        ) {
-            return Err(PercolatorError::FeeSplitFloorViolation.into());
-        }
+        // NOTE: the former `fee_split_floor_ok` two-rate check was retired
+        // here (2026-07-19 fee-collection design). It validated a split of
+        // `T = trade_fee_base_bps + backing_fee_bps` that no longer exists;
+        // `validate_fee_split` (tag 86) now owns split validation. The shape
+        // checks above (`max_trading_fee_bps`, `MAX_DYNAMIC_TRADE_FEE_BPS`,
+        // the `fee_bps == 0 && insurance_share_bps != 0` guard) are unchanged.
         let long_side = domain % 2 == 0;
         let adjust_policy_count =
             |cfg: &mut WrapperConfigV16, old_fee: u16, new_fee: u16| -> ProgramResult {
@@ -12574,19 +12579,12 @@ pub mod processor {
         expect_signer(authority)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
-        let (mut cfg, asset0_insurance_authority, max_trading_fee_bps, configured_market_slots) = {
+        let (mut cfg, asset0_insurance_authority, max_trading_fee_bps) = {
             let market_data = market_ai.try_borrow_data()?;
             let (cfg, _, _, _, max_trading_fee_bps) =
                 state::read_market_trade_preflight(&market_data, 0)?;
             let profile0 = read_oracle_profile_for_asset(&market_data, &cfg, 0)?;
-            let (_, _, configured_market_slots, _) =
-                state::read_market_config_mode_and_capacity(&market_data)?;
-            (
-                cfg,
-                profile0.insurance_authority,
-                max_trading_fee_bps,
-                configured_market_slots,
-            )
+            (cfg, profile0.insurance_authority, max_trading_fee_bps)
         };
         expect_live_authority(&asset0_insurance_authority, authority.key)?;
         if trade_fee_base_bps > max_trading_fee_bps
@@ -12594,59 +12592,15 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        // Fee-split floor (house requirement) -- see
-        // `policy_v16::fee_split_floor_ok`'s doc comment for the integer
-        // inequalities + rounding-tolerance derivation, and for why this is
-        // NOT enforced in the load-time shape validators.
-        //
-        // SECURITY FIX W11 (closes the multi-asset bypass percolator-security
-        // BLOCKED in commit 0405ea23): `trade_fee_base_bps` is a SINGLE
-        // market-wide field (`cfg.trade_fee_base_bps`) -- it is a shared term
-        // of `T = trade_fee_base_bps + backing_fee_bps` for EVERY asset's
-        // long/short domains, not only asset 0's. The previous version of
-        // this handler validated the floor only against asset 0's
-        // cfg-mirrored domains; on a multi-asset market an already-configured
-        // higher `asset_index`'s stored split was never re-checked, so a
-        // caller could raise `trade_fee_base_bps` past the point where that
-        // OTHER asset's split falls below the floor -- especially easy when
-        // asset 0's own backing fee is left at 0 (which trivially skips
-        // `fee_split_floor_ok`), making the old two-domain check a total
-        // no-op. Fix: re-validate EVERY configured asset's stored long/short
-        // domain (asset_index in `0..configured_market_slots`) against the
-        // PROPOSED new `trade_fee_base_bps`, and reject the WHOLE instruction
-        // if ANY domain of ANY asset would fall outside the floor. Asset 0's
-        // domains are covered by this same loop (its `AssetOracleProfileV16`
-        // is kept mirror-identical to `cfg.backing_trade_fee_bps_{long,short}`
-        // by `handle_update_backing_fee_policy`'s asset_index==0 branch), so
-        // the former special-cased two-domain check is subsumed and removed.
-        //
-        // Cost: O(configured_market_slots) zero-copy `AssetOracleProfileV16`
-        // reads (no CPI, no heap Vec) instead of O(1). `UpdateTradeFeePolicy`
-        // is a low-frequency, privileged (asset-0-insurance-authority-gated)
-        // admin action, not a hot/permissionless path like
-        // SyncMaintenanceFee/CloseResolved (see
-        // `credit_maintenance_fee_to_active_market_budgets_view`'s FIX #113
-        // comment for why THOSE were made O(1)) -- growing `max_market_slots`
-        // enough to make this scan CU-expensive would, at worst, freeze this
-        // one admin lever for that market (trading/closing/resolving are
-        // unaffected), not brick the market itself.
-        {
-            let market_data = market_ai.try_borrow_data()?;
-            for asset_index in 0..configured_market_slots {
-                let profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
-                if !policy_v16::fee_split_floor_ok(
-                    trade_fee_base_bps,
-                    profile.backing_trade_fee_bps_long as u64,
-                    profile.backing_trade_fee_insurance_share_bps_long as u64,
-                ) || !policy_v16::fee_split_floor_ok(
-                    trade_fee_base_bps,
-                    profile.backing_trade_fee_bps_short as u64,
-                    profile.backing_trade_fee_insurance_share_bps_short as u64,
-                ) {
-                    return Err(PercolatorError::FeeSplitFloorViolation.into());
-                }
-            }
-        }
+        // NOTE: the former `fee_split_floor_ok` scan over every configured
+        // asset's stored long/short domains was retired here (2026-07-19
+        // fee-collection design). It validated a split of
+        // `T = trade_fee_base_bps + backing_fee_bps` that no longer exists;
+        // `validate_fee_split` (tag 86) now owns split validation. The shape
+        // checks above (`max_trading_fee_bps`, `MAX_DYNAMIC_TRADE_FEE_BPS`)
+        // are unchanged. Removing the scan also makes this handler O(1)
+        // again, retiring the W11 multi-asset-bypass concern along with the
+        // check it guarded.
         cfg.trade_fee_base_bps = trade_fee_base_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }

@@ -18452,114 +18452,90 @@ fn v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority() {
 }
 
 // =============================================================================
-// Fee-split floor enforcement (policy_v16::fee_split_floor_ok), end-to-end
-// through the real `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy`
-// handlers -- not just the pure-function unit tests in v16_program.rs.
-// Covers the T-scaling fix: the flat `FEE_SPLIT_SHARE_TOLERANCE = 10_000`
-// bound made the insurance floor a structural no-op for backing_fee_bps<=6
-// and the LP floor a no-op for backing_fee_bps<=2, independent of how
-// egregious the actual split was, because it bounded `backing_fee_bps`'s
-// rounding-error contribution by its global 10_000 wire-width cap instead
-// of by the tight, structural `backing_fee_bps <= T`. The fix scales the
-// tolerance with T (`ceil(T/2) + FEE_SPLIT_SHARE_TOLERANCE_FLAT`), shrinking
-// the vacuous window to backing_fee_bps in {1,2,3} for insurance and
-// backing_fee_bps==1 for LP -- a proven-irreducible residual (see
-// `FEE_SPLIT_SHARE_TOLERANCE_FLAT`'s doc comment), not a leftover bug.
+// Fee-split policy setters, end-to-end through the real
+// `UpdateBackingFeePolicy` / `UpdateTradeFeePolicy` handlers.
+//
+// The `fee_split_floor_ok` two-rate floor these tests originally pinned was
+// RETIRED on 2026-07-19: it validated a split of
+// `T = trade_fee_base_bps + backing_fee_bps` that no longer exists, and is
+// superseded by `validate_fee_split` (tag 86), which is exact rather than
+// tolerance-based. The first two tests below are the inverted regression
+// guards for that removal; the third still pins that genuine wizard splits
+// are accepted, which is unchanged by the retirement.
 // =============================================================================
 
 #[test]
-fn v16_wrapper_fee_split_floor_enforced_at_wizard_default_t20() {
-    // T=20bps (the wizard's default trading-fee dial value), tfb=0 so the
-    // entire T is backing fee: creator%=0 trivially clears the 45% cap, so
-    // this isolates the insurance/LP floors specifically.
+fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor() {
+    // RETIRED (2026-07-19 fee-collection design): this replaces
+    // `..._fee_split_floor_enforced_at_wizard_default_t20` and
+    // `..._fee_split_floor_low_t_vacuity_shrinks_to_proven_residual`, both of
+    // which pinned `fee_split_floor_ok` enforcement in this handler. That
+    // check validated a split of `T = trade_fee_base_bps + backing_fee_bps`
+    // that no longer exists and is superseded by `validate_fee_split`.
+    //
+    // Inverted and kept as the regression guard: the two splits the old
+    // handler rejected at T=20 (0% insurance and 0% LP) must now be ACCEPTED
+    // and persist. Re-introducing the floor here fails this test.
     let mut admin = signer();
     let mut market = market_account();
     init_market(&mut admin, &mut market);
 
-    // 0% insurance (isb=0) at T=20 must be REJECTED -- the old flat-10_000
-    // tolerance was already non-vacuous here (its vacuous window was
-    // backing_fee_bps<=6), so this also guards against a regression on the
-    // part of the check that was already correct.
-    let rejected_zero_insurance = run_ix(
+    // 0% insurance at T=20 -- formerly rejected against the 15% floor.
+    run_ix(
         Instruction::UpdateBackingFeePolicy {
             domain: 1,
             fee_bps: 20,
             insurance_share_bps: 0,
         },
         &mut [&mut admin, &mut market],
+    )
+    .expect("0% insurance at T=20 must no longer be rejected");
+    let (cfg, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg.backing_trade_fee_bps_short, 20,
+        "the accepted split must actually persist"
     );
-    assert!(
-        rejected_zero_insurance.is_err(),
-        "0% insurance at T=20 must be rejected (floor=15%)"
+    assert_eq!(
+        cfg.backing_trade_fee_policy_count, 1,
+        "and must be counted as a configured policy"
     );
 
-    // 0% LP (isb=10_000) at T=20 must also be REJECTED.
-    let rejected_zero_lp = run_ix(
+    // 0% LP (isb=10_000) at T=20 -- formerly rejected against the 40% floor.
+    run_ix(
         Instruction::UpdateBackingFeePolicy {
             domain: 1,
             fee_bps: 20,
             insurance_share_bps: 10_000,
         },
         &mut [&mut admin, &mut market],
-    );
-    assert!(
-        rejected_zero_lp.is_err(),
-        "0% LP at T=20 must be rejected (floor=40%)"
-    );
-
-    // Confirm the market was left untouched by both rejected attempts (no
-    // policy_count bump, no stored split) -- domain 1 was never configured.
+    )
+    .expect("0% LP at T=20 must no longer be rejected");
     let (cfg, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg.backing_trade_fee_policy_count, 0);
-    assert_eq!(cfg.backing_trade_fee_bps_short, 0);
-}
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 10_000);
 
-#[test]
-fn v16_wrapper_fee_split_floor_low_t_vacuity_shrinks_to_proven_residual() {
-    // Insurance floor: old flat tolerance was a structural no-op through
-    // backing_fee_bps==6; the T-scaled fix narrows that to {1,2,3}. Prove
-    // both ends: T=3 still (documented, irreducible) accepts 0% insurance,
-    // and T=4 -- previously also vacuous under the bug -- now REJECTS it.
-    for (t, expect_ok) in [(3u16, true), (4u16, false)] {
-        let mut admin = signer();
-        let mut market = market_account();
-        init_market(&mut admin, &mut market);
-        let result = run_ix(
-            Instruction::UpdateBackingFeePolicy {
-                domain: 1,
-                fee_bps: t,
-                insurance_share_bps: 0,
-            },
-            &mut [&mut admin, &mut market],
-        );
-        assert_eq!(
-            result.is_ok(),
-            expect_ok,
-            "T={t} bps, 0% insurance: expected is_ok()={expect_ok}, got {result:?}"
-        );
-    }
+    // The SURVIVING shape checks are untouched: an out-of-range fee and the
+    // `fee_bps == 0 && insurance_share_bps != 0` guard must still reject.
+    let before = market.data.clone();
+    let result = run_ix(
+        Instruction::UpdateBackingFeePolicy {
+            domain: 1,
+            fee_bps: 10_001,
+            insurance_share_bps: 5_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(result, &market, &before);
 
-    // LP floor: old flat tolerance was a no-op through backing_fee_bps==2;
-    // the fix narrows that to {1}. T=1 still (documented) accepts 0% LP,
-    // and T=2 -- previously vacuous under the bug -- now REJECTS it.
-    for (t, expect_ok) in [(1u16, true), (2u16, false)] {
-        let mut admin = signer();
-        let mut market = market_account();
-        init_market(&mut admin, &mut market);
-        let result = run_ix(
-            Instruction::UpdateBackingFeePolicy {
-                domain: 1,
-                fee_bps: t,
-                insurance_share_bps: 10_000,
-            },
-            &mut [&mut admin, &mut market],
-        );
-        assert_eq!(
-            result.is_ok(),
-            expect_ok,
-            "T={t} bps, 0% LP: expected is_ok()={expect_ok}, got {result:?}"
-        );
-    }
+    let before = market.data.clone();
+    let result = run_ix(
+        Instruction::UpdateBackingFeePolicy {
+            domain: 1,
+            fee_bps: 0,
+            insurance_share_bps: 5_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(result, &market, &before);
 }
 
 #[test]
@@ -18629,22 +18605,22 @@ fn v16_wrapper_fee_split_floor_accepts_valid_wizard_splits_via_real_handlers() {
 }
 
 #[test]
-fn v16_wrapper_fee_split_floor_update_trade_fee_policy_checks_every_asset_not_just_asset0() {
-    // W11: UpdateTradeFeePolicy mutates trade_fee_base_bps, a SINGLE
-    // market-wide field that is a shared term of T = trade_fee_base_bps +
-    // backing_fee_bps for EVERY asset's domains, not only asset 0's. Before
-    // the fix, the handler validated the floor only against asset 0's
-    // cfg-mirrored domains -- with asset 0's own backing fee left
-    // unconfigured (bf==0, which trivially skips fee_split_floor_ok), a
-    // caller could raise trade_fee_base_bps to ANY value while a real,
-    // already-configured higher-index asset's stored split silently falls
-    // below the floor.
+fn v16_wrapper_update_trade_fee_policy_no_longer_enforces_the_two_rate_floor() {
+    // RETIRED (2026-07-19 fee-collection design): this used to be
+    // `..._fee_split_floor_update_trade_fee_policy_checks_every_asset_not_just_asset0`,
+    // pinning the W11 multi-asset floor scan. `fee_split_floor_ok` validated
+    // a split of `T = trade_fee_base_bps + backing_fee_bps` that no longer
+    // exists; `validate_fee_split` (tag 86) now owns split validation. The
+    // scan is gone, so the W11 bypass it guarded is moot.
+    //
+    // This test is kept, inverted, as the regression guard for that removal:
+    // the EXACT input the old handler rejected (creator% at double the 45%
+    // cap) must now be ACCEPTED and must actually persist. Re-introducing
+    // any floor check in this handler fails here.
     let mut admin = signer();
     let mut market = market_account_with_capacity(2);
     init_market(&mut admin, &mut market);
 
-    // Activate asset 1 (admin doubles as marketauth + all three domain
-    // authorities here, so this needs no fee-payment accounts).
     update_asset_lifecycle(
         &mut admin,
         &mut market,
@@ -18655,10 +18631,7 @@ fn v16_wrapper_fee_split_floor_update_trade_fee_policy_checks_every_asset_not_ju
     )
     .unwrap();
 
-    // Configure asset 1's LONG backing-fee domain (domain=2) while
-    // trade_fee_base_bps is still 0 (the InitMarket default): bf=1000bps,
-    // isb=2000bps -> insurance%=20%, LP%=80%, creator%=0% -- comfortably
-    // within all three floors, so this legitimately succeeds.
+    // Asset 1 LONG domain: bf=1000bps, isb=2000bps.
     run_ix(
         Instruction::UpdateBackingFeePolicy {
             domain: 2,
@@ -18667,40 +18640,33 @@ fn v16_wrapper_fee_split_floor_update_trade_fee_policy_checks_every_asset_not_ju
         },
         &mut [&mut admin, &mut market],
     )
-    .expect("asset 1's 10%-backing/20%-insurance-share split must be accepted at tfb=0");
+    .expect("a well-shaped backing-fee split must still be accepted");
 
-    let (cfg_before, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg_before.backing_trade_fee_bps_long, 0);
-    assert_eq!(cfg_before.backing_trade_fee_bps_short, 0);
-    assert_eq!(cfg_before.trade_fee_base_bps, 0);
-
-    // Raise trade_fee_base_bps to 9000bps. Combined with asset 1's untouched
-    // bf=1000, T=10000 for asset 1's domain and creator%=90%bps -- more than
-    // double the 45% cap, decisively (creator_lhs=900_000 vs
-    // creator_rhs=45*10000+50=450_050, not a rounding-boundary case). Asset
-    // 0's domains are unaffected (bf==0 skips), so the pre-fix code sees
-    // nothing to reject.
-    let before = market.data.clone();
-    let result = run_ix(
+    // tfb=9000 against asset 1's untouched bf=1000 gives T=10000 and
+    // creator%=90% -- double the old 45% cap, and decisively outside any
+    // rounding boundary. The old handler rejected this; it must now succeed.
+    run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 9_000,
         },
         &mut [&mut admin, &mut market],
+    )
+    .expect("the two-rate floor is retired: this must no longer be rejected");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.trade_fee_base_bps, 9_000,
+        "the accepted value must actually persist, not be silently dropped"
     );
-    assert_err_and_market_unchanged(result, &market, &before);
 
-    // Non-vacuity control: a trade_fee_base_bps that keeps asset 1 within
-    // the floor (tfb=100 -> T=1100, creator%~9.09%, insurance%~18.18%,
-    // LP%~72.7%, all comfortably clear of floor+tolerance by hand
-    // computation) is still ACCEPTED -- the fix does not degenerate into
-    // "always reject".
-    run_ix(
+    // The SURVIVING shape check is untouched: MAX_DYNAMIC_TRADE_FEE_BPS /
+    // max_trading_fee_bps still reject an out-of-range rate. Retiring the
+    // floor must not have opened the range gate.
+    let before = market.data.clone();
+    let result = run_ix(
         Instruction::UpdateTradeFeePolicy {
-            trade_fee_base_bps: 100,
+            trade_fee_base_bps: 10_001,
         },
         &mut [&mut admin, &mut market],
-    )
-    .expect("a trade_fee_base_bps that keeps every configured asset within the floor must still be accepted");
-    let (cfg_after, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg_after.trade_fee_base_bps, 100);
+    );
+    assert_err_and_market_unchanged(result, &market, &before);
 }
