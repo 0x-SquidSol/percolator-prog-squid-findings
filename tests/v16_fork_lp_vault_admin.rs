@@ -296,10 +296,24 @@ fn seed_bucket_earnings(env: &mut Env, earnings: u128) {
 /// boundary (`state::read_market` / `state::write_market`) — the production
 /// producer is `split_trade_fee`'s LP leg at the two trade fee sites, which
 /// needs a full trading env this file does not build.
+///
+/// TASK 7 COMPLETION: the counter alone is no longer a faithful fixture. In
+/// production the engine credits the WHOLE trade fee into `header.insurance` at
+/// constant vault (`c_tot -= charged; insurance += charged`, engine
+/// v16.rs:13798) and `split_trade_fee` merely EARMARKS the LP leg in
+/// `cfg.lp_fee_accrued_atoms`. The crank now reclassifies those atoms out of
+/// insurance into LP backing and clamps to the engine-available surplus, so a
+/// counter with no insurance behind it correctly clamps to 0. This env has no
+/// traders and therefore no `c_tot` to drain, so the atoms are added to
+/// `insurance` AND `vault` instead — same accepted boundary, and it preserves
+/// the property that actually matters: the fee atoms sit inside
+/// `header.insurance`, inside `header.vault`, before the crank.
 fn seed_lp_fee_accrued(env: &mut Env, atoms: u128) {
     let mut acct = env.svm.get_account(&env.market).expect("market");
-    let (mut cfg, group) = state::read_market(&acct.data).expect("read market");
+    let (mut cfg, mut group) = state::read_market(&acct.data).expect("read market");
     cfg.lp_fee_accrued_atoms += atoms;
+    group.insurance += atoms;
+    group.vault += atoms;
     state::write_market(&mut acct.data, &cfg, &group).expect("write market");
     env.svm.set_account(env.market, acct).unwrap();
 }

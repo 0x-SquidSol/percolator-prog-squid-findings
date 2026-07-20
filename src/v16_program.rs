@@ -14290,8 +14290,51 @@ pub mod processor {
     ///
     /// Permissionless: syncs the backing-domain ledger from the live bucket,
     /// then drains the wrapper-side LP fee counter
-    /// (`cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms`) into the
-    /// vault's fee accumulator.
+    /// (`cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms`) into the LP
+    /// vault as REAL, REDEEMABLE BACKING PRINCIPAL.
+    ///
+    /// PAYS LPs (Task 7 completion, supersedes `d6b4433c`). The first repoint
+    /// drained the LP counter into `registry.fee_distribution_total_atoms` — a
+    /// statistic that is written and never read — so it moved counters and paid
+    /// nobody. LP NAV is
+    /// `lp_vault_nav_atoms(total_principal, total_earnings, ...)` (engine
+    /// `v16.rs:16473`), so the only wrapper-reachable way to raise an LP's
+    /// redeemable claim is to raise `ledger.total_principal_atoms` and back it
+    /// with matching `fresh_unliened_backing_num`. That is what this now does.
+    ///
+    /// THE MECHANISM (Option 1 — zero engine divergence). The LP fee atoms are
+    /// already physically inside `header.vault`: the engine credits the whole
+    /// trade fee to `header.insurance` at constant vault
+    /// (`c_tot -= charged; insurance += charged`, engine `v16.rs:13798`), and
+    /// `split_trade_fee` only *earmarks* the LP leg in a wrapper counter. So the
+    /// atoms need reclassifying from senior insurance into LP backing, not
+    /// moving. `withdraw_insurance_surplus_not_atomic` (engine `v16.rs:7942`)
+    /// does exactly `insurance -= a; vault -= a` and moves NO tokens — the
+    /// wrapper separately decides whether to CPI a transfer. Restoring
+    /// `header.vault` afterwards (precedent: `:13433`) leaves the tokens in
+    /// place, and `add_fresh_counterparty_backing_view` (precedent: `:13419`,
+    /// `:10421`) hands them to the LP domain:
+    ///
+    ///   `C + (I−a) + E + (FB+a) = S` against an unchanged `V`
+    ///
+    /// — byte-identical senior total to the starting state, so `validate_shape`
+    /// (and `validate_header_aggregate_totals`) holds with the same slack it had
+    /// before. `withdraw_insurance_surplus_not_atomic`'s own internal
+    /// `validate_shape` also passes at the intermediate `(V−a, I−a)` point,
+    /// because both sides of the inequality drop by exactly `a`.
+    ///
+    /// Credits `ledger.total_principal_atoms`, NOT `total_deposited_atoms`: no
+    /// LP shares are minted, so the same share count now claims more atoms —
+    /// which is precisely how the yield reaches existing LPs. `earnings_portion`
+    /// therefore stays 0 in `handle_execute_redemption`, which *disarms* rather
+    /// than arms the `:13889` gate defect (that gate tests `earnings_portion`
+    /// but guards a `gross_consumed` subtraction; both are 0 on this path).
+    ///
+    /// ACCEPTED TRADE-OFF (user decision): LP fee yield lands as at-risk backing
+    /// capital, not a senior earnings claim, so it can be impaired by backing
+    /// losses between crank and redemption. The alternative — a ~15-line engine
+    /// primitive making it senior — was rejected to preserve zero upstream
+    /// divergence.
     ///
     /// FEE-SPLIT REPOINT (2026-07-19 design, Task 7). This crank used to key
     /// off `bucket.utilization_fee_earnings` (via the synced ledger's
@@ -14316,6 +14359,17 @@ pub mod processor {
     /// counter, and would force `lp_fee_withdrawn_atoms` to advance by more
     /// than was actually credited. The whole of `available` is credited and
     /// exactly the whole of `available` is marked withdrawn.
+    ///
+    /// MANDATORY CLAMP. The protocol leg (tag 83), this LP leg, and the stake
+    /// leg now ALL draw from one pool: `insurance − source_insurance_credit_
+    /// reserved_total_atoms − insurance_domain_budget_remaining_total`. Nothing
+    /// checks that the three wrapper-side counters sum within it, so whichever
+    /// leg cranks last would get `EngineLockActive` out of the engine unless
+    /// each clamps its own claim first. This mirrors the clamp in
+    /// `handle_withdraw_protocol_fee` (`:10405-10411`) and then advances
+    /// `lp_fee_withdrawn_atoms` by the CLAMPED amount actually applied, never
+    /// the requested amount — so a partial fill leaves the remainder claimable
+    /// on the next crank instead of marking it paid without paying it.
     #[inline(never)]
     fn handle_lp_vault_crank_fees<'a>(
         program_id: &Pubkey,
@@ -14347,7 +14401,7 @@ pub mod processor {
         // and compute/consume the wrapper-side LP fee claim.
         let (total_earnings, available, cfg_after) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (mut cfg, group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             // PROG-1: verify the vault is still the backing authority for this domain.
             // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
             // without the check here, a fee crank after an asset_admin authority rotation
@@ -14368,24 +14422,68 @@ pub mod processor {
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
             let te = ledger.total_earnings_atoms;
-            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
 
             // Claim capacity. Monotonic invariant:
             // lp_fee_withdrawn_atoms <= lp_fee_accrued_atoms, always — so the
             // subtraction can only underflow on a corrupt config, which fails
-            // closed. Mirrors `protocol_fee_withdraw_amount`'s bound.
-            let available = cfg
+            // closed.
+            let claim_capacity = cfg
                 .lp_fee_accrued_atoms
                 .checked_sub(cfg.lp_fee_withdrawn_atoms)
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            // MANDATORY CLAMP — mirrors handle_withdraw_protocol_fee:10405-10411
+            // verbatim. Three legs (protocol / LP / stake) share this one surplus
+            // pool with no cross-leg accounting, so an unclamped claim makes the
+            // last leg to crank fail out of the engine with EngineLockActive.
+            // `.min(vault)` mirrors `protocol_fee_withdraw_amount`'s second bound:
+            // `withdraw_insurance_surplus_delta` rejects `amount > vault` too, and
+            // this call must succeed at the intermediate (V−a) point even though
+            // we restore V immediately after.
+            let engine_available = group
+                .header
+                .insurance
+                .get()
+                .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+            let available = claim_capacity
+                .min(engine_available)
+                .min(group.header.vault.get());
+            // Zero case: nothing accrued, or the surplus pool is currently dry
+            // (another leg got there first). Same error either way — the claim
+            // is NOT marked withdrawn, so it stays fully claimable next crank.
             if available == 0 {
                 return Err(PercolatorError::LpVaultNoFeesToCrank.into());
             }
-            // Mark withdrawn HERE, by exactly `available` — the same value the
-            // registry credit below adds, with no clamp, no rounding and no
-            // second split between the two. There is no partial-fill path: the
-            // credit is a single `checked_add` on a u128 counter that either
-            // succeeds for the full amount or aborts the whole instruction.
+
+            // ── Reclassify `available` atoms: senior insurance → LP backing. ──
+            // No token moves. See the MECHANISM block on this handler.
+            let v_before = group.header.vault.get();
+            group
+                .withdraw_insurance_surplus_not_atomic(available) // I−a, V−a
+                .map_err(map_v16_error)?;
+            group.header.vault = percolator::V16PodU128::new(v_before); // restore V
+            add_fresh_counterparty_backing_view(
+                &mut group,
+                domain,
+                available
+                    .checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?, // FB += a·BOUND_SCALE
+                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            )?;
+            // The LP-visible half: same shares, more principal ⇒ higher NAV ⇒ a
+            // strictly larger redeemable claim for every existing LP.
+            ledger.total_principal_atoms = ledger
+                .total_principal_atoms
+                .checked_add(available)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            // Conservation: C + (I−a) + E + (FB+a) = S against an unchanged V.
+            group.validate_shape().map_err(map_v16_error)?;
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+
+            // Mark withdrawn by exactly the CLAMPED `available` that was just
+            // applied — never `claim_capacity`. A clamped (partial) crank leaves
+            // `claim_capacity - available` claimable on the next crank rather
+            // than marking it paid without paying it.
             cfg.lp_fee_withdrawn_atoms = cfg
                 .lp_fee_withdrawn_atoms
                 .checked_add(available)

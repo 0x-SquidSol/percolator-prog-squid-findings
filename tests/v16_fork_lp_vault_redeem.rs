@@ -920,6 +920,257 @@ fn vault_balance(env: &Env) -> u64 {
     tok(&env.svm, env.vault_token)
 }
 
+// ── Task 7: LpVaultCrankFees (tag 78) must produce LP-VISIBLE VALUE ──────────
+//
+// The first repoint (d6b4433c) drained `cfg.lp_fee_accrued_atoms` into
+// `registry.fee_distribution_total_atoms` — a counter that is written and never
+// read — so it passed its tests while paying nobody. These tests assert on the
+// ACTUAL redemption payout, not on a counter.
+
+/// Earmark LP fee atoms on the wrapper counter WITHOUT funding the engine-side
+/// insurance surplus behind them. Models the shared-pool race: the protocol
+/// (tag 83) or stake leg already drained the surplus, so this claim must clamp.
+fn credit_lp_fee_counter(env: &mut Env, atoms: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (mut cfg, group) = state::read_market(&acct.data).expect("read market");
+    cfg.lp_fee_accrued_atoms += atoms;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+/// Put `atoms` of real, unreserved surplus into `header.insurance` (and the
+/// vault + the real SPL vault_token behind it, so a later redemption transfer
+/// can settle). In production the engine does this at constant vault via
+/// `c_tot -= charged; insurance += charged` (engine v16.rs:13798); this env has
+/// no traders and so no `c_tot` to drain, so `vault` is credited instead —
+/// the same accepted direct-write boundary `seed_earnings` uses. What matters
+/// for the crank is identical either way: the atoms sit in `header.insurance`,
+/// inside `header.vault`, unreserved and unbudgeted.
+fn fund_insurance(env: &mut Env, atoms: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    group.insurance += atoms;
+    group.vault += atoms;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+
+    let atoms_u64 = u64::try_from(atoms).expect("atoms fits u64");
+    let mut tok_acct = env.svm.get_account(&env.vault_token).expect("vault_token");
+    let mut tok_data = TokenAccount::unpack(&tok_acct.data).expect("unpack vault token");
+    tok_data.amount = tok_data.amount.checked_add(atoms_u64).expect("no overflow");
+    let mut new_data = vec![0u8; TokenAccount::LEN];
+    TokenAccount::pack(tok_data, &mut new_data).expect("pack");
+    tok_acct.data = new_data;
+    env.svm.set_account(env.vault_token, tok_acct).unwrap();
+}
+
+/// A faithful LP fee accrual: the counter AND the insurance surplus behind it.
+fn seed_lp_fee_accrued(env: &mut Env, atoms: u128) {
+    credit_lp_fee_counter(env, atoms);
+    fund_insurance(env, atoms);
+}
+
+fn crank_fees(env: &mut Env) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::LpVaultCrankFees,
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(env.registry, false),
+                AccountMeta::new(env.ledger, false),
+            ],
+        )],
+        &[],
+    )
+}
+
+fn lp_fee_counters(env: &Env) -> (u128, u128) {
+    let (cfg, _) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    (cfg.lp_fee_accrued_atoms, cfg.lp_fee_withdrawn_atoms)
+}
+
+/// `(header.vault, header.insurance)`.
+fn vault_and_insurance(env: &Env) -> (u128, u128) {
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    (group.vault, group.insurance)
+}
+
+/// HEADLINE (Task 7): a tag-78 crank must make an LP's REDEEMABLE CLAIM strictly
+/// larger — not merely move a counter.
+///
+/// Control and treatment are byte-identical vaults with byte-identical accrued
+/// LP fees; the only difference is whether the crank ran. The claim is measured
+/// through the real `RequestRedeemLpShares` → `ExecuteRedemption` path and read
+/// off the redeemer's SPL destination account, so nothing about this assertion
+/// can be satisfied by bookkeeping that pays nobody.
+#[test]
+fn crank_fees_raises_lp_redeemable_claim() {
+    const LP_FEES: u128 = 250_000;
+
+    // ── Control: accrued LP fees present, crank NEVER run. ──
+    let mut ctl = setup_vault(0);
+    let dc = new_depositor(&mut ctl, DEPOSIT);
+    seed_lp_fee_accrued(&mut ctl, LP_FEES);
+    request(&mut ctl, &dc, MINTED).expect("control request");
+    ctl.svm.expire_blockhash();
+    execute(&mut ctl, &dc).expect("control execute");
+    let payout_control = tok(&ctl.svm, dc.dest);
+    assert_eq!(
+        payout_control, MINTED as u64,
+        "control: uncranked LP fees are invisible to redemption — payout is bare principal"
+    );
+
+    // ── Treatment: identical, but crank tag 78 before redeeming. ──
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    seed_lp_fee_accrued(&mut env, LP_FEES);
+
+    let principal_before = ledger(&env).total_principal_atoms;
+    let (vault_before, insurance_before) = vault_and_insurance(&env);
+    let (accrued_before, withdrawn_before) = lp_fee_counters(&env);
+    assert_eq!(withdrawn_before, 0, "nothing withdrawn before the first crank");
+
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("crank with backed, accrued LP fees must succeed");
+
+    let principal_after = ledger(&env).total_principal_atoms;
+    let (vault_after, insurance_after) = vault_and_insurance(&env);
+    let (accrued_after, withdrawn_after) = lp_fee_counters(&env);
+
+    // ── CONSERVATION. `withdraw_insurance_surplus_not_atomic` does I−a AND V−a;
+    //    the handler restores V so no tokens move and the senior sum
+    //    C + (I−a) + E + (FB+a) is byte-identical to C + I + E + FB. ──
+    assert_eq!(
+        vault_after, vault_before,
+        "header.vault MUST be unchanged across the crank — the crank moves no tokens"
+    );
+    assert_eq!(
+        vault_balance(&env),
+        vault_after as u64,
+        "the logical vault still matches the real SPL vault_token balance"
+    );
+    assert_eq!(
+        insurance_before - insurance_after,
+        LP_FEES,
+        "header.insurance must fall by exactly the cranked amount (reclassified, not spent)"
+    );
+    // validate_shape(): the handler calls it after the reclassification and
+    // propagates failure, so a SUCCESSFUL crank is itself a passing
+    // validate_shape. The successful ExecuteRedemption below re-validates the
+    // post-crank state through an entirely separate code path.
+
+    // ── The counters, including the invariant. ──
+    assert_eq!(principal_after - principal_before, LP_FEES,
+        "ledger.total_principal_atoms must rise by exactly the cranked amount");
+    assert_eq!(accrued_after, accrued_before, "accrued must not move on a crank");
+    assert_eq!(withdrawn_after - withdrawn_before, LP_FEES,
+        "withdrawn advances by exactly the amount applied");
+    assert!(withdrawn_after <= accrued_after, "invariant: withdrawn <= accrued");
+
+    // ── LP-VISIBLE VALUE: the SAME shares now redeem for strictly more. ──
+    request(&mut env, &d, MINTED).expect("treatment request");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("treatment execute");
+    let payout_treatment = tok(&env.svm, d.dest);
+
+    assert!(
+        payout_treatment > payout_control,
+        "the crank must make the SAME shares redeem for strictly MORE: \
+         control={payout_control} treatment={payout_treatment}"
+    );
+    // Exact: NAV rose from DEPOSIT to DEPOSIT+LP_FEES against an unchanged share
+    // count, so the redeemer's pro-rata slice of the fees is
+    // floor(MINTED * LP_FEES / DEPOSIT). The remainder is the
+    // LP_VAULT_MINIMUM_LIQUIDITY dead shares' slice, stranded by design (N7).
+    let expected_treatment = MINTED * (DEPOSIT + LP_FEES) / DEPOSIT;
+    assert_eq!(
+        payout_treatment, expected_treatment as u64,
+        "redeemer receives principal + its pro-rata slice of the cranked LP fees"
+    );
+    assert_eq!(
+        payout_treatment - payout_control,
+        (MINTED * LP_FEES / DEPOSIT) as u64,
+        "the ENTIRE payout delta is the redeemer's pro-rata slice of the LP fees"
+    );
+}
+
+/// MANDATORY CLAMP (Task 7). The protocol / LP / stake legs share ONE surplus
+/// pool with no cross-leg accounting. An unclamped LP claim would fail out of
+/// the engine with EngineLockActive whenever another leg got there first. The
+/// clamp must instead fill partially AND leave the remainder claimable — the
+/// opposite mistake (marking the full claim withdrawn) silently burns LP yield.
+#[test]
+fn crank_fees_clamps_to_engine_surplus_and_leaves_remainder_claimable() {
+    const BACKED: u128 = 100_000;
+    const UNBACKED: u128 = 400_000;
+
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    // 100_000 of real, backed accrual...
+    seed_lp_fee_accrued(&mut env, BACKED);
+    // ...plus 400_000 earmarked on the counter with NO insurance behind it.
+    credit_lp_fee_counter(&mut env, UNBACKED);
+
+    let principal_before = ledger(&env).total_principal_atoms;
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("a clamped crank must still apply the available part");
+
+    // Only the backed part moved.
+    assert_eq!(
+        ledger(&env).total_principal_atoms - principal_before,
+        BACKED,
+        "only the engine-available surplus is applied"
+    );
+    let (accrued, withdrawn) = lp_fee_counters(&env);
+    assert_eq!(accrued, BACKED + UNBACKED, "accrued is untouched by the clamp");
+    assert_eq!(
+        withdrawn, BACKED,
+        "withdrawn advances by the CLAMPED amount actually applied, NOT the requested claim"
+    );
+    assert!(withdrawn <= accrued, "invariant: withdrawn <= accrued");
+
+    // A re-crank with the pool still dry rejects — and marks nothing.
+    env.svm.expire_blockhash();
+    let dry = crank_fees(&mut env);
+    let err = dry.expect_err("re-crank against a dry surplus pool must reject");
+    assert!(
+        err.contains("Custom(38)"),
+        "a clamped-to-zero crank returns LpVaultNoFeesToCrank = Custom(38), got: {err}"
+    );
+    assert_eq!(
+        lp_fee_counters(&env).1,
+        BACKED,
+        "a rejected crank must not advance withdrawn"
+    );
+
+    // THE POINT: the remainder is still claimable once the pool refills.
+    fund_insurance(&mut env, UNBACKED);
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("the clamped remainder must still be claimable");
+    assert_eq!(
+        ledger(&env).total_principal_atoms - principal_before,
+        BACKED + UNBACKED,
+        "the full claim eventually reaches the LP ledger across two cranks"
+    );
+    assert_eq!(lp_fee_counters(&env), (BACKED + UNBACKED, BACKED + UNBACKED), "fully drained");
+
+    // And it is real, redeemable value — not a counter.
+    request(&mut env, &d, MINTED).expect("request");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("execute");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        (MINTED * (DEPOSIT + BACKED + UNBACKED) / DEPOSIT) as u64,
+        "both cranked tranches are redeemable"
+    );
+}
+
 fn set_c_tot_for_test(env: &mut Env, c_tot: u128) {
     let mut acct = env.svm.get_account(&env.market).expect("market");
     let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
