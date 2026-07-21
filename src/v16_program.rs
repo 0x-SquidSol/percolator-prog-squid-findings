@@ -15027,7 +15027,8 @@ pub mod processor {
     /// than was actually credited. The whole of `available` is credited and
     /// exactly the whole of `available` is marked withdrawn.
     ///
-    /// MANDATORY CLAMP. The protocol leg (tag 83), this LP leg, and the stake
+    /// MANDATORY CLAMP. The protocol leg (tag 84 `WithdrawProtocolFee` — NOT
+    /// tag 83, which is `InitMatcherCtx`), this LP leg, and the stake
     /// leg now ALL draw from one pool: `insurance − source_insurance_credit_
     /// reserved_total_atoms − insurance_domain_budget_remaining_total`. Nothing
     /// checks that the three wrapper-side counters sum within it, so whichever
