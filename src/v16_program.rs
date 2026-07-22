@@ -503,6 +503,24 @@ pub mod error {
         /// mainnet deployment yet (see `constants::STAKE_PROGRAM_ID`). Appended
         /// at the tail so no existing ordinal moves.
         StakeProgramNotPinned, // Custom(60)
+        // ── Program bug fixes (2026-07-22) ──────────────────────────────────
+        // Appended after StakeProgramNotPinned (ordinal 60). Do NOT reorder.
+        /// `UpdateAssetLifecycle(ACTIVATE)` named an asset slot that is BELOW
+        /// `max_market_slots` and is already configured and live (lifecycle
+        /// Active / DrainOnly / Recovery). Only two activations are legal:
+        /// APPEND at `asset_index == max_market_slots`, or RE-ACTIVATE a slot
+        /// whose lifecycle is `Retired`. Anything else is a no-op request
+        /// against a working slot.
+        ///
+        /// HISTORY: this previously surfaced as `EngineLockActive` (Custom 21)
+        /// — raised either by this wrapper's reuse branch or by the engine's
+        /// `activate_empty_market_slot_not_atomic` lifecycle match arm — which
+        /// reads as "the market/asset is locked" and gave a caller no hint that
+        /// the slot is simply *already in service*. `InitMarket` pre-configures
+        /// slots `0..max_portfolio_assets`, so every one of them hits this on a
+        /// market created with `max_portfolio_assets > 1`.
+        /// SDK agent: add `AssetSlotAlreadyConfigured = 61` to the client error map.
+        AssetSlotAlreadyConfigured, // Custom(61)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2178,6 +2196,21 @@ pub mod state {
             )
             .ok_or(PercolatorError::InvalidAccountLen)?;
         bytemuck::try_from_bytes(bytes).map_err(|_| ProgramError::InvalidAccountData)
+    }
+
+    /// `(max_abs_funding_e9_per_slot, max_accrual_dt_slots)` from the engine
+    /// config. Both are market-wide, so a per-asset funding-feasibility check
+    /// needs only these two plus the asset's own initial price.
+    pub fn read_engine_funding_bounds(data: &[u8]) -> Result<(u64, u64), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let engine_config = market_header(data)?
+            .config
+            .try_to_runtime()
+            .map_err(map_account_wire_error)?;
+        Ok((
+            engine_config.max_abs_funding_e9_per_slot,
+            engine_config.max_accrual_dt_slots,
+        ))
     }
 
     #[inline]
@@ -4079,6 +4112,49 @@ pub mod ix {
         UpdateMaintenanceFeePerSlot {
             maintenance_fee_per_slot: u128,
         },
+        /// ExpireBackingBucket (tag 89) — advance a LAPSED source-domain
+        /// backing bucket out of `Fresh` on a Live market.
+        ///
+        /// WHY THIS EXISTS. A realized loss reserves capital as counterparty
+        /// backing (`reserve_new_capital_backed_loss_for_source_domain_not_atomic`),
+        /// which opens the domain's bucket as `Fresh` with
+        /// `expiry_slot = current_slot + max(max_accrual_dt_slots, h_max,
+        /// max_bankrupt_close_lifetime_slots)`. That expiry is fixed when the
+        /// bucket opens and is NEVER extended while the bucket stays `Fresh`
+        /// (`fresh_counterparty_backing_expiry_slot` returns the stored expiry
+        /// unchanged on a live bucket), so every backed market reaches the
+        /// lapse eventually — a longer horizon defers it, it does not avoid it.
+        ///
+        /// Once `Fresh` has lapsed, the domain is a DEAD END in all three
+        /// directions, permanently:
+        ///   * settling a gain against it -> `EngineStale` (Custom 19), from
+        ///     `validate_source_domain_ledger_current`;
+        ///   * reserving a further loss against it -> `EngineLockActive`
+        ///     (Custom 21), from `prepare_counterparty_backing_add_delta`'s
+        ///     expiry-mismatch arm;
+        ///   * `TopUpBackingBucket` to re-fund it -> `EngineLockActive` (21),
+        ///     same arm. The bucket cannot even be paid to come back.
+        ///
+        /// The engine already owns the escape — `expire_source_backing_bucket_not_atomic`
+        /// — and uses it itself in `realize_source_backed_claims_for_resolved_close_not_atomic`,
+        /// whose comment states that without it a lapsed bucket "would
+        /// otherwise return Stale and strand the winner's close". That sweep
+        /// only runs on the RESOLVED path; nothing in this wrapper ever reached
+        /// the transition on a LIVE market. This tag is that missing call site.
+        ///
+        /// PERMISSIONLESS BY DESIGN: a bricked market must be recoverable by
+        /// any keeper, not only by an authority that may be a cold key or a
+        /// stake-pool PDA. It is not an authority hole — the engine refuses the
+        /// transition unless the bucket is `Fresh` AND `now_slot >=
+        /// expiry_slot`, and `now_slot` here is the runtime `Clock`, never a
+        /// caller-supplied value, so no caller can force an early forfeiture.
+        ///
+        /// Expiry forfeits the lapsed principal to the junior pool. That is the
+        /// engine's documented expiry semantics, not a new haircut invented
+        /// here: the alternative is the account never settling at all.
+        ExpireBackingBucket {
+            domain: u16,
+        },
     }
 
     impl Instruction {
@@ -4401,6 +4477,9 @@ pub mod ix {
                 87 => Self::WithdrawInsuranceReserveToStake,
                 88 => Self::UpdateMaintenanceFeePerSlot {
                     maintenance_fee_per_slot: read_u128(&mut rest)?,
+                },
+                89 => Self::ExpireBackingBucket {
+                    domain: read_u16(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -4901,6 +4980,10 @@ pub mod ix {
                 } => {
                     out.push(88);
                     push_u128(&mut out, maintenance_fee_per_slot);
+                }
+                Self::ExpireBackingBucket { domain } => {
+                    out.push(89);
+                    push_u16(&mut out, domain);
                 }
             }
             out
@@ -6181,6 +6264,71 @@ pub mod processor {
         Clock::get().map(|c| c.slot).unwrap_or(fallback_slot)
     }
 
+    /// Warn, at creation time, when the configured price/rate/dt combination
+    /// makes the engine's funding accrual floor to zero on every crank.
+    ///
+    /// The engine books, per accrual segment:
+    ///
+    /// ```text
+    /// fund_num_total = floor(rate_e9 * segment_dt * effective_price / FUNDING_DEN)
+    /// ```
+    ///
+    /// with `FUNDING_DEN == 1e9`, `|rate_e9| <= max_abs_funding_e9_per_slot`
+    /// and `segment_dt <= max_accrual_dt_slots`. The best case this market can
+    /// reach at price `p` is `rate * dt * p`; when that is `< FUNDING_DEN` the
+    /// floor is 0 for every crank and the market has a funding *setting* with
+    /// no funding *mechanism* — silently, with no error at trade time.
+    ///
+    /// Equivalently, funding needs `price >= ceil(1e9 / (rate * dt))`. At the
+    /// engine's maximum legal rate (10_000) with `dt = 100` that is price 1000;
+    /// at `dt = 5` it is price 20_000. A market denominated in small integers
+    /// cannot fund.
+    ///
+    /// WHY THIS WARNS RATHER THAN REJECTS. The condition is a property of the
+    /// *current price*, and price is mutable: a market created at price 999 is
+    /// dead-funded at genesis but funds correctly once it trades above the
+    /// threshold, so rejecting on the genesis price would refuse markets that
+    /// are merely dead *now*, not *forever*. The one condition that IS
+    /// permanent — funding impossible at every legal price, i.e.
+    /// `rate * dt * MAX_ORACLE_PRICE < FUNDING_DEN` — is unreachable for any
+    /// integer `rate >= 1, dt >= 1` given `MAX_ORACLE_PRICE == 1e12`, so a
+    /// hard reject would either be dead code or would over-reject. The honest
+    /// program-side maximum is therefore a loud, specific creation-time log
+    /// naming the price the creator needs, for the SDK / launch wizard to
+    /// surface. This is a WARNING, not a repair: the arithmetic is in the
+    /// engine and is deliberately not changed.
+    ///
+    /// Markets that disable funding (`max_abs == 0`) are silent — they are not
+    /// broken, they are explicitly off. `dt == 0` is left to the engine's own
+    /// config validation rather than being re-judged here.
+    fn warn_if_funding_cannot_accrue(
+        max_abs_funding_e9_per_slot: u64,
+        max_accrual_dt_slots: u64,
+        initial_price: u64,
+    ) {
+        if max_abs_funding_e9_per_slot == 0 || max_accrual_dt_slots == 0 || initial_price == 0 {
+            return;
+        }
+        let rate_times_dt = (max_abs_funding_e9_per_slot as u128)
+            .saturating_mul(max_accrual_dt_slots as u128);
+        let best_case = rate_times_dt.saturating_mul(initial_price as u128);
+        if best_case >= percolator::FUNDING_DEN {
+            return;
+        }
+        // ceil(FUNDING_DEN / (rate * dt)) — the lowest price at which a full
+        // accrual window at the maximum configured rate books one funding atom.
+        let threshold = percolator::FUNDING_DEN.div_ceil(rate_times_dt);
+        // `alloc::format!` (this crate is `no_std` + `extern crate alloc`), and
+        // only on the warn path, so the allocation costs nothing on the
+        // overwhelmingly common healthy configuration.
+        solana_program::log::sol_log(&alloc::format!(
+            "WARN funding-cannot-accrue: price {initial_price} < threshold {threshold} \
+             for rate {max_abs_funding_e9_per_slot} x dt {max_accrual_dt_slots}; \
+             floor(rate*dt*price/1e9) == 0 on every crank, so funding will never accrue \
+             until price reaches the threshold"
+        ));
+    }
+
     fn authenticated_market_slot_or_fallback_view(group: &state::MarketViewMutV16<'_>) -> u64 {
         core::cmp::max(
             Clock::get()
@@ -7303,6 +7451,9 @@ pub mod processor {
                 accounts,
                 maintenance_fee_per_slot,
             ),
+            Instruction::ExpireBackingBucket { domain } => {
+                handle_expire_backing_bucket(program_id, accounts, domain)
+            }
         }
     }
 
@@ -7368,6 +7519,15 @@ pub mod processor {
         if initial_price == 0 || initial_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
+        // WARNING (not a repair): say so loudly when this market's funding
+        // cannot accrue at its genesis price. See `warn_if_funding_cannot_accrue`
+        // for why this warns rather than rejects. The flooring itself lives in
+        // the engine and is NOT changed.
+        warn_if_funding_cannot_accrue(
+            max_abs_funding_e9_per_slot,
+            max_accrual_dt_slots,
+            initial_price,
+        );
         let init_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
         let wrapper = WrapperConfigV16 {
             marketauth: admin.key.to_bytes(),
@@ -9908,6 +10068,55 @@ pub mod processor {
         Ok(())
     }
 
+    /// ExpireBackingBucket (tag 89) — see `Instruction::ExpireBackingBucket`
+    /// for the full rationale. Permissionless liveness repair: advances a
+    /// `Fresh`-but-LAPSED source-domain backing bucket to `Expired`/`Impaired`
+    /// so settlement against that domain can proceed again.
+    ///
+    /// Moves no tokens. The only state transition is the engine's own
+    /// `expire_source_backing_bucket_not_atomic`, which fails closed with
+    /// `Stale` unless the bucket is `Fresh` and `now_slot >= expiry_slot`.
+    #[inline(never)]
+    fn handle_expire_backing_bucket<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        domain: u16,
+    ) -> ProgramResult {
+        let market_ai = account(accounts, 0)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+
+        let domain_usize = domain as usize;
+        let cfg_after = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // Live-only. A resolved/wound-down market already reaches the
+            // transition through the engine's own resolved-close sweep
+            // (`realize_source_backed_claims_for_resolved_close_not_atomic`),
+            // so re-entering it from outside would be a second, unsequenced
+            // mutation of a terminal ledger.
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let configured_slots = group.header.config.max_market_slots.get() as usize;
+            if domain_usize >= configured_slots.saturating_mul(2) {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // The slot is the runtime Clock, NEVER a caller argument: this is
+            // the only thing standing between "recover a bricked domain" and
+            // "let anyone forfeit live backing early". `max` against the
+            // engine's own `current_slot` keeps the two monotone, matching every
+            // other authenticated-slot site in this program.
+            let now_slot = authenticated_market_slot_or_fallback_view(&group);
+            group
+                .expire_source_backing_bucket_not_atomic(domain_usize, now_slot)
+                .map_err(map_v16_error)?;
+            group.validate_shape().map_err(map_v16_error)?;
+            cfg
+        };
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)
+    }
+
     #[inline(never)]
     fn handle_withdraw_backing_bucket<'a>(
         program_id: &Pubkey,
@@ -11992,6 +12201,21 @@ pub mod processor {
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
+        // Same funding warning as InitMarket: activating an asset is creating a
+        // market, and an asset priced below the funding threshold has the
+        // identical silent-dead-funding failure. `max_abs_funding_e9_per_slot`
+        // and `max_accrual_dt_slots` are market-wide; only `initial_price` varies
+        // per asset, so a market can be perfectly fundable at asset 0's price and
+        // dead-funded at asset 5's.
+        if action == ASSET_ACTION_ACTIVATE {
+            let (max_abs_funding_e9_per_slot, max_accrual_dt_slots) =
+                state::read_engine_funding_bounds(&market_ai.try_borrow_data()?)?;
+            warn_if_funding_cannot_accrue(
+                max_abs_funding_e9_per_slot,
+                max_accrual_dt_slots,
+                initial_price,
+            );
+        }
         let is_asset_authority =
             cfg_pre.marketauth != [0u8; 32] && cfg_pre.marketauth == authority.key.to_bytes();
         let permissionless_reuse_target = action == ASSET_ACTION_ACTIVATE
@@ -12085,7 +12309,18 @@ pub mod processor {
                         if group.markets[asset_index].engine.asset.lifecycle
                             != ASSET_LIFECYCLE_RETIRED
                         {
-                            return Err(PercolatorError::EngineLockActive.into());
+                            // Slot is below max_market_slots and NOT retired. If it is
+                            // one of the three IN-SERVICE lifecycles, say so precisely;
+                            // anything else keeps the prior generic code so no other
+                            // rejection is silently reclassified.
+                            return Err(match group.markets[asset_index].engine.asset.lifecycle {
+                                ASSET_LIFECYCLE_ACTIVE
+                                | ASSET_LIFECYCLE_DRAIN_ONLY
+                                | ASSET_LIFECYCLE_RECOVERY => {
+                                    PercolatorError::AssetSlotAlreadyConfigured.into()
+                                }
+                                _ => PercolatorError::EngineLockActive.into(),
+                            });
                         }
                         // Reject zero domain authorities, mirroring the append path
                         // (activate_dynamic_asset_slot, ~line 1475). A zero
@@ -12269,6 +12504,25 @@ pub mod processor {
                         oracle_authority,
                     ) {
                         return Err(PercolatorError::InvalidInstruction.into());
+                    }
+                    // Reaching here means asset_index < max_market_slots (the
+                    // append path returned earlier). Only a RETIRED slot may be
+                    // re-activated; a slot that is already Active/DrainOnly/
+                    // Recovery is in service and the engine's
+                    // `activate_empty_market_slot_not_atomic` would reject it
+                    // with the generic LockActive. `InitMarket` pre-configures
+                    // slots 0..max_portfolio_assets as Active, so on a market
+                    // with max_portfolio_assets > 1 every one of those indices
+                    // lands here. Answer accurately instead.
+                    //
+                    // Scoped to the three IN-SERVICE lifecycles only: a Disabled
+                    // slot is still a legal activation target for the engine, so
+                    // it must keep falling through untouched.
+                    if matches!(
+                        group.markets[asset_index].engine.asset.lifecycle,
+                        ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY | ASSET_LIFECYCLE_RECOVERY
+                    ) {
+                        return Err(PercolatorError::AssetSlotAlreadyConfigured.into());
                     }
                     let was_retired = group.markets[asset_index].engine.asset.lifecycle
                         == ASSET_LIFECYCLE_RETIRED;

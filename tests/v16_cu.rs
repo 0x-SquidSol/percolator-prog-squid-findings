@@ -8,6 +8,7 @@ use percolator::{
 };
 use percolator_prog::{
     constants::{MATCHER_ABI_VERSION, ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3},
+    error::PercolatorError,
     ix::Instruction as ProgInstruction,
     oracle_v16, processor, state,
     state::{MarketGroupV16, PortfolioAccountV16},
@@ -10783,4 +10784,507 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
         percolator::active_bitmap_count_ones(taker_after.active_bitmap),
         LEGS as u32
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v17 program bug fixes (2026-07-22)
+//
+// Three regression tests, one per bug. Each is written to FAIL against the
+// bytecode deployed on 2026-07-20 (wrapper sha256 e854ae7d…) and PASS against
+// the rebuilt program.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Refresh crank on `portfolio`, returning the raw result rather than panicking.
+fn try_refresh(env: &mut V16CuEnv, portfolio: Pubkey, now_slot: u64) -> Result<u64, String> {
+    let payer = env.payer.pubkey();
+    let market = env.market;
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[],
+    )
+}
+
+fn try_expire_backing_bucket(env: &mut V16CuEnv, domain: u16) -> Result<u64, String> {
+    let market = env.market;
+    env.send(
+        ProgInstruction::ExpireBackingBucket { domain },
+        vec![AccountMeta::new(market, false)],
+        &[],
+    )
+}
+
+fn custom_code(err: &str) -> Option<u32> {
+    let marker = "Custom(";
+    let start = err.find(marker)? + marker.len();
+    let end = start + err[start..].find(')')?;
+    err[start..end].parse().ok()
+}
+
+// ── BUG 1 ────────────────────────────────────────────────────────────────────
+//
+// A realized loss reserves capital as counterparty backing, which opens the
+// domain's backing bucket as `Fresh` with
+//   expiry_slot = current_slot + max(max_accrual_dt_slots, h_max,
+//                                    max_bankrupt_close_lifetime_slots)
+// = current_slot + 100 for this (and every driver's) config. That expiry is
+// fixed when the bucket opens and is never extended while it stays `Fresh`, so
+// EVERY backed market reaches the lapse; a longer horizon defers it, it does
+// not avoid it.
+//
+// After the lapse the domain is a dead end in all three directions, forever:
+// settling a further loss and re-funding the bucket both revert LockActive(21),
+// and settling a gain against it reverts Stale(19). Nothing in the deployed
+// wrapper can advance the bucket out of `Fresh` on a Live market, even though
+// the engine owns the transition (`expire_source_backing_bucket_not_atomic`)
+// and calls it itself on the RESOLVED path.
+//
+// THE LAPSE IS DRIVEN, NOT WAITED FOR. `warp_to_slot` makes it deterministic:
+// this test cannot pass by running fast, which is exactly how the bug hid.
+#[test]
+fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
+    const Q: i128 = 10 * POS_SCALE as i128;
+    let mut env = V16CuEnv::new();
+
+    let (_, cfg_group) = env.market_state();
+    let derived_horizon = cfg_group
+        .config
+        .max_accrual_dt_slots
+        .max(cfg_group.config.h_max)
+        .max(cfg_group.config.max_bankrupt_close_lifetime_slots);
+    assert_eq!(
+        derived_horizon, 100,
+        "the default market config's backing-freshness horizon is the ~100-slot window \
+         every driver in this repo was built with"
+    );
+
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    let a = env.create_portfolio(&owner_a);
+    let b = env.create_portfolio(&owner_b);
+    env.deposit(&owner_a, a, 5_000);
+    env.deposit(&owner_b, b, 5_000);
+
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, 100);
+    env.trade_asset_with_cu(0, &owner_a, a, &owner_b, b, Q, 100, 0);
+
+    // Price 100 -> 50 -> 60. A is long, so A realizes a loss; the loss is
+    // reserved against domain 0 (A's own side), which OPENS that domain's
+    // backing bucket. No caller-supplied expiry anywhere: the horizon below is
+    // the one the engine derives.
+    env.svm.warp_to_slot(2);
+    env.push_auth_mark_for_asset_as_admin(0, 2, 50);
+    try_refresh(&mut env, a, 2).expect("A crank @50");
+    try_refresh(&mut env, b, 2).expect("B crank @50");
+    env.svm.warp_to_slot(3);
+    env.push_auth_mark_for_asset_as_admin(0, 3, 60);
+    try_refresh(&mut env, b, 3).expect("B crank @60");
+    try_refresh(&mut env, a, 3).expect("A crank @60 settles the loss");
+
+    let (_, g_open) = env.market_state();
+    let bucket = g_open.source_backing_buckets[0];
+    assert_eq!(
+        bucket.status,
+        BackingBucketStatusV16::Fresh,
+        "A's realized loss must have opened domain 0's backing bucket"
+    );
+    assert!(
+        bucket.fresh_unliened_backing_num > 0,
+        "the opened bucket must actually hold the reserved backing"
+    );
+    assert_eq!(
+        bucket.expiry_slot,
+        g_open.current_slot + derived_horizon,
+        "expiry is current_slot + max(max_accrual_dt_slots, h_max, \
+         max_bankrupt_close_lifetime_slots) — the horizon is DERIVED, never chosen"
+    );
+    let expiry = bucket.expiry_slot;
+
+    // ── Cross the horizon. Deterministic: no wall-clock dependence. ──
+    let lapsed_slot = expiry + 297;
+    env.svm.warp_to_slot(lapsed_slot);
+    env.push_auth_mark_for_asset_as_admin(0, lapsed_slot, 40);
+
+    // First crank only accrues the asset; the SECOND is the one that settles
+    // A's new loss against the lapsed domain.
+    try_refresh(&mut env, a, lapsed_slot).expect("accrual crank still works");
+    let bricked = try_refresh(&mut env, a, lapsed_slot + 1)
+        .expect_err("settling a loss against a lapsed backing bucket must revert");
+    assert_eq!(
+        custom_code(&bricked),
+        Some(PercolatorError::EngineLockActive as u32),
+        "the lapsed bucket rejects the loss reservation with LockActive; got {bricked}"
+    );
+
+    // PERMANENT, not transient: waiting longer never helps.
+    for extra in [2u64, 50, 500] {
+        let slot = lapsed_slot + extra;
+        env.svm.warp_to_slot(slot);
+        let again = try_refresh(&mut env, a, slot)
+            .expect_err("the brick must persist at every later slot");
+        assert_eq!(
+            custom_code(&again),
+            Some(PercolatorError::EngineLockActive as u32),
+            "still bricked {extra} slots later; got {again}"
+        );
+    }
+
+    // And the bucket cannot be paid back to life either — re-funding it with a
+    // fresh expiry hits the same wall, so "top it up again" is not a recovery.
+    let admin = env.admin.insecure_clone();
+    let refund_src = Pubkey::new_unique();
+    let mint = env.mint;
+    env.svm
+        .set_account(
+            refund_src,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(mint, admin.pubkey(), 500),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let market = env.market;
+    let vault = env.vault;
+    let refund = env
+        .send(
+            ProgInstruction::TopUpBackingBucket {
+                domain: 0,
+                amount: 500,
+                expiry_slot: lapsed_slot + 10_000,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(refund_src, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a lapsed Fresh bucket cannot be re-funded");
+    assert_eq!(
+        custom_code(&refund),
+        Some(PercolatorError::EngineLockActive as u32),
+        "TopUpBackingBucket on a lapsed bucket is the same dead end; got {refund}"
+    );
+
+    // ── THE FIX: tag 89 advances the lapsed bucket out of `Fresh`. ──
+    try_expire_backing_bucket(&mut env, 0).expect("ExpireBackingBucket must clear the lapsed bucket");
+    let (_, g_expired) = env.market_state();
+    assert_ne!(
+        g_expired.source_backing_buckets[0].status,
+        BackingBucketStatusV16::Fresh,
+        "after expiry the bucket must have left `Fresh` — that is the whole repair"
+    );
+
+    // Settlement lives again.
+    let settle_slot = lapsed_slot + 600;
+    env.svm.warp_to_slot(settle_slot);
+    try_refresh(&mut env, a, settle_slot)
+        .expect("the losing account settles again once the lapsed bucket is expired");
+}
+
+/// The recovery instruction must NOT be usable to forfeit live backing early:
+/// the engine gates the transition on `now_slot >= expiry_slot`, and the slot
+/// is the runtime `Clock`, never a caller argument.
+#[test]
+fn v17_expire_backing_bucket_refuses_a_live_bucket() {
+    let mut env = V16CuEnv::new();
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, 100);
+    // A long-lived Fresh bucket on domain 1.
+    env.top_up_backing_bucket(1, 500, 100_000);
+    let (_, g) = env.market_state();
+    assert_eq!(g.source_backing_buckets[1].status, BackingBucketStatusV16::Fresh);
+
+    let early = try_expire_backing_bucket(&mut env, 1)
+        .expect_err("expiring a bucket that has not lapsed must be refused");
+    assert_eq!(
+        custom_code(&early),
+        Some(PercolatorError::EngineStale as u32),
+        "the engine refuses an early expiry with Stale; got {early}"
+    );
+    let (_, g_after) = env.market_state();
+    assert_eq!(
+        g_after.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Fresh,
+        "the live bucket must be untouched"
+    );
+    assert_eq!(
+        g_after.source_backing_buckets[1].fresh_unliened_backing_num,
+        g.source_backing_buckets[1].fresh_unliened_backing_num,
+        "no principal may move on a refused expiry"
+    );
+}
+
+// ── BUG 2 ────────────────────────────────────────────────────────────────────
+//
+// The engine books, per accrual segment:
+//     fund_num_total = floor(rate_e9 * segment_dt * effective_price / 1e9)
+// so funding is identically zero whenever
+//     price < ceil(1e9 / (rate * dt)).
+// At the maximum legal rate (10_000) with dt = 100 that threshold is price 1000:
+// a market denominated in small integers has a funding *setting* but no funding
+// *mechanism*, silently and with no error at trade time.
+//
+// The arithmetic is in the ENGINE and is deliberately NOT changed. This is a
+// creation-time GUARD: it refuses to build a market whose funding can never
+// accrue, so the condition surfaces once, loudly, to the creator.
+
+/// Send `InitMarket` into a fresh SVM and return the program LOGS on success.
+fn try_init_market_with(params: V16CuMarketParams) -> Result<Vec<String>, String> {
+    let mut svm = LiteSVM::new();
+    let program_id = percolator_prog::id();
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("read BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("read token BPF"),
+    );
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let market = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_account(
+        mint,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0u8;
+                state::market_account_len_for_capacity(params.max_portfolio_assets as usize)
+                    .unwrap()
+            ],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(mint, false),
+        ],
+        data: ProgInstruction::InitMarket {
+            max_portfolio_assets: params.max_portfolio_assets,
+            h_min: params.h_min,
+            h_max: params.h_max,
+            initial_price: params.initial_price,
+            min_nonzero_mm_req: params.min_nonzero_mm_req,
+            min_nonzero_im_req: params.min_nonzero_im_req,
+            maintenance_margin_bps: params.maintenance_margin_bps,
+            initial_margin_bps: params.initial_margin_bps,
+            max_trading_fee_bps: params.max_trading_fee_bps,
+            trade_fee_base_bps: params.trade_fee_base_bps,
+            liquidation_fee_bps: params.liquidation_fee_bps,
+            liquidation_fee_cap: params.liquidation_fee_cap,
+            min_liquidation_abs: params.min_liquidation_abs,
+            max_price_move_bps_per_slot: params.max_price_move_bps_per_slot,
+            max_accrual_dt_slots: params.max_accrual_dt_slots,
+            max_abs_funding_e9_per_slot: params.max_abs_funding_e9_per_slot,
+            min_funding_lifetime_slots: params.min_funding_lifetime_slots,
+            max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
+            max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
+            max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
+            public_b_chunk_atoms: params.public_b_chunk_atoms,
+            maintenance_fee_per_slot: params.maintenance_fee_per_slot,
+        }
+        .encode(),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[heap_ix(), cu_ix(), ix],
+        Some(&payer.pubkey()),
+        &[&payer, &admin],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .map(|meta| meta.logs)
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn funding_warning_line(logs: &[String]) -> Option<&String> {
+    logs.iter().find(|l| l.contains("WARN funding-cannot-accrue"))
+}
+
+#[test]
+fn v17_init_market_warns_when_funding_can_never_accrue() {
+    // A realistic risk config — a funding-enabled market must clear the engine's
+    // exact solvency envelope, which the 1x-margin default params do not. Only
+    // `initial_price` and the funding rate vary below.
+    let funding_market = |price: u64, max_abs: u64| V16CuMarketParams {
+        initial_price: price,
+        max_abs_funding_e9_per_slot: max_abs,
+        ..production_risk_params()
+    };
+    // production_risk_params fixes max_accrual_dt_slots = 20, so the threshold is
+    //     price >= ceil(1e9 / (rate * 20)).
+    const DT: u128 = 20;
+    let threshold = |rate: u128| -> u64 { (1_000_000_000u128).div_ceil(rate * DT) as u64 };
+    assert_eq!(threshold(1_000), 50_000);
+    assert_eq!(threshold(500), 100_000);
+
+    // Bracket the threshold at rate 1_000: one atom below books zero funding,
+    // the threshold itself books one.
+    assert_eq!(1_000u128 * DT * 49_999 / 1_000_000_000, 0);
+    assert_eq!(1_000u128 * DT * 50_000 / 1_000_000_000, 1);
+
+    let below = try_init_market_with(funding_market(49_999, 1_000))
+        .expect("the market is still creatable — this warns, it does not reject");
+    let warning = funding_warning_line(&below).unwrap_or_else(|| {
+        panic!("a market whose funding cannot accrue must SAY SO at creation; logs: {below:#?}")
+    });
+    assert!(
+        warning.contains("price 49999") && warning.contains("threshold 50000"),
+        "the warning must name the actual price and the price the creator needs; got {warning}"
+    );
+
+    // One atom over: silent. The warning is a real discriminator, not noise on
+    // every funding market.
+    let at_threshold = try_init_market_with(funding_market(50_000, 1_000))
+        .expect("price 50_000 is creatable");
+    assert!(
+        funding_warning_line(&at_threshold).is_none(),
+        "price 50_000 books one funding atom per window and must NOT warn; logs: {at_threshold:#?}"
+    );
+
+    // The threshold tracks the RATE too, not just the price: halving the rate
+    // doubles it, and a price that was fine at rate 1_000 now warns.
+    assert_eq!(500u128 * DT * 99_999 / 1_000_000_000, 0);
+    assert_eq!(500u128 * DT * 100_000 / 1_000_000_000, 1);
+    let below_slow =
+        try_init_market_with(funding_market(99_999, 500)).expect("still creatable");
+    let slow_warning = funding_warning_line(&below_slow)
+        .unwrap_or_else(|| panic!("halving the rate doubles the threshold; logs: {below_slow:#?}"));
+    assert!(
+        slow_warning.contains("threshold 100000"),
+        "the warning must track the rate; got {slow_warning}"
+    );
+    assert!(
+        funding_warning_line(
+            &try_init_market_with(funding_market(100_000, 500)).expect("creatable")
+        )
+        .is_none(),
+        "price 100_000 clears the rate-500 threshold and must not warn"
+    );
+
+    // A market that deliberately switches funding OFF is silent — it is not
+    // broken, it is explicitly disabled. This is the state every existing
+    // fixture in this repo is in.
+    let funding_off = try_init_market_with(V16CuMarketParams {
+        initial_price: 100,
+        max_abs_funding_e9_per_slot: 0,
+        ..V16CuMarketParams::default()
+    })
+    .expect("funding disabled must stay creatable at any price");
+    assert!(
+        funding_warning_line(&funding_off).is_none(),
+        "a market with funding switched off must not be warned about; logs: {funding_off:#?}"
+    );
+}
+
+// ── BUG 3 ────────────────────────────────────────────────────────────────────
+//
+// `InitMarket` sets `max_market_slots = max_portfolio_assets` and pre-configures
+// every slot below it as Active. `UpdateAssetLifecycle(ACTIVATE)` can only
+// APPEND at `asset_index == max_market_slots` or RE-ACTIVATE a `Retired` slot,
+// so on a market with `max_portfolio_assets = 2`, index 1 is un-activatable.
+// The deployed program answers `EngineLockActive` (Custom 21) — which means
+// "the market/asset is locked", something else entirely, and gives the caller
+// no hint that the slot is simply already in service.
+#[test]
+fn v17_activate_already_configured_slot_reports_a_distinct_error() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(1);
+
+    let (_, g) = env.market_state();
+    assert_eq!(
+        g.config.max_market_slots, 2,
+        "InitMarket sets max_market_slots = max_portfolio_assets"
+    );
+    assert_eq!(
+        g.assets[1].lifecycle,
+        AssetLifecycleV16::Active,
+        "slot 1 is pre-configured and in service — it is not appendable and not retired"
+    );
+
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    let authority = admin.pubkey().to_bytes();
+    let err = env
+        .send(
+            ProgInstruction::UpdateAssetLifecycle {
+                action: 0, // ACTIVATE
+                asset_index: 1,
+                now_slot: 1,
+                initial_price: 100,
+                insurance_authority: authority,
+                insurance_operator: authority,
+                backing_bucket_authority: authority,
+                oracle_authority: authority,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("activating an already-configured slot must fail");
+
+    assert_ne!(
+        custom_code(&err),
+        Some(PercolatorError::EngineLockActive as u32),
+        "LockActive means the market/asset is locked, which is NOT what happened; got {err}"
+    );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::AssetSlotAlreadyConfigured as u32),
+        "the slot is already configured and in service — say exactly that; got {err}"
+    );
+
+    // The slot must be untouched by the refused activation.
+    let (_, g_after) = env.market_state();
+    assert_eq!(g_after.assets[1].lifecycle, AssetLifecycleV16::Active);
+    assert_eq!(
+        g_after.assets[1].market_id, g.assets[1].market_id,
+        "a refused activation must not mint a new market_id for the live slot"
+    );
+}
+
+/// Ordinal pin for the new error code. Ordinals are wire-visible: this fails
+/// loudly if anything is ever inserted rather than appended.
+#[test]
+fn v17_new_error_ordinals_are_appended_at_the_tail() {
+    assert_eq!(PercolatorError::StakeProgramNotPinned as u32, 60);
+    assert_eq!(PercolatorError::AssetSlotAlreadyConfigured as u32, 61);
 }
