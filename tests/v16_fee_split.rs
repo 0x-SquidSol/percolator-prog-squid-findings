@@ -64,6 +64,141 @@ fn config_size_is_576_and_16_byte_aligned() {
     assert_eq!(576 % core::mem::align_of::<WrapperConfigV16>(), 0);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Creator-fee-claim layout pins (2026-07-23 design §1 / testing item 1+2).
+//
+// `creator_fee_claimable_atoms` was squeezed into the ONLY 8-aligned slot of
+// the pre-existing 10-byte `_padding_split`, precisely so that
+// `WRAPPER_CONFIG_LEN` stays 576 and `MARKET_GROUP_OFF` (and therefore every
+// asset-profile offset) does not move under the already-deployed 576-byte
+// markets. These tests pin that byte-for-byte: a reorder that moved the three
+// share fields, or a re-typing that grew the struct, is exactly the 496->576
+// offset incident repeating, and it must break the build's tests loudly rather
+// than brick a live market at read time.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Byte-exact placement of the new counter AND non-movement of the three share
+/// fields it shares the tail with. Uses distinct magic values per field so a
+/// swap between any two of them (not just a shift) is caught.
+#[test]
+fn creator_fee_counter_is_at_568_and_the_three_share_fields_have_not_moved() {
+    use percolator_prog::state::WrapperConfigV16;
+
+    let mut cfg = WrapperConfigV16::default();
+    cfg.creator_share_bps = 0x1111;
+    cfg.lp_share_bps = 0x2222;
+    cfg.insurance_share_bps = 0x3333;
+    cfg.creator_fee_claimable_atoms = 0x0102_0304_0506_0708;
+
+    // Named-offset pins first. The byte-magic assertions below already catch a
+    // move (mutation-proven 2026-07-24: reordering the tail so the counter sits
+    // at 560..568 fails them), but they report it as `left: [8, 7] right: [17,
+    // 17]` — these say WHICH field moved and to where.
+    assert_eq!(
+        core::mem::offset_of!(WrapperConfigV16, creator_share_bps),
+        560
+    );
+    assert_eq!(core::mem::offset_of!(WrapperConfigV16, lp_share_bps), 562);
+    assert_eq!(
+        core::mem::offset_of!(WrapperConfigV16, insurance_share_bps),
+        564
+    );
+    assert_eq!(core::mem::offset_of!(WrapperConfigV16, _padding_split), 566);
+    assert_eq!(
+        core::mem::offset_of!(WrapperConfigV16, creator_fee_claimable_atoms),
+        568,
+        "creator_fee_claimable_atoms must start at byte 568 — deployed 576-byte \
+         markets read it there"
+    );
+    assert_eq!(
+        core::mem::size_of_val(&cfg.creator_fee_claimable_atoms),
+        8,
+        "and must still be 8 bytes wide (568..576)"
+    );
+
+    let bytes = bytemuck::bytes_of(&cfg);
+    assert_eq!(bytes.len(), 576, "config must serialize to exactly 576 bytes");
+
+    assert_eq!(
+        &bytes[560..562],
+        &0x1111u16.to_le_bytes(),
+        "creator_share_bps must still read at 560..562"
+    );
+    assert_eq!(
+        &bytes[562..564],
+        &0x2222u16.to_le_bytes(),
+        "lp_share_bps must still read at 562..564"
+    );
+    assert_eq!(
+        &bytes[564..566],
+        &0x3333u16.to_le_bytes(),
+        "insurance_share_bps must still read at 564..566"
+    );
+    assert_eq!(
+        &bytes[566..568],
+        &[0u8; 2],
+        "the 2-byte remnant of _padding_split must stay zero, not absorb counter bytes"
+    );
+    assert_eq!(
+        &bytes[568..576],
+        &0x0102_0304_0506_0708u64.to_le_bytes(),
+        "creator_fee_claimable_atoms must occupy bytes 568..576, little-endian"
+    );
+
+    // Round-trip through the same unaligned read the on-chain parse uses.
+    let reparsed: WrapperConfigV16 = bytemuck::pod_read_unaligned(bytes);
+    assert_eq!(reparsed.creator_fee_claimable_atoms, 0x0102_0304_0506_0708);
+    assert_eq!(reparsed.creator_share_bps, 0x1111);
+    assert_eq!(reparsed.lp_share_bps, 0x2222);
+    assert_eq!(reparsed.insurance_share_bps, 0x3333);
+}
+
+/// Backward compatibility (design §1): every market deployed before this change
+/// has bytes 566..576 zeroed, because they were padding. Parsing such a tail
+/// must yield `claimable == 0` -- and, just as importantly, must still yield
+/// the three share values, i.e. the counter must not have been carved out of
+/// bytes the shares occupy.
+#[test]
+fn preexisting_market_with_zeroed_pad_tail_parses_as_zero_claimable() {
+    use percolator_prog::state::WrapperConfigV16;
+
+    let mut cfg = WrapperConfigV16::default();
+    cfg.creator_share_bps = 1600;
+    cfg.lp_share_bps = 4800;
+    cfg.insurance_share_bps = 1600;
+    cfg.creator_fee_claimable_atoms = u64::MAX; // will be zeroed below
+
+    // Reproduce the on-chain shape of a market written by the OLD program:
+    // the whole 10-byte `_padding_split` region is zero.
+    let mut bytes = bytemuck::bytes_of(&cfg).to_vec();
+    for b in bytes[566..576].iter_mut() {
+        *b = 0;
+    }
+
+    let parsed: WrapperConfigV16 = bytemuck::pod_read_unaligned(&bytes);
+    assert_eq!(
+        parsed.creator_fee_claimable_atoms, 0,
+        "an old market's zeroed pad tail must read as a zero claimable balance"
+    );
+    assert_eq!(parsed.creator_share_bps, 1600, "shares must survive the zeroed tail");
+    assert_eq!(parsed.lp_share_bps, 4800);
+    assert_eq!(parsed.insurance_share_bps, 1600);
+}
+
+/// The counter must not have grown the struct: `MARKET_GROUP_OFF` is
+/// `HEADER_LEN + WRAPPER_CONFIG_LEN`, so a single byte of growth shifts the
+/// entire engine group and every asset-profile offset out from under the
+/// deployed markets.
+#[test]
+fn creator_fee_counter_did_not_shift_market_group_off() {
+    use percolator_prog::constants::{HEADER_LEN, MARKET_GROUP_OFF, WRAPPER_CONFIG_LEN};
+    use percolator_prog::state::WrapperConfigV16;
+    assert_eq!(WRAPPER_CONFIG_LEN, 576);
+    assert_eq!(core::mem::size_of::<WrapperConfigV16>(), WRAPPER_CONFIG_LEN);
+    assert_eq!(MARKET_GROUP_OFF, HEADER_LEN + 576);
+    assert_eq!(MARKET_GROUP_OFF, 592, "deployed 576-byte markets pin this to 592");
+}
+
 #[test]
 fn default_shares_sum_to_total_and_satisfy_floors() {
     use percolator_prog::constants::*;
@@ -104,6 +239,69 @@ fn fee_split_error_ordinals_are_pinned() {
     assert_eq!(PercolatorError::StakePoolModeMismatch as u32, 59);
     // Appended at the tail — nothing above may move.
     assert_eq!(PercolatorError::StakeProgramNotPinned as u32, 60);
+    // 2026-07-22/24 additions, appended after 60 in declaration order. Pinned
+    // here so that a future variant inserted ABOVE either of them (which would
+    // silently renumber every wire-visible ordinal below it) fails loudly.
+    assert_eq!(PercolatorError::AssetSlotAlreadyConfigured as u32, 61);
+    assert_eq!(PercolatorError::CreatorFeeOverClaim as u32, 62);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Dispatch-tag wire pin (creator-fee-claim, testing item 3).
+//
+// PROVEN NEEDED 2026-07-24: renumbering BOTH the encode arm (`out.push(90)`)
+// and the decode arm (`90 => Self::WithdrawCreatorFee`) to 91 together left the
+// ENTIRE test suite green. Every existing test builds its instruction through
+// `Instruction::encode()` and feeds it to `process_instruction`, so encode and
+// decode cancel out and the byte on the wire is never observed. The SDK, the
+// keeper and every already-signed transaction DO observe it — that is the exact
+// shape of the v16/v17 offset drift that has bitten this project before.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The first byte of an encoded `WithdrawCreatorFee` must be exactly 90, and a
+/// hand-built 90-tagged payload must decode back to it. Both halves compare
+/// against the LITERAL 90 rather than against each other, so a coordinated
+/// rename of both arms still fails.
+#[test]
+fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
+    use percolator_prog::ix::Instruction;
+
+    let encoded = Instruction::WithdrawCreatorFee {
+        amount: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+    }
+    .encode();
+    assert_eq!(
+        encoded[0], 90,
+        "WithdrawCreatorFee must encode as dispatch tag 90 — the SDK, the keeper \
+         and any pre-signed transaction all hard-code this byte"
+    );
+    assert_eq!(
+        encoded.len(),
+        1 + 16,
+        "tag byte + a u128 amount; a length change is also a wire break"
+    );
+    assert_eq!(
+        &encoded[1..17],
+        &0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128.to_le_bytes(),
+        "amount is a little-endian u128 immediately after the tag"
+    );
+
+    // Decode direction, built from the literal byte rather than from encode().
+    let mut wire = vec![90u8];
+    wire.extend_from_slice(&7u128.to_le_bytes());
+    assert_eq!(
+        Instruction::decode(&wire),
+        Ok(Instruction::WithdrawCreatorFee { amount: 7 }),
+        "byte 90 must dispatch to WithdrawCreatorFee"
+    );
+
+    // And 90 must not have been taken from a neighbour: pin the two adjacent
+    // fee-withdrawal tags this instruction was modelled on.
+    assert_eq!(
+        Instruction::WithdrawProtocolFee { amount: 1 }.encode()[0],
+        84
+    );
+    assert_eq!(Instruction::WithdrawInsuranceReserveToStake.encode()[0], 87);
 }
 
 /// The harness mounts the stake `.so` at `STAKE_ID`; tag 87 pins

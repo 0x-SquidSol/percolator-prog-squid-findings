@@ -685,6 +685,41 @@ fn run_ix(ix: Instruction, accounts: &mut [&mut TestAccount]) -> Result<(), Prog
     run_ix_data(&ix.encode(), accounts)
 }
 
+/// `run_ix` WITHOUT the on-Err snapshot/restore that `run_ix_data` performs.
+///
+/// WHY THIS EXISTS. `run_ix_data` snapshots `(lamports, data)` for every
+/// account before dispatch and RESTORES them whenever the instruction returns
+/// `Err` -- before any of the caller's assertions run. That models the real
+/// runtime (a failed transaction reverts), but it makes every
+/// "rejected-instruction-must-not-mutate-X" assertion written against `run_ix`
+/// STRUCTURALLY UNFALSIFIABLE: the harness, not the handler, guarantees the
+/// bytes match. Such an assertion passes even against a handler that scribbles
+/// over the account and only then errors, so it proves nothing about the code
+/// under test.
+///
+/// This variant hands back exactly what the handler left behind. Assertions
+/// written against it are real: they fail if the handler mutates before
+/// rejecting.
+///
+/// WHAT IT DOES AND DOES NOT PROVE. It does NOT claim a mid-handler mutation
+/// would be observable on-chain -- it would not; the runtime reverts a failed
+/// top-level instruction and a failed CPI alike. What it pins is the handler's
+/// FAIL-CLOSED ORDERING: validate fully, then mutate. That discipline is what
+/// keeps a future edit (an early write-back, a debit hoisted above its capacity
+/// check) from turning a rejection into a partial application the moment the
+/// surrounding control flow changes -- e.g. if a caller ever swallows the Err,
+/// or if the mutation moves into a path that commits before the check.
+///
+/// Use `run_ix` for everything else; this is deliberately the exception, not
+/// the default.
+fn run_ix_no_rollback(
+    ix: Instruction,
+    accounts: &mut [&mut TestAccount],
+) -> Result<(), ProgramError> {
+    let infos: Vec<AccountInfo> = accounts.iter_mut().map(|a| a.to_info()).collect();
+    processor::process_instruction(&program_id(), &infos, &ix.encode())
+}
+
 fn configure_base_ewma_mark(
     admin: &mut TestAccount,
     market: &mut TestAccount,
@@ -1796,8 +1831,15 @@ fn v16_wrapper_trade_fee_policy_is_insurance_authority_gated_and_bounds_fee() {
     assert_eq!(cfg.trade_fee_base_bps, 25);
 }
 
+/// RENAMED 2026-07-24 (was
+/// `..._is_admin_gated_and_redirects_non_main_fees_to_market_zero`): the
+/// redirect half of that name has been false for TRADE fees since the
+/// creator-fee-claim change removed `credit_fee_to_domain_budget_view`. What
+/// this test still proves is (a) `UpdateFeeRedirectPolicy`'s admin gate and
+/// bps cap, and (b) that a non-main asset's trade fee now bypasses the domain
+/// budgets entirely.
 #[test]
-fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_redirects_non_main_fees_to_market_zero() {
+fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_budgets() {
     let mut admin = signer();
     let mut attacker = signer();
     let mut market = market_account();
@@ -1852,10 +1894,11 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_redirects_non_main_fees_to
     let size_q = 100 * POS_SCALE;
     let exec_price = 100;
     let fee_bps = 100;
-    let expected_fee_total = two_sided_fee(size_q, exec_price, fee_bps);
-    let expected_fee_per_side = expected_fee_total / 2;
-    let expected_redirect_per_side = expected_fee_per_side * 2_500 / 10_000;
-    let expected_domain_per_side = expected_fee_per_side - expected_redirect_per_side;
+    // Taker-only charging (design §1A): exactly ONE side's ceil-rounded fee per
+    // fill. (`two_sided_fee`, used here until 2026-07-24, has been the wrong
+    // model since the taker-only rewrite.)
+    let expected_fee_total = taker_only_fee(size_q, exec_price, fee_bps);
+    let (_, group_before_trade) = state::read_market(&market.data).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
             asset_index: 1,
@@ -1873,21 +1916,64 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_redirects_non_main_fees_to
     )
     .unwrap();
 
-    let (_, group) = state::read_market(&market.data).unwrap();
+    let (cfg_after_trade, group) = state::read_market(&market.data).unwrap();
     assert_eq!(group.insurance, expected_fee_total);
-    assert_eq!(group.insurance_domain_budget[2], expected_domain_per_side);
-    assert_eq!(group.insurance_domain_budget[3], expected_domain_per_side);
+    // CURRENT CONTRACT (creator-fee claim, 2026-07-23). Until then this block
+    // asserted
+    //     insurance_domain_budget[2] == insurance_domain_budget[3]
+    //         == fee_per_side - redirect_per_side
+    //     insurance - budget[2] - budget[3] == redirect_per_side * 2
+    // i.e. "a non-main asset's trade fee lands in ITS domain budgets, minus a
+    // `fee_redirect_to_market_0_bps` skim to market 0". That contract is GONE:
+    // the trade-fee creator leg -- the only leg that ever reached a domain
+    // budget, and therefore the only leg the redirect ever skimmed on this path
+    // -- now accrues to `creator_fee_claimable_atoms` instead, and
+    // `credit_fee_to_domain_budget_view` was deleted outright.
+    //
+    // `fee_redirect_to_market_0_bps` is NOT dead: the maintenance-fee and
+    // backing-fee paths still apply it via
+    // `credit_market_fee_split_across_domains_view`. It simply no longer has
+    // any effect on TRADE fees, which is what this fixture drives.
+    let expected_creator_cut =
+        expected_fee_total * cfg_after_trade.creator_share_bps as u128 / 10_000;
+    assert_ne!(
+        expected_creator_cut, 0,
+        "the fixture must produce a nonzero creator leg, or the assertions below are no-ops"
+    );
     assert_eq!(
-        group.insurance - group.insurance_domain_budget[2] - group.insurance_domain_budget[3],
-        expected_redirect_per_side * 2
+        cfg_after_trade.creator_fee_claimable_atoms, expected_creator_cut as u64,
+        "the non-main asset's creator leg accrues to the claimable counter"
+    );
+    assert_eq!(
+        group.insurance_domain_budget, group_before_trade.insurance_domain_budget,
+        "NO domain budget moves on a trade any more -- not asset 1's own (domains 2/3), and \
+         not asset 0's redirect target (domains 0/1)"
+    );
+    assert_eq!(
+        group.insurance_domain_budget[2], 0,
+        "asset 1's long domain budget must still be unfunded"
+    );
+    assert_eq!(
+        group.insurance_domain_budget[3], 0,
+        "asset 1's short domain budget must still be unfunded"
     );
 
     // v17: UpdateInsurancePolicy (tag 33) deleted (matrix row 35). Live withdrawal is
-    // impossible; terminal withdrawal is domain-budget-gated. Resolve the market, then verify:
-    //  - admin (insurance_authority for asset-0 and asset-1) can withdraw the domain budgets
-    //    for asset-1 (domains 2+3 = expected_domain_per_side * 2).
-    //  - The redirected fees (global pool, no domain budget) are not directly withdrawable.
-    //  - Overdraw beyond domain budgets is rejected.
+    // impossible; terminal withdrawal is domain-budget-gated.
+    //
+    // CONSEQUENCE OF THE ABOVE, and the reason the rest of this test changed
+    // shape: with every domain budget at 0, a trade fee is no longer reachable
+    // through the terminal `WithdrawInsurance` (tag 41) exit AT ALL. The old
+    // tail withdrew `expected_domain_per_side * 2` successfully; there is now
+    // nothing to withdraw, and an attempt must be refused.
+    //
+    // HARNESS LIMIT (pre-existing, and why this test is one of this file's
+    // long-standing failures): `handle_withdraw_insurance`'s first statement is
+    // `Clock::get()?`, and this in-process harness has no Clock sysvar, so
+    // every call below returns `UnsupportedSysvar` BEFORE any gate is
+    // evaluated. The assertions are written against the real contract so they
+    // become live the moment a Clock stub lands; they are not claimed to hold
+    // today.
     run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
 
     // v17: handle_withdraw_insurance requires materialized_portfolio_count == 0 && c_tot == 0.
@@ -1901,12 +1987,9 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_redirects_non_main_fees_to
 
     // In v17, admin controls insurance_authority for ALL domains (asset-0 and asset-1) because
     // update_asset_lifecycle uses the caller (admin) as insurance_authority for every new asset.
-    // The redirect fees land in asset-0 domains (domain 0 and 1) which are also under admin,
-    // so admin's total withdrawable capacity = domain_budgets[0]+[1]+[2]+[3] = full fee total.
-    // Overdraw BEYOND the full pool is still rejected.
-    let withdrawable = expected_domain_per_side * 2;
+    // Even so, its terminal withdraw capacity is the SUM OF THE DOMAIN BUDGETS, which the trade
+    // above no longer funds -- so admin's capacity is 0 and every amount is an overdraw.
     let vault_balance = state::read_market(&market.data).unwrap().1.vault;
-    let before_withdraw = market.data.clone();
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault = vault_token_account(&market, mint, vault_balance as u64);
     let mut vault_auth = vault_authority_account(&market);
@@ -1925,13 +2008,19 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_redirects_non_main_fees_to
             &mut token_program,
         ],
     );
-    assert_err_and_market_unchanged(over_total, &market, &before_withdraw);
+    assert_eq!(
+        over_total,
+        Err(ProgramError::Custom(21)), // EngineLockActive
+        "an overdraw beyond the (now zero) domain-budget capacity must be refused"
+    );
 
-    // Exact asset-1 domain budget drains successfully (admin withdraws asset-1 portion).
-    run_ix(
-        Instruction::WithdrawInsurance {
-            amount: withdrawable,
-        },
+    // ...and so is a SINGLE ATOM: the whole fee sits in unbudgeted insurance
+    // (protocol / creator / LP / insurance-reserve counters), none of which the
+    // domain-budget-gated terminal exit can reach. This is the load-bearing
+    // half of the creator-fee re-route -- if a creator could still sweep the
+    // leg out through tag 41, moving it off the domain budget bought nothing.
+    let one_atom = run_ix(
+        Instruction::WithdrawInsurance { amount: 1 },
         &mut [
             &mut admin,
             &mut market,
@@ -1940,12 +2029,21 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_redirects_non_main_fees_to
             &mut vault_auth,
             &mut token_program,
         ],
-    )
-    .unwrap();
-    let (_, group) = state::read_market(&market.data).unwrap();
-    // Asset-1 domain budgets drained; redirect pool (asset-0 domains) still in insurance.
-    assert_eq!(group.insurance, expected_fee_total - withdrawable);
-    assert_eq!(group.insurance, expected_redirect_per_side * 2);
+    );
+    assert_eq!(
+        one_atom,
+        Err(ProgramError::Custom(21)), // EngineLockActive
+        "no domain budget was funded, so not one atom of the trade fee is terminally withdrawable"
+    );
+    let (cfg_end, group_end) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        group_end.insurance, expected_fee_total,
+        "the whole fee stays in insurance, unreachable through the domain-budget exit"
+    );
+    assert_eq!(
+        cfg_end.creator_fee_claimable_atoms, expected_creator_cut as u64,
+        "and the creator's leg is still sitting on its own counter, claimable only via tag 90"
+    );
 }
 
 #[test]
@@ -17791,7 +17889,7 @@ fn set_trade_fee_base_bps(market: &mut TestAccount, bps: u64) {
 }
 
 #[test]
-fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_credits_taker_domain_only() {
+fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_the_backstop() {
     let mut admin = signer();
     let mut market = market_account();
     init_market(&mut admin, &mut market);
@@ -17850,14 +17948,31 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_credits_taker_domain_only
         cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut,
         "protocol accrues exactly fee_share_floor(fee, 2000)"
     );
+    // Creator-fee-claim change (2026-07-23, design §2): the creator leg accrues
+    // to its own counter. `expected_creator_cut` is nonzero here (16 atoms at
+    // the fixture's 1600 bps of a 100-atom fee), so the assertion is not
+    // satisfiable by a no-op.
+    assert_ne!(expected_creator_cut, 0, "fixture must produce a nonzero creator leg");
     assert_eq!(
-        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
-        expected_creator_cut,
-        "taker's domain (asset 0 long) gets the creator's configured share"
+        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        expected_creator_cut as u64,
+        "creator accrues exactly split_a.creator + split_b.creator into the claimable counter"
+    );
+    // The NEGATIVE half, and the entire point of the change: the creator drip
+    // no longer lands in the per-domain insurance budget, which IS the loss
+    // backstop (`consume_domain_insurance_for_negative_pnl`). Before the change
+    // this delta was `expected_creator_cut`.
+    assert_eq!(
+        group_after.insurance_domain_budget[0], group_before.insurance_domain_budget[0],
+        "taker's domain (asset 0 long) budget must be UNCHANGED -- the creator leg left the backstop"
     );
     assert_eq!(
         group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
         "N1/N4 regression guard: maker's domain (asset 0 short) is byte-unchanged"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget, group_before.insurance_domain_budget,
+        "NO domain budget anywhere may move on a trade now that the creator leg is re-routed"
     );
     assert_eq!(
         cfg_after.lp_fee_accrued_atoms - cfg_before.lp_fee_accrued_atoms,
@@ -17869,10 +17984,20 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_credits_taker_domain_only
         expected_insurance_cut,
         "insurance reserve accrues its configured share plus rounding dust (Task 4 wiring)"
     );
+    // Conservation across the four sinks: nothing is silently dropped or
+    // double-counted by the re-route.
+    assert_eq!(
+        expected_protocol_cut
+            + cfg_after.creator_fee_claimable_atoms as u128
+            + expected_lp_cut
+            + expected_insurance_cut,
+        total_fee,
+        "the four legs must still sum to the whole fee"
+    );
 }
 
 #[test]
-fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_credits_taker_domain_only() {
+fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_accrues_creator_leg_off_the_backstop() {
     let mut admin = signer();
     let mut market = market_account();
     init_market(&mut admin, &mut market);
@@ -17921,14 +18046,23 @@ fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_credits_taker_domain_only()
 
     assert_eq!(group_after.insurance - group_before.insurance, total_fee);
     assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
+    assert_ne!(expected_creator_cut, 0, "fixture must produce a nonzero creator leg");
     assert_eq!(
-        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
-        expected_creator_cut,
-        "taker's (account_a) domain gets the creator's configured share"
+        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        expected_creator_cut as u64,
+        "creator accrues its configured share into the claimable counter on the CPI path too"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[0], group_before.insurance_domain_budget[0],
+        "taker's (account_a) domain budget must be UNCHANGED -- the creator leg left the backstop"
     );
     assert_eq!(
         group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
         "N1/N4 regression guard: maker's (account_b) domain is byte-unchanged"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget, group_before.insurance_domain_budget,
+        "NO domain budget anywhere may move on a trade now that the creator leg is re-routed"
     );
     assert_eq!(
         cfg_after.lp_fee_accrued_atoms - cfg_before.lp_fee_accrued_atoms,
@@ -17943,7 +18077,7 @@ fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_credits_taker_domain_only()
 }
 
 #[test]
-fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain_only() {
+fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_off_the_backstop() {
     let mut admin = signer();
     let mut market = market_account();
     init_market(&mut admin, &mut market);
@@ -18002,14 +18136,27 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain
         cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut,
         "protocol accrues exactly fee_share_floor(fee, 2000)"
     );
+    // BATCH PATH (design §2): this is the site that does NOT go through
+    // `credit_trade_fees_to_market_budgets_view` -- it credited
+    // `credit_fee_to_domain_budget_view` DIRECTLY from inside the leg loop, and
+    // was nearly missed. It gets its own accrual + its own negative assertion.
+    assert_ne!(expected_creator_cut, 0, "fixture must produce a nonzero creator leg");
     assert_eq!(
-        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
-        expected_creator_cut,
-        "batch taker's (account_a, always long_account for batches) domain gets the creator's configured share"
+        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        expected_creator_cut as u64,
+        "batch loop must fold creator_cut_running_total into the claimable counter"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget[0], group_before.insurance_domain_budget[0],
+        "batch taker's domain budget must be UNCHANGED -- the batch creator leg left the backstop too"
     );
     assert_eq!(
         group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
         "N1/N4 regression guard: batch maker's domain is byte-unchanged"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget, group_before.insurance_domain_budget,
+        "NO domain budget anywhere may move on a batch trade"
     );
     assert_eq!(
         cfg_after.lp_fee_accrued_atoms - cfg_before.lp_fee_accrued_atoms,
@@ -18039,16 +18186,30 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain
 // `handle_batch_trade_cpi` converts the matcher's fills into `BatchTradeLeg`s
 // and delegates to the exact same `handle_batch_execute_zero_copy` core
 // already exercised (with the skim asserted) by
-// `v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_credits_taker_domain_only`,
+// `v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_off_the_backstop`,
 // and (b) the engine-level `proof_v16_taker_only_charges_exactly_one_side`
 // Kani proof, which is call-site-agnostic. A real fix needs a LiteSVM harness
 // with the actual matcher `.so` mounted (see `tests/v16_cu.rs`'s
 // `v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded` for the
 // pattern) -- left as follow-up, not attempted here to avoid a half-verified
 // LiteSVM matcher-CPI harness under time pressure.
+//
+// STILL UNRUNNABLE, RE-VERIFIED 2026-07-24: `cargo test --features devnet
+// --test v16_wrapper -- --ignored` fails at the `BatchTradeCpi` dispatch with
+// `Custom(9)` (InvalidInstruction) -- precisely the
+// `get_return_data().ok_or(InvalidInstruction)` arm in `handle_batch_trade_cpi`.
+// Nothing about the creator-fee change makes it runnable here; the blocker is
+// the missing return-data syscall, not the assertions. The `#[ignore]` stays.
+//
+// RENAMED 2026-07-24: the old name promised
+// `..._credits_taker_domain_only`, which the body has not asserted since the
+// creator leg was routed off the per-domain insurance budget -- the assertions
+// now pin the claimable counter and require EVERY domain budget to be
+// unchanged. A name that contradicts its own body is worse than no name when
+// someone finally un-ignores this.
 #[test]
 #[ignore = "needs a real BPF/LiteSVM harness for get_return_data(); see comment above"]
-fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_credits_taker_domain_only() {
+fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_off_the_backstop() {
     let mut admin = signer();
     let mut market = market_account();
     init_market(&mut admin, &mut market);
@@ -18130,17 +18291,24 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_credits_taker_domain_o
     let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
     let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
     let expected_protocol_cut = total_fee * 2_000 / 10_000;
-    let expected_taker_domain = total_fee - expected_protocol_cut;
+    let expected_creator_cut = total_fee * cfg_before.creator_share_bps as u128 / 10_000;
 
     assert_eq!(group_after.insurance - group_before.insurance, total_fee);
     assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
+    // NOTE: these two assertions were stale twice over while the test sat
+    // ignored -- first against the 2026-07-19 four-way split (the taker domain
+    // stopped receiving `total_fee - protocol_cut`), then against the
+    // 2026-07-23 creator-fee-claim change (the creator leg left the domain
+    // budget entirely). Kept current so un-ignoring this test, once a real
+    // BPF/LiteSVM harness exists, does not start from a false expectation.
     assert_eq!(
-        group_after.insurance_domain_budget[0] - group_before.insurance_domain_budget[0],
-        expected_taker_domain
+        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        expected_creator_cut as u64,
+        "batch-CPI must accrue the creator leg to the claimable counter"
     );
     assert_eq!(
-        group_after.insurance_domain_budget[1], group_before.insurance_domain_budget[1],
-        "N1/N4 regression guard: batch-CPI maker's domain is byte-unchanged"
+        group_after.insurance_domain_budget, group_before.insurance_domain_budget,
+        "batch-CPI must leave every insurance domain budget unchanged"
     );
 }
 
@@ -18449,6 +18617,1283 @@ fn v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority() {
     .unwrap();
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_after.protocol_fee_authority, new_authority.to_bytes());
+}
+
+// =============================================================================
+// Creator fee claim (2026-07-23 design,
+// `docs/superpowers/specs/2026-07-23-creator-fee-claim-design.md`).
+//
+// The creator's trade-fee leg used to be credited into the per-domain
+// insurance budget -- which IS the loss backstop the engine draws down via
+// `consume_domain_insurance_for_negative_pnl` -- and its only exit was tag 57
+// `WithdrawInsuranceAsset`. A "claim fees" button was therefore a "drain the
+// backstop" button. The leg now accrues into
+// `WrapperConfigV16::creator_fee_claimable_atoms` (bytes 568..576) and leaves
+// only through tag 90 `WithdrawCreatorFee`.
+//
+// The accrual + negative (budget-unchanged) assertions live in the three
+// `..._accrues_creator_leg_off_the_backstop` tests above, one per credit site
+// (TradeNoCpi, TradeCpi, BatchTradeNoCpi -- the batch site credited
+// `credit_fee_to_domain_budget_view` DIRECTLY and needs its own coverage).
+// This block covers write-back, accrual overflow, and the tag-90 withdraw.
+// =============================================================================
+
+/// Directly seeds the creator claim counter plus the engine's insurance/vault
+/// surplus, so tag 90's authority / capacity / isolation behaviour can be
+/// tested without threading a full trade sequence. Mirrors
+/// `seed_protocol_fee_fixture`.
+///
+/// `state::write_market` regenerates asset 0's oracle profile from `cfg` only
+/// when `cfg.oracle_mode != ORACLE_MODE_MANUAL`; `InitMarket` writes MANUAL, so
+/// this does NOT silently rewrite `insurance_operator` out from under the
+/// marketauth-rotation test below.
+fn seed_creator_fee_fixture(
+    market: &mut TestAccount,
+    claimable: u64,
+    insurance: u128,
+    vault: u128,
+) {
+    let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+    cfg.creator_fee_claimable_atoms = claimable;
+    group.insurance = insurance;
+    group.vault = vault;
+    group.c_tot = 0;
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+/// The six accounts tag 90 takes, in handler order.
+fn withdraw_creator_fee(
+    authority: &mut TestAccount,
+    market: &mut TestAccount,
+    dest: &mut TestAccount,
+    vault: &mut TestAccount,
+    vault_auth: &mut TestAccount,
+    token_program: &mut TestAccount,
+    amount: u128,
+) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::WithdrawCreatorFee { amount },
+        &mut [authority, market, dest, vault, vault_auth, token_program],
+    )
+}
+
+/// Same six accounts, but dispatched through `run_ix_no_rollback` so the
+/// market account is left EXACTLY as the handler left it on rejection.
+///
+/// Every "a rejected claim must not mutate the market / must not have wrapped
+/// the counter" assertion in this block is routed through here. Through the
+/// plain `withdraw_creator_fee` those assertions are unfalsifiable: `run_ix`
+/// restores the pre-call bytes on `Err` before the assertion is even reached,
+/// so they hold no matter what the handler did.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_creator_fee_no_rollback(
+    authority: &mut TestAccount,
+    market: &mut TestAccount,
+    dest: &mut TestAccount,
+    vault: &mut TestAccount,
+    vault_auth: &mut TestAccount,
+    token_program: &mut TestAccount,
+    amount: u128,
+) -> Result<(), ProgramError> {
+    run_ix_no_rollback(
+        Instruction::WithdrawCreatorFee { amount },
+        &mut [authority, market, dest, vault, vault_auth, token_program],
+    )
+}
+
+/// Ordinal pin for the creator-fee-claim error code. Ordinals are wire-visible
+/// (the SDK maps `ProgramError::Custom(n)` back to a name), so an INSERTION
+/// rather than an append silently re-points every client's error map. The
+/// neighbours are pinned alongside it so this fails loudly rather than
+/// mysteriously.
+///
+/// The other two pins for this tail live in `tests/v16_cu.rs`
+/// (`v17_new_error_ordinals_are_appended_at_the_tail`) and
+/// `tests/v16_fee_split.rs` (`fee_split_error_ordinals_are_pinned`); this one
+/// is here because tag 90's behaviour tests are here.
+#[test]
+fn v16_wrapper_creator_fee_over_claim_error_ordinal_is_appended_at_the_tail() {
+    use percolator_prog::error::PercolatorError;
+    assert_eq!(PercolatorError::StakeProgramNotPinned as u32, 60);
+    assert_eq!(PercolatorError::AssetSlotAlreadyConfigured as u32, 61);
+    assert_eq!(
+        PercolatorError::CreatorFeeOverClaim as u32,
+        62,
+        "CreatorFeeOverClaim must be APPENDED at 62 -- inserting it anywhere \
+         earlier renumbers already-shipped codes"
+    );
+    // The over-claim code must stay DISTINCT from the internal-invariant code
+    // it was split out of, or the split is cosmetic.
+    assert_ne!(
+        PercolatorError::CreatorFeeOverClaim as u32,
+        PercolatorError::EngineCounterUnderflow as u32,
+        "an over-ask by a caller must not report as an engine ledger underflow"
+    );
+    assert_eq!(PercolatorError::EngineCounterUnderflow as u32, 25);
+}
+
+/// WRITE-BACK regression guard (design §2, "the `cfg_after = Some(cfg)`
+/// write-back is load-bearing -- a missed write-back SILENTLY DISCARDS accrued
+/// fees").
+///
+/// Two things are proven that a single-trade counter read cannot:
+///   1. the accrual reaches the ACCOUNT BYTES at config offset 568..576 (the
+///      wire slot the SDK/frontend will read), not just an in-memory `cfg`;
+///   2. it ACCUMULATES across two separate `process_instruction` invocations.
+///      A missed write-back leaves the second trade reading 0 and the counter
+///      ends at one trade's worth, not two.
+#[test]
+fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulates() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+
+    let (cfg_before, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_before.creator_fee_claimable_atoms, 0);
+    let per_trade_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
+    let per_trade_creator = per_trade_fee * cfg_before.creator_share_bps as u128 / 10_000;
+    assert_ne!(per_trade_creator, 0, "fixture must produce a nonzero creator leg");
+
+    // Raw slot in the market account: 16-byte header + 568-byte config prefix.
+    const CLAIMABLE_OFF: usize = 16 + 568;
+    let raw_counter = |data: &[u8]| -> u64 {
+        u64::from_le_bytes(data[CLAIMABLE_OFF..CLAIMABLE_OFF + 8].try_into().unwrap())
+    };
+
+    for expected_trades in 1..=2u128 {
+        run_ix(
+            Instruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: (10 * POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 1_000,
+            },
+            &mut [
+                &mut long_owner,
+                &mut short_owner,
+                &mut market,
+                &mut long_account,
+                &mut short_account,
+            ],
+        )
+        .unwrap();
+        let expected = (per_trade_creator * expected_trades) as u64;
+        assert_eq!(
+            raw_counter(&market.data),
+            expected,
+            "after {expected_trades} trade(s) the RAW account bytes at 568..576 must hold the \
+             running creator accrual -- a missed cfg_after write-back reads back as 0/stale here"
+        );
+        let (cfg_now, _) = state::read_market(&market.data).unwrap();
+        assert_eq!(
+            cfg_now.creator_fee_claimable_atoms, expected,
+            "the parsed view must agree with the raw bytes"
+        );
+    }
+}
+
+/// OVERFLOW, single-trade path: `checked_add` must ERROR, never wrap. Seeded at
+/// `u64::MAX` so the next accrual cannot fit. A `wrapping_add` would silently
+/// reset the creator's claim to ~0 (and `saturating_add` would silently mint an
+/// unbacked ~1.8e19-atom claim), so the whole trade must reject instead.
+#[test]
+fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrapping() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    {
+        let (mut cfg, group) = state::read_market(&market.data).unwrap();
+        cfg.creator_fee_claimable_atoms = u64::MAX;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before = market.data.clone();
+    let rejected = run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: (10 * POS_SCALE) as i128,
+            exec_price: 100,
+            fee_bps: 1_000,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(15)), // EngineArithmeticOverflow
+        "an accrual that cannot fit u64 must reject the trade with EngineArithmeticOverflow"
+    );
+    assert_eq!(market.data, before, "the rejected trade must not mutate the market");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms,
+        u64::MAX,
+        "the counter must be exactly u64::MAX still -- not wrapped to a small value"
+    );
+}
+
+/// OVERFLOW, batch path: the post-loop fold of `creator_cut_running_total` has
+/// its own `checked_add`, so it needs its own test.
+#[test]
+fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_wrapping() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    {
+        let (mut cfg, group) = state::read_market(&market.data).unwrap();
+        cfg.creator_fee_claimable_atoms = u64::MAX;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before = market.data.clone();
+    let rejected = run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: (10 * POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 1_000,
+            }],
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(15)), // EngineArithmeticOverflow
+        "the batch fold must reject with EngineArithmeticOverflow, not wrap"
+    );
+    assert_eq!(market.data, before, "the rejected batch must not mutate the market");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, u64::MAX);
+}
+
+/// A claim BELOW capacity pays out and decrements by exactly `amount`, and the
+/// atoms leave both the insurance fund and the engine vault (they are real
+/// value, not a bookkeeping entry).
+#[test]
+fn v16_wrapper_withdraw_creator_fee_below_capacity_decrements_by_exactly_the_amount() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let (_, group_before) = state::read_market(&market.data).unwrap();
+
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    )
+    .expect("a claim within capacity must succeed");
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms, 60,
+        "the counter must fall by EXACTLY the claimed amount (100 - 40)"
+    );
+    assert_eq!(
+        group_before.insurance - group_after.insurance,
+        40,
+        "the claimed atoms must leave the insurance fund"
+    );
+    assert_eq!(
+        group_before.vault - group_after.vault,
+        40,
+        "the claimed atoms must leave the engine vault"
+    );
+
+    // A second claim continues from the decremented balance rather than the
+    // original one -- i.e. the decrement was persisted, not just computed.
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        60,
+    )
+    .expect("the remaining balance must still be claimable");
+    let (cfg_final, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_final.creator_fee_claimable_atoms, 0);
+}
+
+/// A claim of EXACTLY the capacity drains the counter to zero, and a further
+/// 1-atom claim is then rejected (the counter is not silently replenished).
+#[test]
+fn v16_wrapper_withdraw_creator_fee_at_capacity_drains_to_zero_then_rejects() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        100,
+    )
+    .expect("claiming exactly the capacity must succeed");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 0, "capacity must drain to exactly 0");
+
+    let drained = market.data.clone();
+    // NO-ROLLBACK harness: the "must not underflow-wrap" claim below is about
+    // what the HANDLER leaves behind, so it must not be handed pre-call bytes
+    // that `run_ix` restored on `Err`.
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        1,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(62)), // CreatorFeeOverClaim
+        "a claim against a drained counter must reject as an over-claim, not underflow-wrap"
+    );
+    assert_eq!(
+        market.data, drained,
+        "the handler itself must leave the drained market untouched"
+    );
+    let (cfg_drained, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_drained.creator_fee_claimable_atoms, 0,
+        "0 - 1 must not have wrapped the counter to ~1.8e19 claimable atoms"
+    );
+}
+
+/// A claim ABOVE capacity is rejected outright -- not saturated down to the
+/// capacity, and not partially filled. The engine surplus (1_000) is
+/// deliberately far larger than the claim (101) so that the LEDGER, not the
+/// engine's own surplus clamp, is what rejects.
+///
+/// EVERY rejection here runs through `withdraw_creator_fee_no_rollback`. The
+/// point of the test is that the HANDLER declines to touch the counter, and
+/// `run_ix`'s restore-on-Err would have supplied that conclusion for free.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_over_claim_is_rejected_not_saturated() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        101,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(62)), // CreatorFeeOverClaim
+        "claiming 101 against a 100-atom counter must reject with the caller-error \
+         code, not the engine's internal-invariant EngineCounterUnderflow (25)"
+    );
+    assert_eq!(
+        market.data, before,
+        "the handler must not have written a single byte before rejecting"
+    );
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms, 100,
+        "a rejected over-claim must leave the full balance claimable (no saturation)"
+    );
+
+    // An amount above u64::MAX is an over-claim too, not a narrowing accident.
+    let huge = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        u64::MAX as u128 + 1,
+    );
+    assert_eq!(huge, Err(ProgramError::Custom(62)));
+    assert_eq!(market.data, before);
+
+    // A zero claim is rejected as a caller bug rather than silently no-op'ing
+    // (deliberate divergence from tag 84, where 0 means "withdraw everything").
+    let zero = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        0,
+    );
+    assert_eq!(
+        zero,
+        Err(ProgramError::Custom(9)), // InvalidInstruction
+        "amount == 0 must reject: tag 84's '0 means all' convention is NOT inherited"
+    );
+    assert_eq!(market.data, before);
+}
+
+/// Only `insurance_operator` may claim. An arbitrary signer is rejected, and so
+/// is a signer holding a DIFFERENT asset slot's operator key.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_insurance_operator() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    let mut attacker = signer();
+    let mut dest = user_token_account(attacker.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut attacker,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        1,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "a signer that isn't asset 0's insurance_operator must be rejected"
+    );
+    assert_eq!(
+        market.data, before,
+        "the handler must reject before touching the market -- asserted through the \
+         no-rollback harness, so this is the handler's discipline and not run_ix's restore"
+    );
+
+    // The real operator still succeeds, proving the rejection above was the
+    // authority gate and not an unrelated failure in the fixture.
+    let mut admin_dest = user_token_account(admin.key, mint, 0);
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut admin_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        1,
+    )
+    .expect("the insurance_operator must be able to claim");
+}
+
+/// STAKED MARKET (design §3): `StakeInitPool` rotates `cfg.marketauth` to the
+/// stake-pool PDA but never touches `insurance_operator`. The creator must
+/// therefore still be able to claim after the rotation -- and, critically, the
+/// rotated `marketauth` must NOT be able to, which is exactly why
+/// `verify_domain_withdrawal_preflight` (which accepts `marketauth` as an
+/// alternate gate) is not reused here.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_survives_marketauth_rotation_and_the_new_marketauth_cannot_claim(
+) {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    let profile_before = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+    assert_eq!(
+        profile_before.insurance_operator,
+        admin.key.to_bytes(),
+        "InitMarket must bootstrap asset 0's insurance_operator to the creator"
+    );
+
+    // Stand in for StakeInitPool's `cfg.marketauth = pool_pda` rotation, using
+    // the real UpdateAuthority handler (both keys must co-sign).
+    let mut pool_pda = signer();
+    run_ix(
+        Instruction::UpdateAuthority {
+            new_pubkey: pool_pda.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut pool_pda, &mut market],
+    )
+    .unwrap();
+    let (cfg_rotated, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_rotated.marketauth, pool_pda.key.to_bytes(), "marketauth must have rotated");
+    let profile_after = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+    assert_eq!(
+        profile_after.insurance_operator,
+        admin.key.to_bytes(),
+        "the rotation must NOT drag insurance_operator along with it"
+    );
+
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    // The pool PDA is now marketauth. It must NOT be able to claim the
+    // creator's revenue.
+    let mut pool_dest = user_token_account(pool_pda.key, mint, 0);
+    let before = market.data.clone();
+    let pool_rejected = withdraw_creator_fee_no_rollback(
+        &mut pool_pda,
+        &mut market,
+        &mut pool_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        100,
+    );
+    assert_eq!(
+        pool_rejected,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "the staked market's pool PDA (now marketauth) must NOT be able to claim creator revenue"
+    );
+    assert_eq!(
+        market.data, before,
+        "the refused pool claim must not debit the counter -- no-rollback harness, so \
+         this is the handler's own doing"
+    );
+
+    // The creator, who still holds insurance_operator, can.
+    let mut creator_dest = user_token_account(admin.key, mint, 0);
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut creator_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        100,
+    )
+    .expect("the creator must still be able to claim on a staked (marketauth-rotated) market");
+    let (cfg_final, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_final.creator_fee_claimable_atoms, 0);
+}
+
+/// ISOLATION, direction A (design testing item 6): a creator claim must not
+/// reach the loss backstop. Every `insurance_domain_budget` entry -- and the
+/// engine's `insurance_domain_budget_remaining_total` aggregate -- must be
+/// byte-identical across the claim.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_cannot_reduce_any_insurance_domain_budget() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    // A funded backstop sitting alongside the creator claim: insurance must
+    // cover BOTH the budget (250) and the claim (100), since tag 90 draws only
+    // from the UNBUDGETED surplus.
+    {
+        let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+        cfg.creator_fee_claimable_atoms = 100;
+        group.insurance_domain_budget[0] = 150;
+        group.insurance_domain_budget[1] = 100;
+        group.insurance = 1_000;
+        group.vault = 1_000;
+        group.c_tot = 0;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    let (_, group_before) = state::read_market(&market.data).unwrap();
+    assert_eq!(group_before.insurance_domain_budget[0], 150, "fixture must fund the backstop");
+    assert_eq!(group_before.insurance_domain_budget[1], 100);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        100,
+    )
+    .expect("the full creator claim must succeed alongside a funded backstop");
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 0);
+    assert_eq!(
+        group_after.insurance_domain_budget, group_before.insurance_domain_budget,
+        "WithdrawCreatorFee must not reduce ANY insurance domain budget -- the counter is \
+         disjoint from the loss backstop by construction"
+    );
+    assert_eq!(
+        group_before.insurance - group_after.insurance,
+        100,
+        "the claim comes out of the UNBUDGETED surplus only"
+    );
+}
+
+/// End-to-end: a real trade accrues, and the creator then claims exactly what
+/// that trade produced -- no seeding anywhere. Ties the two halves of the
+/// design together and catches a units/scale mismatch between the accrual site
+/// (u128 split) and the withdraw site (u64 counter).
+#[test]
+fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_that() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+
+    let (cfg_before, _) = state::read_market(&market.data).unwrap();
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: (10 * POS_SCALE) as i128,
+            exec_price: 100,
+            fee_bps: 1_000,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
+    let earned = total_fee * cfg_before.creator_share_bps as u128 / 10_000;
+    assert_ne!(earned, 0);
+    let (cfg_accrued, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_accrued.creator_fee_claimable_atoms as u128, earned);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    // One atom more than was earned must be rejected...
+    let before = market.data.clone();
+    let over = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        earned + 1,
+    );
+    assert_eq!(
+        over,
+        Err(ProgramError::Custom(62)), // CreatorFeeOverClaim
+        "over-claiming a real accrual is a caller error, not an engine underflow"
+    );
+    assert_eq!(market.data, before);
+
+    // ...and exactly what was earned must be payable.
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        earned,
+    )
+    .expect("the creator must be able to claim exactly the fees the trade produced");
+    let (cfg_claimed, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_claimed.creator_fee_claimable_atoms, 0);
+}
+
+/// SIGNER GATE. `expect_signer(authority)` is the first thing tag 90 does, and
+/// nothing else in the handler can substitute for it: the authority check that
+/// follows compares KEYS ONLY (`live_authority_matches`), so without the signer
+/// requirement anyone could name the creator's pubkey in slot 0 -- a pubkey
+/// that is public by definition -- and drain the claim.
+///
+/// The account here carries the CORRECT `insurance_operator` key with
+/// `is_signer = false`, so the key comparison passes and only the signer check
+/// can reject. Routed through the no-rollback harness so the
+/// "market untouched" half is the handler's doing.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_requires_the_operator_to_actually_sign() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    // Same key as `admin`, but NOT a signer (no `.signer()`).
+    let mut unsigned_operator = TestAccount::new(admin.key, Pubkey::new_unique(), 0);
+    assert!(!unsigned_operator.is_signer);
+    assert_eq!(
+        unsigned_operator.key,
+        admin.key,
+        "the fixture must present the RIGHT key, so only the signer gate can reject"
+    );
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut unsigned_operator,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        50,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(6)), // ExpectedSigner
+        "naming the creator's pubkey without signing for it must reject with ExpectedSigner"
+    );
+    assert_eq!(market.data, before, "a non-signed claim must not debit the counter");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 100);
+
+    // Control: the SAME key, signing, succeeds -- so the rejection above was
+    // the signer gate and nothing else about the fixture.
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        50,
+    )
+    .expect("the same key, signing, must be able to claim");
+    let (cfg_signed, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_signed.creator_fee_claimable_atoms, 50);
+}
+
+/// TOKEN-ACCOUNT GUARD (a): `verify_withdrawable_token_accounts` pins
+/// `dest_token.owner == authority`. Without it the creator could pay their
+/// claim into ANY token account -- which matters because the authority here
+/// (`insurance_operator`) may be a PDA or a multisig whose operator is not the
+/// intended beneficiary, and because it is the only thing tying the payout to
+/// the signer at all.
+///
+/// Ported from the tag-87 negatives in `tests/v16_fee_split.rs`
+/// (`tag87_rejects_...`), which cover the same helper on the stake leg.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_rejects_a_dest_token_not_owned_by_the_authority() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    // Correct mint, correct SPL program, initialized -- but owned by someone
+    // else, so ONLY the dest-owner pin can reject.
+    let attacker = Pubkey::new_unique();
+    let mut foreign_dest = user_token_account(attacker, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut foreign_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(11)), // InvalidTokenAccount
+        "a destination the signing authority does not own must be rejected"
+    );
+    assert_eq!(market.data, before);
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms, 100,
+        "not one atom of claim may be spent against a foreign destination"
+    );
+
+    // Control: the authority's OWN token account is accepted.
+    let mut own_dest = user_token_account(admin.key, mint, 0);
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut own_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    )
+    .expect("the authority's own token account must be accepted");
+}
+
+/// TOKEN-ACCOUNT GUARD (b), the subtle one: a token account whose SPL owner IS
+/// the market's `vault_authority` PDA, but which sits at a NON-CANONICAL
+/// address (not the vault ATA). `verify_withdrawable_token_accounts` pins
+/// `vault_token_ai.key == canonical_vault_address(...)` precisely because an
+/// owner-only check would accept this -- F-VAULT-FRAG, vault fragmentation
+/// that strands honest withdrawals in side accounts.
+///
+/// This is the direct tag-90 port of
+/// `tag87_rejects_a_vault_auth_owned_impostor_at_the_wrong_address`.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_rejects_a_vault_authority_owned_impostor_vault() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    // Correct SPL owner (the vault authority PDA), correct mint, funded --
+    // wrong ADDRESS. Only the canonical-address pin can reject it.
+    let mut impostor_vault = TestAccount::new_with_data(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        make_token_data(mint, vault_authority(&market), 1_000),
+    )
+    .writable();
+    assert_ne!(
+        impostor_vault.key,
+        canonical_vault_ata(&vault_authority(&market), &mint),
+        "the impostor must not accidentally be the canonical vault"
+    );
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut impostor_vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(12)), // InvalidVaultAccount
+        "correct SPL owner but wrong address must still be rejected -- the pin is the \
+         canonical vault ATA, not merely the owner"
+    );
+    assert_eq!(market.data, before);
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 100);
+
+    // Control: the canonical vault at the same balance IS accepted.
+    let mut real_vault = vault_token_account(&market, mint, 1_000);
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut real_vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    )
+    .expect("the canonical vault must be accepted");
+}
+
+/// VAULT-BALANCE GUARD: `require_token_balance(vault_token, amount)`. The
+/// engine's own `withdraw_insurance_surplus_not_atomic` bounds the claim
+/// against the engine's BOOK (`header.insurance`/`vault`), which can legitimately
+/// exceed what is physically in the SPL vault (e.g. a secondary-mint market, or
+/// a vault mid-migration). Without this check the handler would debit the
+/// counter and then hand the SPL program a transfer it cannot fill.
+///
+/// The fixture deliberately makes the BOOK generous (insurance/vault = 1_000)
+/// and only the SPL balance thin (10), so `require_token_balance` is the only
+/// thing that can reject.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_rejects_when_the_spl_vault_balance_is_too_thin() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut thin_vault = vault_token_account(&market, mint, 10);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut thin_vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(11)), // InvalidTokenAccount
+        "a claim larger than the vault's SPL balance must reject before anything is debited"
+    );
+    assert_eq!(market.data, before);
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms, 100,
+        "the counter must not be debited for a transfer the vault cannot fund"
+    );
+
+    // Control: the SAME claim against a vault that can fund it succeeds, so the
+    // rejection above was the balance guard and not the ledger/authority path.
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut thin_vault,
+        &mut vault_auth,
+        &mut token_program,
+        10,
+    )
+    .expect("a claim within the vault's SPL balance must succeed");
+}
+
+/// MODE GATE, positive half. Mirrors
+/// `v16_wrapper_withdraw_protocol_fee_succeeds_after_resolve_when_fully_wound_down`
+/// for tag 90, and for the same W12 reason: `ResolveMarket` is one-way and tag
+/// 90 is this counter's ONLY exit, so a Live-only gate would strand every
+/// unclaimed creator atom the instant a market resolves.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_succeeds_after_resolve_when_fully_wound_down() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        group.mode = MarketModeV16::Resolved;
+        group.resolved_slot = group.current_slot;
+        assert_eq!(group.materialized_portfolio_count, 0);
+        assert_eq!(group.c_tot, 0);
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    withdraw_creator_fee(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        100,
+    )
+    .expect("a fully wound-down Resolved market must still pay the creator's claim");
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 0);
+}
+
+/// MODE GATE, non-over-widening half. Mirrors
+/// `v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed`.
+/// Resolved must not become an unconditional pass-through: while ANY portfolio
+/// is still materialized or any committed capital remains (`c_tot != 0`), the
+/// claim stays rejected, exactly as tag 41 `WithdrawInsurance` requires.
+///
+/// The claim (1) and the surplus (200) are deliberately non-limiting so the
+/// wind-down guard -- not the ledger or the engine's surplus clamp -- is what
+/// stands between the request and success.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_resolved_requires_all_portfolios_closed() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    let mint = init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 10);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    {
+        // Seeded inline rather than via `seed_creator_fee_fixture`, which
+        // unconditionally zeroes `c_tot` -- the very precondition under test.
+        let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+        assert_ne!(
+            group.materialized_portfolio_count, 0,
+            "init_portfolio must have materialized one portfolio"
+        );
+        assert_ne!(group.c_tot, 0, "deposit(10) must have raised c_tot");
+        cfg.creator_fee_claimable_atoms = 100;
+        group.insurance = 200;
+        group.vault = group.vault.checked_add(200).unwrap();
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 210);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        1,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(21)), // EngineLockActive
+        "a Resolved market with an open portfolio must still refuse the claim"
+    );
+    assert_eq!(market.data, before);
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 100);
+}
+
+/// MODE GATE, third arm: neither Live nor Resolved. `Recovery` is the only
+/// other `MarketModeV16`, and the handler's gate is written as "not Live and
+/// not Resolved -> reject", so this is the arm that proves the gate is a
+/// whitelist rather than a Live-only check with a Resolved escape hatch.
+#[test]
+fn v16_wrapper_withdraw_creator_fee_rejects_in_recovery_mode() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+    seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        group.mode = MarketModeV16::Recovery;
+        group.recovery_reason = Some(PermissionlessRecoveryReasonV16::BelowProgressFloor);
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before = market.data.clone();
+
+    let rejected = withdraw_creator_fee_no_rollback(
+        &mut admin,
+        &mut market,
+        &mut dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        40,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(21)), // EngineLockActive
+        "Recovery is neither Live nor Resolved -- the claim must be refused"
+    );
+    assert_eq!(market.data, before);
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_after.creator_fee_claimable_atoms, 100);
+}
+
+/// BATCH MULTI-LEG FOLD. The batch post-pass accumulates
+/// `creator_cut_running_total` INSIDE the leg loop and folds it into the
+/// counter ONCE after the loop. Every other batch test in this file submits
+/// exactly ONE leg, which makes "accumulate" and "assign" indistinguishable:
+/// replacing the in-loop
+/// `creator_cut_running_total = creator_cut_running_total.checked_add(split_leg.creator)?`
+/// with a plain `= split_leg.creator` leaves a single-leg suite entirely green
+/// while silently paying the creator only the LAST leg of every real batch.
+///
+/// This test submits TWO legs on DISTINCT assets (the batch pre-pass rejects
+/// duplicate `asset_index`) with DELIBERATELY UNEQUAL sizes, so the sum
+/// (16 + 48 = 64) differs from the last leg alone (48), from the first alone
+/// (16), and from the max. It asserts the counter delta equals the SUM.
+#[test]
+fn v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg() {
+    let mut admin = signer();
+    let mut market = market_account();
+    // `max_portfolio_assets = 2` both pre-configures asset slots 0 and 1 as
+    // Active at InitMarket and raises each portfolio's active-leg cap to 2, so
+    // one batch can carry a leg on each.
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 2;
+            }
+        }),
+    );
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+
+    let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    assert_eq!(cfg_before.creator_fee_claimable_atoms, 0);
+
+    // Unequal sizes => unequal per-leg creator cuts => the SUM is distinguishable
+    // from any single leg.
+    let leg0_size = 10 * POS_SCALE;
+    let leg1_size = 30 * POS_SCALE;
+    run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![
+                percolator_prog::ix::BatchTradeLeg {
+                    asset_index: 0,
+                    size_q: leg0_size as i128,
+                    exec_price: 100,
+                    fee_bps: 1_000,
+                },
+                percolator_prog::ix::BatchTradeLeg {
+                    asset_index: 1,
+                    size_q: leg1_size as i128,
+                    exec_price: 100,
+                    fee_bps: 1_000,
+                },
+            ],
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .expect("a two-leg batch on distinct assets must execute");
+
+    let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
+    let fee_leg0 = taker_only_fee(leg0_size, 100, 1_000);
+    let fee_leg1 = taker_only_fee(leg1_size, 100, 1_000);
+    let creator_leg0 = fee_leg0 * cfg_before.creator_share_bps as u128 / 10_000;
+    let creator_leg1 = fee_leg1 * cfg_before.creator_share_bps as u128 / 10_000;
+    let creator_sum = creator_leg0 + creator_leg1;
+
+    // Guard the guard: if the two legs ever produced the same cut, or either
+    // were zero, the SUM assertion below would stop distinguishing "accumulate"
+    // from "assign the last leg".
+    assert_ne!(creator_leg0, 0, "leg 0 must produce a nonzero creator cut");
+    assert_ne!(creator_leg1, 0, "leg 1 must produce a nonzero creator cut");
+    assert_ne!(
+        creator_leg0, creator_leg1,
+        "the two legs must differ, or an in-loop ASSIGNMENT would be indistinguishable \
+         from an ACCUMULATION"
+    );
+    assert_ne!(
+        creator_sum, creator_leg1,
+        "the sum must differ from the last leg alone -- that is the whole mutation \
+         this test exists to catch"
+    );
+
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        creator_sum as u64,
+        "the batch fold must credit the SUM of every leg's creator cut, not just one leg"
+    );
+    // The other three legs are folded the same way, so pin them on the same
+    // multi-leg batch: a mis-folded running total in any of them is the same bug.
+    assert_eq!(
+        group_after.insurance - group_before.insurance,
+        fee_leg0 + fee_leg1,
+        "header.insurance still receives 100% of BOTH legs' fees"
+    );
+    assert_eq!(
+        cfg_after.protocol_fee_accrued_atoms - cfg_before.protocol_fee_accrued_atoms,
+        fee_leg0 * 2_000 / 10_000 + fee_leg1 * 2_000 / 10_000,
+        "the protocol fold must also sum across legs"
+    );
+    assert_eq!(
+        cfg_after.lp_fee_accrued_atoms - cfg_before.lp_fee_accrued_atoms,
+        fee_leg0 * cfg_before.lp_share_bps as u128 / 10_000
+            + fee_leg1 * cfg_before.lp_share_bps as u128 / 10_000,
+        "the LP fold must also sum across legs"
+    );
+    assert_eq!(
+        group_after.insurance_domain_budget, group_before.insurance_domain_budget,
+        "and no domain budget moves on a multi-leg batch either"
+    );
 }
 
 // =============================================================================

@@ -108,8 +108,8 @@ pub mod constants {
     // ── Protocol-fee program change ─────────────────────────────────────
     // See ~/v17/PROTOCOL-FEE-DESIGN.md §0/§2. `PROTOCOL_FEE_BPS` is the
     // rate applied via `fee_share_floor` to 100% of every trade-fee credit
-    // (the two call sites in `credit_trade_fees_to_market_budgets_view`'s
-    // callers). It is a compile-time constant, never stored on-chain and
+    // (the `policy_v16::split_trade_fee` call sites in the single-trade and
+    // batch fee post-passes). It is a compile-time constant, never stored on-chain and
     // never settable by anyone short of a program upgrade -- there is
     // deliberately no `SetProtocolFeeBps` instruction (design §3.3).
     pub const PROTOCOL_FEE_BPS: u16 = 2000;
@@ -521,6 +521,25 @@ pub mod error {
         /// market created with `max_portfolio_assets > 1`.
         /// SDK agent: add `AssetSlotAlreadyConfigured = 61` to the client error map.
         AssetSlotAlreadyConfigured, // Custom(61)
+        // ── Creator fee claim (2026-07-24) ──────────────────────────────────
+        // Appended after AssetSlotAlreadyConfigured (ordinal 61). Do NOT reorder.
+        /// `WithdrawCreatorFee` (tag 90) asked for more atoms than
+        /// `WrapperConfigV16::creator_fee_claimable_atoms` currently holds.
+        /// This is a CALLER error (ask for less, or trade more first), not an
+        /// internal-invariant violation.
+        ///
+        /// HISTORY: this capacity rejection originally returned
+        /// `EngineCounterUnderflow` (Custom 25) — the code the engine raises
+        /// when one of ITS OWN ledgers would go negative, i.e. a "this program
+        /// is broken" signal. A creator typing one atom too many is not that,
+        /// and collapsing the two left a client unable to distinguish "you
+        /// over-asked" from "the market's accounting is corrupt".
+        /// `EngineCounterUnderflow` is DELIBERATELY still used for the
+        /// handler's own `checked_sub` fail-closed guard, which is unreachable
+        /// behind this check and would genuinely mean an internal invariant
+        /// broke.
+        /// SDK agent: add `CreatorFeeOverClaim = 62` to the client error map.
+        CreatorFeeOverClaim, // Custom(62)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1155,8 +1174,19 @@ pub mod state {
         // forbids IMPLICIT padding. The struct ends at 496 B (a multiple of 16,
         // so u128-aligned). Placing the u16 shares first would push these u128s
         // to offset 502, forcing the compiler to insert implicit padding and
-        // FAILING the Pod derive. Counters first (496->560), then shares (566),
-        // then explicit padding to the 16-byte alignment boundary (576).
+        // FAILING the Pod derive.
+        //
+        // EXACT TAIL LAYOUT (kept current — this is the comment a future editor
+        // reads before touching the layout; it described the pre-creator-fee
+        // shape until 2026-07-24):
+        //   496..560  the four u128 accrued/withdrawn counters below
+        //   560..566  the three u16 shares (creator, lp, insurance)
+        //   566..568  `_padding_split: [u8; 2]`, aligning the next field to 8
+        //   568..576  `creator_fee_claimable_atoms: u64` (creator-fee claim,
+        //             2026-07-23) — this took the last 8 bytes of what was a
+        //             `[u8; 10]` pad, so the struct still ends at exactly 576.
+        // The struct's alignment is 16 (the u128s), and 576 is a multiple of 16,
+        // so there is no trailing implicit padding for Pod to reject.
         /// Cumulative atoms accrued to the LP vault's claim. Monotonic.
         /// Claimed via `LpVaultCrankFees` (tag 78) into vault NAV.
         pub lp_fee_accrued_atoms: u128,
@@ -1173,9 +1203,33 @@ pub mod state {
         pub lp_share_bps: u16,
         /// Insurance/staker share of T in bps. Floor: >= MIN_INSURANCE_SHARE_BPS.
         pub insurance_share_bps: u16,
-        /// Explicit padding to the struct's 16-byte alignment. Explicit because
-        /// bytemuck::Pod forbids implicit padding.
-        pub _padding_split: [u8; 10],
+        /// Explicit padding to the new counter's 8-byte alignment. Explicit
+        /// because bytemuck::Pod forbids implicit padding. Was `[u8; 10]`
+        /// before the creator-fee-claim change (2026-07-23) took the last
+        /// 8 bytes of the pad; see `creator_fee_claimable_atoms`.
+        pub _padding_split: [u8; 2],
+        // ── Creator fee claim (2026-07-23 design) ───────────────────────────
+        /// Creator's UNCLAIMED share of trade fees, in collateral atoms.
+        /// Claimed via `WithdrawCreatorFee` (tag 90), which is the ONLY thing
+        /// that decrements it.
+        ///
+        /// LAYOUT IS LOAD-BEARING AND DELIBERATELY CRAMPED. This occupies
+        /// bytes 568..576 — the only 8-aligned slot inside the pre-existing
+        /// 10-byte `_padding_split` — so `WRAPPER_CONFIG_LEN` stays 576 and NO
+        /// existing field moves. Growing the struct would shift
+        /// `MARKET_GROUP_OFF` (592) and every asset-profile offset, bricking
+        /// the already-deployed 576-byte markets (a repeat of the 496->576
+        /// offset incident). Deployed markets have these bytes zeroed (they
+        /// were padding), so after an in-place upgrade the counter reads 0 and
+        /// accrues fresh — no migration.
+        ///
+        /// ACCEPTED TRADE-OFFS (forced by the 10-byte budget): `u64` not
+        /// `u128` (1.8e19 atoms ~ $18T at 6dp, a non-issue), and a single
+        /// "claimable" counter rather than the accrued/withdrawn audit PAIR
+        /// the protocol/LP/insurance legs use. Consequence: this counter is
+        /// NOT monotonic, so it cannot be used to derive lifetime creator
+        /// revenue — only the currently-claimable balance.
+        pub creator_fee_claimable_atoms: u64,
     }
 
     // Compile-time guard (design §5.1 recommendation): a future field addition to
@@ -4155,6 +4209,30 @@ pub mod ix {
         ExpireBackingBucket {
             domain: u16,
         },
+        // ── Creator fee claim (2026-07-23 design §3) ────────────────────────
+        /// WithdrawCreatorFee (tag 90) — pays the market creator's accrued
+        /// trade-fee share out of the vault to an external token account, and
+        /// decrements `WrapperConfigV16::creator_fee_claimable_atoms` by
+        /// exactly `amount`.
+        ///
+        /// AUTHORITY: asset 0's `insurance_operator`, and ONLY that. It is
+        /// bootstrapped to the creator at `InitMarket`
+        /// (`asset_oracle_profile_from_config`: `insurance_operator =
+        /// config.marketauth`) and, unlike `marketauth`, `StakeInitPool` does
+        /// NOT rotate it — so the creator can still claim on a staked market.
+        /// This deliberately does NOT reuse
+        /// `verify_domain_withdrawal_preflight`'s authority check, which
+        /// accepts `cfg.marketauth` as an alternate gate: on a staked market
+        /// `marketauth` IS the stake-pool PDA, and accepting it here would let
+        /// the pool claim the creator's revenue.
+        ///
+        /// `amount == 0` is REJECTED. It deliberately does NOT mean "withdraw
+        /// everything available" the way `WithdrawProtocolFee` (tag 84) reads
+        /// it: this instruction's contract is an exact debit of the counter,
+        /// and a silent 0-atom transfer is a caller bug, not a claim.
+        WithdrawCreatorFee {
+            amount: u128,
+        },
     }
 
     impl Instruction {
@@ -4480,6 +4558,9 @@ pub mod ix {
                 },
                 89 => Self::ExpireBackingBucket {
                     domain: read_u16(&mut rest)?,
+                },
+                90 => Self::WithdrawCreatorFee {
+                    amount: read_u128(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -4984,6 +5065,10 @@ pub mod ix {
                 Self::ExpireBackingBucket { domain } => {
                     out.push(89);
                     push_u16(&mut out, domain);
+                }
+                Self::WithdrawCreatorFee { amount } => {
+                    out.push(90);
+                    push_u128(&mut out, amount);
                 }
             }
             out
@@ -6913,40 +6998,21 @@ pub mod processor {
         Ok(())
     }
 
-    fn credit_fee_to_domain_budget_view(
-        cfg: &WrapperConfigV16,
-        group: &mut state::MarketViewMutV16<'_>,
-        domain: usize,
-        amount: u128,
-    ) -> ProgramResult {
-        if amount == 0 {
-            return Ok(());
-        }
-        let asset_index = domain / 2;
-        let redirect = if asset_index == 0 {
-            0
-        } else {
-            fee_share_floor(amount, cfg.fee_redirect_to_market_0_bps)?
-        };
-        let domain_amount = amount
-            .checked_sub(redirect)
-            .ok_or(PercolatorError::EngineCounterUnderflow)?;
-        group
-            .credit_domain_insurance_budget_not_atomic(domain, domain_amount)
-            .map_err(map_v16_error)?;
-        credit_market_insurance_budget_view(group, 0, redirect)
-    }
-
-    fn credit_trade_fees_to_market_budgets_view(
-        cfg: &WrapperConfigV16,
-        group: &mut state::MarketViewMutV16<'_>,
-        asset_index: usize,
-        fee_long: u128,
-        fee_short: u128,
-    ) -> ProgramResult {
-        credit_fee_to_domain_budget_view(cfg, group, asset_index * 2, fee_long)?;
-        credit_fee_to_domain_budget_view(cfg, group, asset_index * 2 + 1, fee_short)
-    }
+    // REMOVED (creator fee claim, 2026-07-23): `credit_fee_to_domain_budget_view`
+    // and its only wrapper `credit_trade_fees_to_market_budgets_view`.
+    //
+    // Every caller of them carried the CREATOR leg of `split_trade_fee` (single
+    // trade: `split_a.creator`/`split_b.creator`; batch: `split_leg.creator`),
+    // so once that leg was re-routed to `cfg.creator_fee_claimable_atoms` both
+    // functions had zero live callers. They dripped creator revenue into the
+    // per-domain insurance budget -- the engine's loss backstop -- which is what
+    // made a "claim fees" button a "drain the backstop" button.
+    //
+    // The `fee_redirect_to_market_0_bps` skim they applied is NOT lost: the
+    // maintenance-fee and backing-fee paths still use it via
+    // `credit_market_fee_split_across_domains_view` below. It simply no longer
+    // applies to the creator trade-fee leg, which is now a market-level counter
+    // with no per-asset domain to redirect between.
 
     fn credit_market_fee_split_across_domains_view(
         cfg: &WrapperConfigV16,
@@ -7454,6 +7520,9 @@ pub mod processor {
             Instruction::ExpireBackingBucket { domain } => {
                 handle_expire_backing_bucket(program_id, accounts, domain)
             }
+            Instruction::WithdrawCreatorFee { amount } => {
+                handle_withdraw_creator_fee(program_id, accounts, amount)
+            }
         }
     }
 
@@ -7599,7 +7668,9 @@ pub mod processor {
             creator_share_bps: constants::DEFAULT_CREATOR_SHARE_BPS,
             lp_share_bps: constants::DEFAULT_LP_SHARE_BPS,
             insurance_share_bps: constants::DEFAULT_INSURANCE_SHARE_BPS,
-            _padding_split: [0u8; 10],
+            _padding_split: [0u8; 2],
+            // Creator fee claim: a brand-new market has earned nothing yet.
+            creator_fee_claimable_atoms: 0,
         };
         state::init_market_account_zero_copy(
             &mut market_ai.try_borrow_mut_data()?,
@@ -7949,10 +8020,17 @@ pub mod processor {
                 cfg.lp_share_bps,
                 cfg.insurance_share_bps,
             )?;
-            // The creator leg keeps the pre-existing domain-budget path; only
-            // its AMOUNT changes (a configured share, not "everything left").
-            let domain_fee_a = split_a.creator;
-            let domain_fee_b = split_b.creator;
+            // Creator-fee-claim change (2026-07-23): the creator leg NO LONGER
+            // goes to the domain insurance budget. That budget is the loss
+            // backstop the engine draws down via
+            // `consume_domain_insurance_for_negative_pnl`, and its only exit
+            // (tag 57 `WithdrawInsuranceAsset`) let a creator drain the
+            // backstop while the market was healthy. The leg now accrues to a
+            // dedicated counter claimable only via tag 90.
+            let creator_cut_total = split_a
+                .creator
+                .checked_add(split_b.creator)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
 
             let protocol_cut_total = split_a
                 .protocol
@@ -7967,7 +8045,11 @@ pub mod processor {
                 .checked_add(split_b.insurance)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
 
-            if protocol_cut_total != 0 || lp_cut_total != 0 || insurance_cut_total != 0 {
+            if protocol_cut_total != 0
+                || lp_cut_total != 0
+                || insurance_cut_total != 0
+                || creator_cut_total != 0
+            {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
                     .checked_add(protocol_cut_total)
@@ -7980,19 +8062,23 @@ pub mod processor {
                     .insurance_reserve_accrued_atoms
                     .checked_add(insurance_cut_total)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // u128 -> u64 narrowing: the counter is u64 because it had to
+                // fit the 8 spare bytes of `_padding_split`. Overflow (either
+                // the narrowing or the add) ERRORS the whole trade rather than
+                // wrapping or saturating.
+                cfg.creator_fee_claimable_atoms = cfg
+                    .creator_fee_claimable_atoms
+                    .checked_add(
+                        u64::try_from(creator_cut_total)
+                            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?,
+                    )
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 // CRITICAL: force the write-back below even if nothing else in
                 // this instruction would otherwise have dirtied cfg. The cfg_after
                 // pattern is opt-in per mutation -- a missed write-back here
-                // SILENTLY DISCARDS accrued fees for all three legs.
+                // SILENTLY DISCARDS accrued fees for all four legs.
                 cfg_after = Some(cfg);
             }
-            credit_trade_fees_to_market_budgets_view(
-                &cfg,
-                &mut group,
-                asset_index as usize,
-                domain_fee_a,
-                domain_fee_b,
-            )?;
             update_hybrid_mark_after_trade_view(
                 &mut oracle_profile,
                 &group,
@@ -8153,9 +8239,15 @@ pub mod processor {
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
             let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(legs.len());
             // (asset_index, oracle_profile, reported_exec_price, fee_basis_price, fee_bps_eff,
-            // abs_size, leg_size_q) -- leg_size_q (the raw signed per-leg size) is carried through
-            // so the taker-only post-pass below can pick the correct single domain per leg (§1A.3).
-            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u64, u64, u128, i128)> =
+            // abs_size).
+            //
+            // A 7th element, `leg_size_q` (the raw signed per-leg size), used to
+            // be carried through so the taker-only post-pass could pick the
+            // correct single DOMAIN per leg (§1A.3) for the creator-leg budget
+            // credit. The creator-fee-claim change (2026-07-23) routes that leg
+            // to `cfg.creator_fee_claimable_atoms` instead of a domain budget,
+            // so no per-leg domain is selected any more and the field is gone.
+            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u64, u64, u128)> =
                 Vec::with_capacity(legs.len());
             for leg in legs {
                 let asset_index = leg.asset_index as usize;
@@ -8199,7 +8291,6 @@ pub mod processor {
                     fee_basis_price,
                     fee_bps_eff,
                     abs_size,
-                    leg.size_q,
                 ));
             }
             ensure_trade_portfolios_current_for_requests_view(
@@ -8243,17 +8334,21 @@ pub mod processor {
                 return Err(PercolatorError::EngineArithmeticOverflow.into());
             }
 
-            // Post-pass: split fees back to each asset's single paying domain and drive its hybrid
-            // mark. Fees are reconstructed deterministically per leg; the running total must equal
-            // the engine's aggregate or we refuse the batch (no silent mis-accounting). Also applies
-            // the four-way split (design §1/§2) to each leg's fee before crediting the domain --
-            // the domain gets only the configured creator share, not everything left over --
-            // symmetric with the single-trade credit site above.
+            // Post-pass: accrue each leg's four-way fee split into the four config counters and
+            // drive each asset's hybrid mark. Fees are reconstructed deterministically per leg;
+            // the running total must equal the engine's aggregate or we refuse the batch (no
+            // silent mis-accounting). Symmetric with the single-trade credit site above.
+            //
+            // Creator-fee-claim change (2026-07-23): the creator leg no longer lands in a domain
+            // insurance budget here either -- it accrues into
+            // `cfg.creator_fee_claimable_atoms` via `creator_cut_running_total`, exactly like the
+            // other three legs' running totals, and is folded in once after the loop.
             let mut reconstructed_total: u128 = 0;
             let mut cfg_dirty = false;
             let mut protocol_cut_running_total: u128 = 0;
             let mut lp_cut_running_total: u128 = 0;
             let mut insurance_cut_running_total: u128 = 0;
+            let mut creator_cut_running_total: u128 = 0;
             for (
                 asset_index,
                 oracle_profile,
@@ -8261,7 +8356,6 @@ pub mod processor {
                 fee_basis_price,
                 fee_bps_eff,
                 abs_size,
-                leg_size_q,
             ) in leg_ctx.iter_mut()
             {
                 let fee_leg = batch_leg_fee(*abs_size, *fee_basis_price, *fee_bps_eff)?;
@@ -8273,7 +8367,6 @@ pub mod processor {
                         cfg.lp_share_bps,
                         cfg.insurance_share_bps,
                     )?;
-                    let domain_amount_leg = split_leg.creator;
                     protocol_cut_running_total = protocol_cut_running_total
                         .checked_add(split_leg.protocol)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
@@ -8283,43 +8376,17 @@ pub mod processor {
                     insurance_cut_running_total = insurance_cut_running_total
                         .checked_add(split_leg.insurance)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                    if taker_paid {
-                        // account_a is always the engine's first (long_account)
-                        // positional slot for batches, so its delta on this leg
-                        // is leg_size_q directly -- positive means account_a's
-                        // exposure on this asset is the LONG domain.
-                        let domain = if *leg_size_q > 0 {
-                            *asset_index * 2
-                        } else {
-                            *asset_index * 2 + 1
-                        };
-                        credit_fee_to_domain_budget_view(
-                            &cfg,
-                            &mut group,
-                            domain,
-                            domain_amount_leg,
-                        )?;
-                    } else if maker_paid {
-                        // account_b's delta on this leg is -leg_size_q (the
-                        // opposite of account_a's) -- positive leg_size_q means
-                        // account_b's exposure on this asset is the SHORT domain.
-                        let domain = if *leg_size_q > 0 {
-                            *asset_index * 2 + 1
-                        } else {
-                            *asset_index * 2
-                        };
-                        credit_fee_to_domain_budget_view(
-                            &cfg,
-                            &mut group,
-                            domain,
-                            domain_amount_leg,
-                        )?;
-                    }
-                    // else: neither side paid anything this batch (both
-                    // waived/insolvent) -- fee_leg stays uncredited to any
-                    // domain, and the post-loop reconstructed_total !=
-                    // engine_total (0) check below rejects the whole batch
-                    // rather than silently dropping a nonzero fee.
+                    creator_cut_running_total = creator_cut_running_total
+                        .checked_add(split_leg.creator)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    // NOTE (behaviour preserved): the creator leg used to be
+                    // credited only under `if taker_paid { .. } else if
+                    // maker_paid { .. }`, i.e. dropped when NEITHER side paid.
+                    // Accruing it unconditionally (as the other three legs
+                    // already did) is equivalent: if neither side paid,
+                    // `engine_total` is 0 while `reconstructed_total` is
+                    // nonzero, so the post-loop cross-check below hard-rejects
+                    // the whole batch and no counter is ever written back.
                 }
                 reconstructed_total = reconstructed_total
                     .checked_add(fee_leg)
@@ -8348,6 +8415,7 @@ pub mod processor {
             if protocol_cut_running_total != 0
                 || lp_cut_running_total != 0
                 || insurance_cut_running_total != 0
+                || creator_cut_running_total != 0
             {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
@@ -8361,9 +8429,20 @@ pub mod processor {
                     .insurance_reserve_accrued_atoms
                     .checked_add(insurance_cut_running_total)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // u128 -> u64 narrowing, same as the single-trade site: the
+                // counter is u64 because it had to fit the spare 8 bytes of
+                // `_padding_split`. Overflow ERRORS the whole batch rather
+                // than wrapping or saturating.
+                cfg.creator_fee_claimable_atoms = cfg
+                    .creator_fee_claimable_atoms
+                    .checked_add(
+                        u64::try_from(creator_cut_running_total)
+                            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?,
+                    )
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 // CRITICAL: same write-back-forcing requirement as the
                 // single-trade site -- a missed write-back here would
-                // silently discard accrued fees for all three legs.
+                // silently discard accrued fees for all four legs.
                 cfg_dirty = true;
             }
             if cfg_dirty {
@@ -10891,6 +10970,165 @@ pub mod processor {
         )
     }
 
+    /// WithdrawCreatorFee (tag 90, creator-fee-claim design §3). Pays the
+    /// creator's accrued trade-fee share out of the vault and debits
+    /// `cfg.creator_fee_claimable_atoms` by exactly `amount`.
+    ///
+    /// Modeled on `handle_withdraw_protocol_fee` (tag 84) — same six accounts,
+    /// same derived-vault-authority transfer, same mode gate — with three
+    /// deliberate divergences:
+    ///
+    /// 1. AUTHORITY is asset 0's `insurance_operator`, and ONLY that. It is
+    ///    bootstrapped to the creator at `InitMarket`
+    ///    (`asset_oracle_profile_from_config`) and is not rotated by staking.
+    ///    The writes to it are: that default; the new-slot setter in
+    ///    `activate_dynamic_asset_slot` (append path only — a slot index that
+    ///    does not exist yet, so never asset 0); the permissionless-reuse and
+    ///    re-activation branches of `handle_update_asset_lifecycle`, BOTH of
+    ///    which are barred from asset 0 (they reject the in-service lifecycles,
+    ///    `ASSET_ACTION_RETIRE` rejects `asset_index == 0` so asset 0 can never
+    ///    be RETIRED, and an explicit `asset_index == 0` guard now pins that);
+    ///    an explicit preserve on reconfiguration; and the holder's own
+    ///    `UpdateAssetAuthority` self-rotation.
+    ///
+    ///    NOTE: an earlier version of this comment claimed `marketauth` could
+    ///    never reach `insurance_operator` at all. That was imprecise —
+    ///    `marketauth` CAN set domain authorities when re-activating a RETIRED
+    ///    non-zero asset slot (that is the intended slot-recycling feature).
+    ///    What matters for this handler is narrower and now explicitly
+    ///    enforced: it can never do so for **asset 0**, which is the only
+    ///    profile this claim reads. `StakeInitPool`'s `cfg.marketauth = new_pubkey`
+    ///    rotation never touches it, so a staked market's creator can still
+    ///    claim. This is exactly why `verify_domain_withdrawal_preflight` is
+    ///    NOT reused: it accepts `cfg.marketauth` as an alternate gate, and on
+    ///    a staked market `marketauth` IS the stake-pool PDA — that path would
+    ///    hand the creator's revenue to the pool.
+    ///
+    /// 2. NO health-check / cooldown, unlike tag 57 `WithdrawInsuranceAsset`.
+    ///    Those gates exist because tag 57 draws down the per-domain insurance
+    ///    budget, which IS the loss backstop
+    ///    (`consume_domain_insurance_for_negative_pnl`). This counter is
+    ///    disjoint from that budget by construction — the creator leg no longer
+    ///    touches any domain budget — so backstop-health gating has nothing to
+    ///    protect here.
+    ///
+    /// 3. EXACT DEBIT, NO PARTIAL FILL. `amount` must be nonzero and
+    ///    `<= creator_fee_claimable_atoms`; over-claims are rejected rather
+    ///    than saturated. If the shared unbudgeted surplus is momentarily too
+    ///    thin (the protocol/LP/stake legs draw from the same pool),
+    ///    `withdraw_insurance_surplus_not_atomic` fails closed with
+    ///    `EngineLockActive` and NOTHING is debited — the claim stays fully
+    ///    claimable and the creator retries with a smaller amount. Tags 84/87
+    ///    clamp-and-partial-fill instead; that is incompatible with an exact
+    ///    single-counter debit, and unlike them this leg has no
+    ///    `accrued`/`withdrawn` pair that a partial fill could reconcile
+    ///    against.
+    ///
+    /// MODE GATE mirrors tag 84's (Live, or Resolved once fully wound down),
+    /// and for the same W12 reason: `ResolveMarket` is one-way and tag 90 is
+    /// this counter's ONLY exit, so a Live-only gate would strand every
+    /// unclaimed creator atom permanently the instant a market resolves.
+    #[inline(never)]
+    fn handle_withdraw_creator_fee<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        let authority = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let dest_token = account(accounts, 2)?;
+        let vault_token = account(accounts, 3)?;
+        let vault_authority_ai = account(accounts, 4)?;
+        let token_program = account(accounts, 5)?;
+        expect_signer(authority)?;
+        expect_writable(market_ai)?;
+        expect_writable(dest_token)?;
+        expect_writable(vault_token)?;
+        expect_owner(market_ai, program_id)?;
+        verify_token_program(token_program)?;
+
+        let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+
+        let (transfer_amount_u64, cfg_after) = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let live_mode = group.header.mode == 0;
+            let resolved_mode = group.header.mode == 1;
+            if !live_mode && !resolved_mode {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            if resolved_mode
+                && (group.header.materialized_portfolio_count.get() != 0
+                    || group.header.c_tot.get() != 0)
+            {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            // Authority: asset 0's `insurance_operator` ONLY. `live_authority_matches`
+            // also rejects the all-zero key, so an unconfigured slot can never
+            // be claimed against by a zero-key signer.
+            let asset0_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
+            if !live_authority_matches(&asset0_profile.insurance_operator, authority.key) {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            verify_withdrawable_token_accounts(
+                dest_token,
+                authority.key,
+                vault_token,
+                &vault_authority,
+                &cfg,
+            )?;
+            // Exact capacity check, in u128 so an `amount` above u64::MAX is an
+            // over-claim (rejected) rather than a `try_from` panic-adjacent
+            // edge case. Reject-not-saturate, and reject the no-op zero claim.
+            if amount == 0 {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // A CALLER error (over-ask), not an internal-invariant violation --
+            // hence its own ordinal rather than the engine's
+            // `EngineCounterUnderflow`, which stays reserved for the
+            // fail-closed `checked_sub` below.
+            if amount > cfg.creator_fee_claimable_atoms as u128 {
+                return Err(PercolatorError::CreatorFeeOverClaim.into());
+            }
+            let transfer_amount_u64 = amount_to_u64(amount)?;
+            require_token_balance(vault_token, transfer_amount_u64)?;
+            // I-a, V-a: the atoms leave both the insurance fund and the vault.
+            // The creator leg was charged into `header.insurance` by the engine
+            // and (since the creator-fee-claim change) was never credited to any
+            // domain budget, so it is exactly the "unbudgeted surplus" this
+            // primitive is bounded by. It hard-errors if another leg got there
+            // first, leaving the counter untouched.
+            group
+                .withdraw_insurance_surplus_not_atomic(amount)
+                .map_err(map_v16_error)?;
+            // `checked_sub` cannot fail after the clamp above; it is kept so a
+            // future edit that weakens the clamp still fails closed rather than
+            // wrapping the counter to ~1.8e19 claimable atoms.
+            cfg.creator_fee_claimable_atoms = cfg
+                .creator_fee_claimable_atoms
+                .checked_sub(amount as u64)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            group.validate_shape().map_err(map_v16_error)?;
+            (transfer_amount_u64, cfg)
+        };
+        // Unconditional write-back, as in `handle_withdraw_protocol_fee`: every
+        // successful call here debits `creator_fee_claimable_atoms` (a zero
+        // amount errored above). Without it the counter resets and the SAME
+        // atoms are claimable again on the next call.
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
+        let bump_arr = [bump];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            dest_token,
+            vault_authority_ai,
+            transfer_amount_u64,
+            signer_seeds,
+        )
+    }
+
     /// SetProtocolFeeAuthority (tag 85, design §3.2). Rotates
     /// `protocol_fee_authority` on a single market. Gated on the program's
     /// BPF upgrade authority -- NOT `marketauth`, NOT any
@@ -12522,6 +12760,26 @@ pub mod processor {
                         group.markets[asset_index].engine.asset.lifecycle,
                         ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY | ASSET_LIFECYCLE_RECOVERY
                     ) {
+                        return Err(PercolatorError::AssetSlotAlreadyConfigured.into());
+                    }
+                    // CREATOR-FEE-CLAIM INVARIANT (2026-07-24, defense in depth).
+                    // Asset 0's `insurance_operator` is the ONLY key that can claim accrued
+                    // creator fees (tag 90 `WithdrawCreatorFee` reads asset index 0). This
+                    // re-activation branch is the one path that rewrites domain authorities on
+                    // an ALREADY-EXISTING slot (`:profile.insurance_operator = ...` below), so
+                    // it must never reach asset 0 -- otherwise `marketauth`, which on a STAKED
+                    // market is the stake-pool PDA, could rewrite asset-0's insurance_operator
+                    // and steal the creator's claim (exactly the theft tag 90 declines to
+                    // enable by refusing `marketauth` as a gate).
+                    //
+                    // This is ALREADY unreachable today, but only EMERGENTLY: the in-service
+                    // check directly above rejects ACTIVE/DRAIN_ONLY/RECOVERY, and
+                    // ASSET_ACTION_RETIRE rejects `asset_index == 0`, so asset 0 can never be
+                    // RETIRED and therefore never re-activated. That safety spans two distant
+                    // checks and is asserted nowhere. Pin it here so a future lifecycle change
+                    // (e.g. adding a Disabled state, or relaxing the RETIRE guard) cannot
+                    // silently re-open the theft path.
+                    if asset_index == 0 {
                         return Err(PercolatorError::AssetSlotAlreadyConfigured.into());
                     }
                     let was_retired = group.markets[asset_index].engine.asset.lifecycle
