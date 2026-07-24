@@ -1,15 +1,16 @@
 //! Creator-fee-claim AUTHORITY GUARD (2026-07-24).
 //!
-//! Tag 90 `WithdrawCreatorFee` is gated on **asset 0's `insurance_operator`**
-//! and nothing else. That key is therefore the creator's revenue: whoever can
-//! rewrite it can take the claim.
+//! Tag 90 `WithdrawCreatorFee` is gated on **asset 0's `asset_admin`** and
+//! nothing else (2026-07-24 re-gate; it was `insurance_operator` until the
+//! staked-create-flow lockout was found). That key is therefore the creator's
+//! revenue: whoever can rewrite it can take the claim.
 //!
 //! `handle_update_asset_lifecycle`'s privileged re-activation branch is the ONE
-//! path that rewrites domain authorities on an ALREADY-EXISTING slot, and it is
-//! gated on `cfg.marketauth` — which on a STAKED market is the stake-pool PDA
-//! (`StakeInitPool` rotates `cfg.marketauth` to it). So that branch reaching
-//! asset 0 would hand the creator's revenue to the pool. A guard now pins it
-//! shut:
+//! path that rewrites the per-asset authorities (including `asset_admin`) on an
+//! ALREADY-EXISTING slot, and it is gated on `cfg.marketauth` — which on a
+//! STAKED market is the stake-pool PDA (`StakeInitPool` rotates `cfg.marketauth`
+//! to it). So that branch reaching asset 0 would hand the creator's revenue to
+//! the pool. A guard now pins it shut:
 //!
 //! ```ignore
 //! if asset_index == 0 {
@@ -329,8 +330,8 @@ fn seed_asset_slot_retired(market: &mut TestAccount, asset_index: usize, retired
 
 /// Simulates `StakeInitPool`'s `cfg.marketauth = <stake pool PDA>` rotation.
 /// Writes ONLY the wrapper config, exactly as the on-chain handler does, so
-/// asset 0's stored profile (and therefore its `insurance_operator`) is
-/// untouched — which is the whole point of the property under test.
+/// asset 0's stored profile (and therefore its `asset_admin`, the tag-90 claim
+/// gate) is untouched — which is the whole point of the property under test.
 fn rotate_marketauth(market: &mut TestAccount, new_marketauth: [u8; 32]) {
     let (mut cfg, _) = state::read_market(&market.data).unwrap();
     cfg.marketauth = new_marketauth;
@@ -348,10 +349,14 @@ fn seed_creator_claim(market: &mut TestAccount, claimable: u64) {
     state::write_market(&mut market.data, &cfg, &group).unwrap();
 }
 
-fn insurance_operator_of(market: &TestAccount, asset_index: usize) -> [u8; 32] {
+/// Reads asset `asset_index`'s `asset_admin` -- the key tag 90
+/// `WithdrawCreatorFee` gates on. The re-activation branch under test rewrites
+/// this field (`profile.asset_admin = authority.key`), so it is the field whose
+/// integrity the `if asset_index == 0` guard protects.
+fn asset_admin_of(market: &TestAccount, asset_index: usize) -> [u8; 32] {
     state::read_asset_oracle_profile(&market.data, asset_index)
         .unwrap()
-        .insurance_operator
+        .asset_admin
 }
 
 fn activate_ix(asset_index: u16, now_slot: u64, initial_price: u64, authority: [u8; 32]) -> Instruction {
@@ -408,13 +413,14 @@ fn withdraw_creator_fee(
 
 /// THE LOAD-BEARING TEST. `marketauth` (here: the stake pool that
 /// `StakeInitPool` installed) attempts to re-activate asset 0 and install
-/// ITSELF as every domain authority — including `insurance_operator`, the one
-/// key tag 90 accepts. It must be rejected, asset 0's `insurance_operator` must
-/// still be the creator's, and the creator's claim must still be payable.
+/// ITSELF as every per-asset authority — including `asset_admin`, the one key
+/// tag 90 accepts. It must be rejected, asset 0's `asset_admin` must still be
+/// the creator's, and the creator's claim must still be payable.
 ///
 /// Mutation-proven 2026-07-24: deleting `if asset_index == 0 { return Err(...) }`
 /// from `handle_update_asset_lifecycle`'s ACTIVATE branch makes this test fail
-/// (the activation succeeds and `insurance_operator` becomes the pool's key).
+/// (the activation succeeds, `asset_admin` becomes the pool's key, and the pool
+/// can then claim).
 #[test]
 fn asset_zero_seeded_retired_cannot_be_reactivated_by_marketauth() {
     let mut creator = signer();
@@ -422,11 +428,11 @@ fn asset_zero_seeded_retired_cannot_be_reactivated_by_marketauth() {
     let mut market = market_account();
     let mint = init_two_asset_market(&mut creator, &mut market);
 
-    // InitMarket bootstraps asset 0's insurance_operator to the creator.
+    // InitMarket bootstraps asset 0's asset_admin to the creator.
     assert_eq!(
-        insurance_operator_of(&market, 0),
+        asset_admin_of(&market, 0),
         creator.key.to_bytes(),
-        "fixture precondition: the creator holds asset 0's insurance_operator"
+        "fixture precondition: the creator holds asset 0's asset_admin"
     );
 
     seed_creator_claim(&mut market, 100);
@@ -441,12 +447,12 @@ fn asset_zero_seeded_retired_cannot_be_reactivated_by_marketauth() {
         attack,
         Err(ERR_ASSET_SLOT_ALREADY_CONFIGURED),
         "marketauth must not be able to re-activate asset 0 (that branch rewrites \
-         domain authorities, and asset 0's insurance_operator IS the creator-fee key)"
+         the per-asset authorities, and asset 0's asset_admin IS the creator-fee key)"
     );
     assert_eq!(
-        insurance_operator_of(&market, 0),
+        asset_admin_of(&market, 0),
         creator.key.to_bytes(),
-        "asset 0's insurance_operator must be unchanged by the rejected attempt"
+        "asset 0's asset_admin must be unchanged by the rejected attempt"
     );
 
     // The theft this guard prevents, spelled out: the pool cannot claim...
@@ -463,7 +469,7 @@ fn asset_zero_seeded_retired_cannot_be_reactivated_by_marketauth() {
 }
 
 /// POSITIVE CONTROL for the test above. The identical retired-slot seeding at
-/// index 1 DOES activate, and DOES install the caller's `insurance_operator`.
+/// index 1 DOES activate, and DOES install the caller as `asset_admin`.
 /// Without this, `asset_zero_seeded_retired_cannot_be_reactivated_by_marketauth`
 /// could be passing because the seeded slot is simply not activatable at all —
 /// i.e. it could be vacuous.
@@ -483,15 +489,15 @@ fn identical_retired_seed_activates_normally_at_asset_index_one() {
     )
     .expect("the same seeded retired slot must be activatable at a nonzero index");
     assert_eq!(
-        insurance_operator_of(&market, 1),
+        asset_admin_of(&market, 1),
         stake_pool.key.to_bytes(),
-        "the re-activation branch does install the caller's domain authorities — \
-         which is exactly why it must never reach asset 0"
+        "the re-activation branch does install the caller as asset_admin (the \
+         creator-fee key) — which is exactly why it must never reach asset 0"
     );
     assert_eq!(
-        insurance_operator_of(&market, 0),
+        asset_admin_of(&market, 0),
         creator.key.to_bytes(),
-        "and it must not touch asset 0 while doing so"
+        "and it must not touch asset 0's asset_admin while doing so"
     );
 }
 
@@ -525,10 +531,13 @@ fn retired_nonzero_slot_recycling_still_sets_fresh_domain_authorities() {
     assert_eq!(profile1.insurance_authority, new_operator);
     assert_eq!(profile1.backing_bucket_authority, new_operator);
     assert_eq!(profile1.oracle_authority, new_operator);
+    // ...including asset_admin, which the branch sets to the re-activating signer
+    // (the creator here). This is exactly the write the asset-0 guard blocks.
+    assert_eq!(profile1.asset_admin, creator.key.to_bytes());
     assert_eq!(
-        insurance_operator_of(&market, 0),
+        asset_admin_of(&market, 0),
         creator.key.to_bytes(),
-        "recycling slot 1 must leave asset 0's creator-fee authority alone"
+        "recycling slot 1 must leave asset 0's creator-fee authority (asset_admin) alone"
     );
 }
 
@@ -575,5 +584,5 @@ fn activate_on_a_live_asset_zero_is_rejected_before_the_guard_is_reached() {
         ),
         Err(ERR_ASSET_SLOT_ALREADY_CONFIGURED)
     );
-    assert_eq!(insurance_operator_of(&market, 0), creator.key.to_bytes());
+    assert_eq!(asset_admin_of(&market, 0), creator.key.to_bytes());
 }

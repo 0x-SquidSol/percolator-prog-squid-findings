@@ -4215,16 +4215,17 @@ pub mod ix {
         /// decrements `WrapperConfigV16::creator_fee_claimable_atoms` by
         /// exactly `amount`.
         ///
-        /// AUTHORITY: asset 0's `insurance_operator`, and ONLY that. It is
-        /// bootstrapped to the creator at `InitMarket`
-        /// (`asset_oracle_profile_from_config`: `insurance_operator =
-        /// config.marketauth`) and, unlike `marketauth`, `StakeInitPool` does
-        /// NOT rotate it — so the creator can still claim on a staked market.
-        /// This deliberately does NOT reuse
-        /// `verify_domain_withdrawal_preflight`'s authority check, which
-        /// accepts `cfg.marketauth` as an alternate gate: on a staked market
-        /// `marketauth` IS the stake-pool PDA, and accepting it here would let
-        /// the pool claim the creator's revenue.
+        /// AUTHORITY: asset 0's `asset_admin`, and ONLY that. It bootstraps to
+        /// the asset activator (the creator) and is rotated ONLY by its holder
+        /// via `UpdateAssetAuthority`. Crucially, it is the one creator-facing
+        /// field the wizard's full create flow leaves alone: `StakeInitPool` +
+        /// `BindInsuranceAuthority` rotate `marketauth`, `insurance_authority`
+        /// AND `insurance_operator` to program PDAs, so gating on any of those
+        /// makes the creator's fees unclaimable on a staked market (no wallet
+        /// holds a PDA key — verified on the live staked market 7FBXdrm1…). Do
+        /// NOT reuse `verify_domain_withdrawal_preflight`'s check, which accepts
+        /// `cfg.marketauth` as an alternate gate: on a staked market that IS the
+        /// stake-pool PDA and would hand the creator's revenue to the pool.
         ///
         /// `amount == 0` is REJECTED. It deliberately does NOT mean "withdraw
         /// everything available" the way `WithdrawProtocolFee` (tag 84) reads
@@ -10978,31 +10979,28 @@ pub mod processor {
     /// same derived-vault-authority transfer, same mode gate — with three
     /// deliberate divergences:
     ///
-    /// 1. AUTHORITY is asset 0's `insurance_operator`, and ONLY that. It is
-    ///    bootstrapped to the creator at `InitMarket`
-    ///    (`asset_oracle_profile_from_config`) and is not rotated by staking.
-    ///    The writes to it are: that default; the new-slot setter in
-    ///    `activate_dynamic_asset_slot` (append path only — a slot index that
-    ///    does not exist yet, so never asset 0); the permissionless-reuse and
-    ///    re-activation branches of `handle_update_asset_lifecycle`, BOTH of
-    ///    which are barred from asset 0 (they reject the in-service lifecycles,
-    ///    `ASSET_ACTION_RETIRE` rejects `asset_index == 0` so asset 0 can never
-    ///    be RETIRED, and an explicit `asset_index == 0` guard now pins that);
-    ///    an explicit preserve on reconfiguration; and the holder's own
-    ///    `UpdateAssetAuthority` self-rotation.
+    /// 1. AUTHORITY is asset 0's `asset_admin`, and ONLY that. It bootstraps to
+    ///    the asset activator (the creator) at `InitMarket` / activation, and is
+    ///    rotated ONLY by its holder via `UpdateAssetAuthority` self-rotation.
+    ///    The one path that can rewrite it on an EXISTING slot is the
+    ///    re-activation branch of `handle_update_asset_lifecycle` (reachable by
+    ///    `marketauth`), which is barred from asset 0 (it rejects the in-service
+    ///    lifecycles, `ASSET_ACTION_RETIRE` rejects `asset_index == 0` so asset 0
+    ///    can never be RETIRED/re-activated, and an explicit `asset_index == 0`
+    ///    guard pins that). So `asset_admin` for asset 0 is stable creator-only.
     ///
-    ///    NOTE: an earlier version of this comment claimed `marketauth` could
-    ///    never reach `insurance_operator` at all. That was imprecise —
-    ///    `marketauth` CAN set domain authorities when re-activating a RETIRED
-    ///    non-zero asset slot (that is the intended slot-recycling feature).
-    ///    What matters for this handler is narrower and now explicitly
-    ///    enforced: it can never do so for **asset 0**, which is the only
-    ///    profile this claim reads. `StakeInitPool`'s `cfg.marketauth = new_pubkey`
-    ///    rotation never touches it, so a staked market's creator can still
-    ///    claim. This is exactly why `verify_domain_withdrawal_preflight` is
-    ///    NOT reused: it accepts `cfg.marketauth` as an alternate gate, and on
-    ///    a staked market `marketauth` IS the stake-pool PDA — that path would
-    ///    hand the creator's revenue to the pool.
+    ///    WHY `asset_admin` AND NOT `insurance_operator`: the wizard's full
+    ///    create flow runs `StakeInitPool` + `BindInsuranceAuthority`, which
+    ///    rotate `marketauth`, `insurance_authority` AND `insurance_operator` to
+    ///    program PDAs (the stake pool / vault_auth). Gating this claim on any of
+    ///    those makes the creator's own fees UNCLAIMABLE on a staked market — no
+    ///    wallet holds a PDA's key. Verified on the live staked market
+    ///    `7FBXdrm1…`: `insurance_operator` was a PDA while `asset_admin` was the
+    ///    creator's wallet. `asset_admin` is the one creator-facing field the
+    ///    stake flow leaves alone. This is also why `verify_domain_withdrawal_
+    ///    preflight` is NOT reused: it accepts `cfg.marketauth` as an alternate
+    ///    gate, and on a staked market that IS the stake-pool PDA — that path
+    ///    would hand the creator's revenue to the pool.
     ///
     /// 2. NO health-check / cooldown, unlike tag 57 `WithdrawInsuranceAsset`.
     ///    Those gates exist because tag 57 draws down the per-domain insurance
@@ -11064,11 +11062,24 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            // Authority: asset 0's `insurance_operator` ONLY. `live_authority_matches`
-            // also rejects the all-zero key, so an unconfigured slot can never
-            // be claimed against by a zero-key signer.
+            // Authority: asset 0's `asset_admin` ONLY. `live_authority_matches`
+            // also rejects the all-zero key, so a burned/unconfigured admin can
+            // never be claimed against by a zero-key signer.
+            //
+            // Why `asset_admin` and NOT `insurance_operator`: the wizard's full
+            // create flow runs `StakeInitPool` + `BindInsuranceAuthority`, which
+            // rotate `marketauth`, `insurance_authority` AND `insurance_operator`
+            // to program PDAs (the stake pool / vault_auth). Gating on any of
+            // those would make the creator's own fees unclaimable on a staked
+            // market -- no wallet holds a PDA's key. Verified on a live staked
+            // market (7FBXdrm1…): insurance_operator was a PDA while `asset_admin`
+            // remained the creator's wallet. `asset_admin` bootstraps to the
+            // asset activator (the creator) and is rotated ONLY by its holder via
+            // `UpdateAssetAuthority` -- the stake flow never touches it. It is the
+            // one field that reliably tracks the creator through staking, and it
+            // already gates other creator ops (e.g. RestartAssetOracle).
             let asset0_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
-            if !live_authority_matches(&asset0_profile.insurance_operator, authority.key) {
+            if !live_authority_matches(&asset0_profile.asset_admin, authority.key) {
                 return Err(PercolatorError::Unauthorized.into());
             }
             verify_withdrawable_token_accounts(
@@ -12763,14 +12774,15 @@ pub mod processor {
                         return Err(PercolatorError::AssetSlotAlreadyConfigured.into());
                     }
                     // CREATOR-FEE-CLAIM INVARIANT (2026-07-24, defense in depth).
-                    // Asset 0's `insurance_operator` is the ONLY key that can claim accrued
-                    // creator fees (tag 90 `WithdrawCreatorFee` reads asset index 0). This
-                    // re-activation branch is the one path that rewrites domain authorities on
-                    // an ALREADY-EXISTING slot (`:profile.insurance_operator = ...` below), so
-                    // it must never reach asset 0 -- otherwise `marketauth`, which on a STAKED
-                    // market is the stake-pool PDA, could rewrite asset-0's insurance_operator
-                    // and steal the creator's claim (exactly the theft tag 90 declines to
-                    // enable by refusing `marketauth` as a gate).
+                    // Asset 0's `asset_admin` is the ONLY key that can claim accrued creator
+                    // fees (tag 90 `WithdrawCreatorFee` reads asset index 0). This re-activation
+                    // branch is the one path that rewrites the per-asset authorities on an
+                    // ALREADY-EXISTING slot -- including `profile.asset_admin = authority.key`
+                    // below -- so it must never reach asset 0. Otherwise `marketauth`, which on
+                    // a STAKED market is the stake-pool PDA, could rewrite asset-0's asset_admin
+                    // and steal the creator's claim (exactly the theft tag 90 declines to enable
+                    // by refusing `marketauth` as a gate). Note this branch is why `asset_admin`
+                    // could NOT be rewritten out from under the creator by the stake flow.
                     //
                     // This is ALREADY unreachable today, but only EMERGENTLY: the in-service
                     // check directly above rejects ACTIVE/DRAIN_ONLY/RECOVERY, and

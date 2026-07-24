@@ -18645,8 +18645,9 @@ fn v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority() {
 ///
 /// `state::write_market` regenerates asset 0's oracle profile from `cfg` only
 /// when `cfg.oracle_mode != ORACLE_MODE_MANUAL`; `InitMarket` writes MANUAL, so
-/// this does NOT silently rewrite `insurance_operator` out from under the
-/// marketauth-rotation test below.
+/// this does NOT silently rewrite asset 0's stored authorities (`asset_admin` --
+/// the tag-90 claim gate -- or `insurance_operator`) out from under the
+/// staked-create-flow test below.
 fn seed_creator_fee_fixture(
     market: &mut TestAccount,
     claimable: u64,
@@ -19101,26 +19102,63 @@ fn v16_wrapper_withdraw_creator_fee_over_claim_is_rejected_not_saturated() {
     assert_eq!(market.data, before);
 }
 
-/// Only `insurance_operator` may claim. An arbitrary signer is rejected, and so
-/// is a signer holding a DIFFERENT asset slot's operator key.
+/// Only asset 0's `asset_admin` may claim (2026-07-24 re-gate). Two rejections
+/// pin the gate, then the real `asset_admin` succeeds:
+///   1. an arbitrary signer holding NEITHER key, and
+///   2. THE REGRESSION that proves the gate actually moved: a signer holding
+///      asset 0's `insurance_operator` but NOT its `asset_admin`. Under the old
+///      `insurance_operator` gate this signer would have SUCCEEDED and drained
+///      the creator's claim; under the new gate it must be Unauthorized.
+///
+/// `insurance_operator` and `asset_admin` both bootstrap to the creator at
+/// `InitMarket`, so the fixture first rotates `insurance_operator` away (via the
+/// real `UpdateAssetAuthority`, admin co-signing) to make the two keys distinct
+/// -- otherwise case (2) is untestable and the whole test is vacuous w.r.t. the
+/// move.
 #[test]
-fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_insurance_operator() {
+fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_asset_admin() {
     let mut admin = signer();
     let mut market = market_account();
     let mint = init_market(&mut admin, &mut market);
     seed_creator_fee_fixture(&mut market, 100, 1_000, 1_000);
 
-    let mut attacker = signer();
-    let mut dest = user_token_account(attacker.key, mint, 0);
+    // Split the two keys: rotate asset 0's insurance_operator to a fresh key,
+    // leaving asset_admin with the creator. Now `operator` holds ONLY the old
+    // gate's key.
+    let mut operator = signer();
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE_OPERATOR,
+            new_pubkey: operator.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut operator, &mut market],
+    )
+    .unwrap();
+    let profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+    assert_eq!(
+        profile.insurance_operator,
+        operator.key.to_bytes(),
+        "fixture: insurance_operator now held by a key that is NOT the asset_admin"
+    );
+    assert_eq!(
+        profile.asset_admin,
+        admin.key.to_bytes(),
+        "fixture: rotating insurance_operator must leave asset_admin with the creator"
+    );
+
     let mut vault = vault_token_account(&market, mint, 1_000);
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
-    let before = market.data.clone();
 
+    // (1) An arbitrary signer holding neither key.
+    let mut attacker = signer();
+    let mut attacker_dest = user_token_account(attacker.key, mint, 0);
+    let before = market.data.clone();
     let rejected = withdraw_creator_fee_no_rollback(
         &mut attacker,
         &mut market,
-        &mut dest,
+        &mut attacker_dest,
         &mut vault,
         &mut vault_auth,
         &mut token_program,
@@ -19129,7 +19167,7 @@ fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_insurance_op
     assert_eq!(
         rejected,
         Err(ProgramError::Custom(8)), // Unauthorized
-        "a signer that isn't asset 0's insurance_operator must be rejected"
+        "a signer that holds neither asset 0's asset_admin nor its insurance_operator must be rejected"
     );
     assert_eq!(
         market.data, before,
@@ -19137,8 +19175,29 @@ fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_insurance_op
          no-rollback harness, so this is the handler's discipline and not run_ix's restore"
     );
 
-    // The real operator still succeeds, proving the rejection above was the
-    // authority gate and not an unrelated failure in the fixture.
+    // (2) THE REGRESSION: the insurance_operator, now DISTINCT from asset_admin,
+    // must be rejected. This is the case that fails if the gate is reverted to
+    // `insurance_operator`.
+    let mut operator_dest = user_token_account(operator.key, mint, 0);
+    let before = market.data.clone();
+    let operator_rejected = withdraw_creator_fee_no_rollback(
+        &mut operator,
+        &mut market,
+        &mut operator_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        1,
+    );
+    assert_eq!(
+        operator_rejected,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "asset 0's insurance_operator is NO LONGER the creator-fee key -- it must be rejected"
+    );
+    assert_eq!(market.data, before);
+
+    // The real asset_admin (the creator) still succeeds, proving the rejections
+    // above were the authority gate and not an unrelated failure in the fixture.
     let mut admin_dest = user_token_account(admin.key, mint, 0);
     withdraw_creator_fee(
         &mut admin,
@@ -19149,18 +19208,20 @@ fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_insurance_op
         &mut token_program,
         1,
     )
-    .expect("the insurance_operator must be able to claim");
+    .expect("asset 0's asset_admin (the creator) must be able to claim");
 }
 
-/// STAKED MARKET (design §3): `StakeInitPool` rotates `cfg.marketauth` to the
-/// stake-pool PDA but never touches `insurance_operator`. The creator must
-/// therefore still be able to claim after the rotation -- and, critically, the
-/// rotated `marketauth` must NOT be able to, which is exactly why
-/// `verify_domain_withdrawal_preflight` (which accepts `marketauth` as an
-/// alternate gate) is not reused here.
+/// STAKED MARKET (design §3): the wizard's full create flow rotates BOTH
+/// `cfg.marketauth` (via `StakeInitPool`, to the stake-pool PDA) AND asset 0's
+/// `insurance_operator` (via `BindInsuranceAuthority`, to a program PDA nobody
+/// can sign for). It leaves `asset_admin` -- the creator's wallet -- alone. So
+/// the creator must STILL be able to claim via `asset_admin`, while BOTH rotated
+/// authorities are rejected. The `insurance_operator` rejection is the whole
+/// reason the gate is `asset_admin` and not `insurance_operator`; the marketauth
+/// rejection is why `verify_domain_withdrawal_preflight` (which accepts
+/// `marketauth` as an alternate gate) is NOT reused here.
 #[test]
-fn v16_wrapper_withdraw_creator_fee_survives_marketauth_rotation_and_the_new_marketauth_cannot_claim(
-) {
+fn v16_wrapper_withdraw_creator_fee_survives_the_staked_create_flow_and_only_asset_admin_claims() {
     let mut admin = signer();
     let mut market = market_account();
     let mint = init_market(&mut admin, &mut market);
@@ -19168,13 +19229,13 @@ fn v16_wrapper_withdraw_creator_fee_survives_marketauth_rotation_and_the_new_mar
 
     let profile_before = state::read_asset_oracle_profile(&market.data, 0).unwrap();
     assert_eq!(
-        profile_before.insurance_operator,
+        profile_before.asset_admin,
         admin.key.to_bytes(),
-        "InitMarket must bootstrap asset 0's insurance_operator to the creator"
+        "InitMarket must bootstrap asset 0's asset_admin to the creator"
     );
 
-    // Stand in for StakeInitPool's `cfg.marketauth = pool_pda` rotation, using
-    // the real UpdateAuthority handler (both keys must co-sign).
+    // (a) StakeInitPool: `cfg.marketauth = pool_pda`, via the real UpdateAuthority
+    // handler (both keys co-sign).
     let mut pool_pda = signer();
     run_ix(
         Instruction::UpdateAuthority {
@@ -19183,21 +19244,41 @@ fn v16_wrapper_withdraw_creator_fee_survives_marketauth_rotation_and_the_new_mar
         &mut [&mut admin, &mut pool_pda, &mut market],
     )
     .unwrap();
+
+    // (b) BindInsuranceAuthority: asset 0's `insurance_operator = <program PDA>`.
+    // A throwaway signer stands in for the un-signable PDA precisely so it can
+    // still ATTEMPT the claim below -- the point is that holding
+    // `insurance_operator` no longer authorizes it.
+    let mut operator_pda = signer();
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE_OPERATOR,
+            new_pubkey: operator_pda.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut operator_pda, &mut market],
+    )
+    .unwrap();
+
     let (cfg_rotated, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_rotated.marketauth, pool_pda.key.to_bytes(), "marketauth must have rotated");
     let profile_after = state::read_asset_oracle_profile(&market.data, 0).unwrap();
     assert_eq!(
         profile_after.insurance_operator,
+        operator_pda.key.to_bytes(),
+        "the stake flow rotated insurance_operator to a PDA"
+    );
+    assert_eq!(
+        profile_after.asset_admin,
         admin.key.to_bytes(),
-        "the rotation must NOT drag insurance_operator along with it"
+        "...but must NOT have dragged asset_admin along -- it still tracks the creator"
     );
 
     let mut vault = vault_token_account(&market, mint, 1_000);
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
 
-    // The pool PDA is now marketauth. It must NOT be able to claim the
-    // creator's revenue.
+    // The pool PDA is now marketauth. It must NOT be able to claim.
     let mut pool_dest = user_token_account(pool_pda.key, mint, 0);
     let before = market.data.clone();
     let pool_rejected = withdraw_creator_fee_no_rollback(
@@ -19220,7 +19301,29 @@ fn v16_wrapper_withdraw_creator_fee_survives_marketauth_rotation_and_the_new_mar
          this is the handler's own doing"
     );
 
-    // The creator, who still holds insurance_operator, can.
+    // Nor may the rotated insurance_operator PDA -- THE regression that proves
+    // the gate is `asset_admin`, not `insurance_operator` (2026-07-24). On a
+    // real staked market this key is a PDA and unsignable; even standing in for
+    // it with a signer, the claim must be refused.
+    let mut operator_dest = user_token_account(operator_pda.key, mint, 0);
+    let before = market.data.clone();
+    let operator_rejected = withdraw_creator_fee_no_rollback(
+        &mut operator_pda,
+        &mut market,
+        &mut operator_dest,
+        &mut vault,
+        &mut vault_auth,
+        &mut token_program,
+        100,
+    );
+    assert_eq!(
+        operator_rejected,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "asset 0's insurance_operator (a PDA on a staked market) must NOT be able to claim"
+    );
+    assert_eq!(market.data, before);
+
+    // The creator, who still holds asset_admin, can.
     let mut creator_dest = user_token_account(admin.key, mint, 0);
     withdraw_creator_fee(
         &mut admin,
@@ -19231,7 +19334,7 @@ fn v16_wrapper_withdraw_creator_fee_survives_marketauth_rotation_and_the_new_mar
         &mut token_program,
         100,
     )
-    .expect("the creator must still be able to claim on a staked (marketauth-rotated) market");
+    .expect("the creator must still claim via asset_admin on a staked market");
     let (cfg_final, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_final.creator_fee_claimable_atoms, 0);
 }
@@ -19380,12 +19483,12 @@ fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_
 /// requirement anyone could name the creator's pubkey in slot 0 -- a pubkey
 /// that is public by definition -- and drain the claim.
 ///
-/// The account here carries the CORRECT `insurance_operator` key with
+/// The account here carries the CORRECT `asset_admin` key with
 /// `is_signer = false`, so the key comparison passes and only the signer check
 /// can reject. Routed through the no-rollback harness so the
 /// "market untouched" half is the handler's doing.
 #[test]
-fn v16_wrapper_withdraw_creator_fee_requires_the_operator_to_actually_sign() {
+fn v16_wrapper_withdraw_creator_fee_requires_the_asset_admin_to_actually_sign() {
     let mut admin = signer();
     let mut market = market_account();
     let mint = init_market(&mut admin, &mut market);
@@ -19443,9 +19546,9 @@ fn v16_wrapper_withdraw_creator_fee_requires_the_operator_to_actually_sign() {
 /// TOKEN-ACCOUNT GUARD (a): `verify_withdrawable_token_accounts` pins
 /// `dest_token.owner == authority`. Without it the creator could pay their
 /// claim into ANY token account -- which matters because the authority here
-/// (`insurance_operator`) may be a PDA or a multisig whose operator is not the
-/// intended beneficiary, and because it is the only thing tying the payout to
-/// the signer at all.
+/// (asset 0's `asset_admin`) may be a multisig or cold-storage key whose signer
+/// is not the intended beneficiary, and because it is the only thing tying the
+/// payout to the signer at all.
 ///
 /// Ported from the tag-87 negatives in `tests/v16_fee_split.rs`
 /// (`tag87_rejects_...`), which cover the same helper on the stake leg.
