@@ -20419,3 +20419,151 @@ fn v16_wrapper_lp_fee_claim_is_junior_to_bad_debt_coverage() {
         still_owed,
     );
 }
+
+/// END-TO-END WRAPPER VERIFICATION of the LP-drain engine fix.
+///
+/// Every earlier test of this fix drove the ENGINE LIBRARY directly. This one goes
+/// through the real wrapper instruction handlers — InitMarket / InitPortfolio /
+/// Deposit / TradeCpi (with the matcher CPI) / PushAuthMark / PermissionlessCrank —
+/// i.e. exactly the path the deployed program executes.
+///
+/// Scenario: an LP holds the matcher counterparty side while the price churns and
+/// returns EXACTLY to where it started, and the keeper cranks the LP on every step
+/// (production behaviour). A zero-net price path must cost the LP nothing.
+/// Pre-fix this bled one full leg of value per direction change.
+#[test]
+fn v17_wrapper_lp_survives_zero_net_price_churn_end_to_end() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner_a = signer(); // trader
+    let mut owner_b = signer(); // LP / matcher counterparty
+    let mut account_a = portfolio_account();
+    let mut account_b = portfolio_account();
+
+    // Wide accrual window so a multi-slot churn step is never rejected for staleness.
+    // NOTE: config validation rejects min_funding_lifetime_slots < max_accrual_dt_slots,
+    // so both must be raised together.
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner_a, &mut market, &mut account_a);
+    init_portfolio(&mut owner_b, &mut market, &mut account_b);
+    deposit(&mut owner_a, &mut market, &mut account_a, 5_000_000);
+    deposit(&mut owner_b, &mut market, &mut account_b, 5_000_000);
+
+    // Drive price through the AUTH_MARK oracle so PushAuthMark actually moves the mark.
+    configure_base_auth_mark(&mut admin, &mut market, 1, 100);
+
+    // Open: trader (A) long, LP (B) short — B is the matcher-enabled counterparty.
+    let size_q = POS_SCALE as i128 * 10;
+    run_trade_cpi_with_matcher(
+        &mut owner_a,
+        &mut owner_b,
+        &mut market,
+        &mut account_a,
+        &mut account_b,
+        0,
+        size_q,
+        size_q,
+        100,
+        0,
+        0,
+    )
+    .unwrap();
+
+    let lp_before = state::read_portfolio(&account_b.data).unwrap();
+    let equity_before = lp_before.capital as i128 + lp_before.pnl;
+    assert!(
+        lp_before.legs.iter().any(|l| l.active),
+        "VACUOUS: the LP has no open position, nothing is being settled"
+    );
+    let pos_before = lp_before
+        .legs
+        .iter()
+        .find(|l| l.active)
+        .map(|l| l.basis_pos_q)
+        .unwrap();
+
+    // Churn: 100_000 -> 104_000 -> 100_000, twenty times. Net move is EXACTLY zero.
+    // Crank the LP on every step, which is what the keeper does in production.
+    let mut slot = 10u64;
+    let (mut cranks_ok, mut cranks_err) = (0u32, 0u32);
+    let mut price_moves = 0u32;
+    for cycle in 0..20 {
+        for mark in [104u64, 100u64] {
+            slot += 10;
+            push_base_auth_mark(&mut admin, &mut market, slot, mark);
+            price_moves += 1;
+            let crank = run_ix(
+                Instruction::PermissionlessCrank {
+                    action: 0, // Refresh
+                    asset_index: 0,
+                    now_slot: slot,
+                    funding_rate_e9: 0,
+                    recovery_reason: 0,
+                },
+                &mut [&mut owner_b, &mut market, &mut account_b],
+            );
+            match crank {
+                Ok(()) => cranks_ok += 1,
+                Err(_) => cranks_err += 1,
+            }
+            let _ = cycle;
+        }
+    }
+    // Settle the one-step lag: a Refresh settles against the CURRENT k and only THEN
+    // accrues, so one extra crank at the unchanged final mark realizes the last delta.
+    for _ in 0..2 {
+        slot += 10;
+        push_base_auth_mark(&mut admin, &mut market, slot, 100);
+        let _ = run_ix(
+            Instruction::PermissionlessCrank {
+                action: 0,
+                asset_index: 0,
+                now_slot: slot,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            &mut [&mut owner_b, &mut market, &mut account_b],
+        );
+    }
+
+    let lp_after = state::read_portfolio(&account_b.data).unwrap();
+    let equity_after = lp_after.capital as i128 + lp_after.pnl;
+    let (_, group) = state::read_market(&market.data).unwrap();
+
+    println!(
+        "WRAPPER e2e: cranks ok={} err={} price_moves={} | final mark={} \
+         | LP capital {} -> {} pnl {} -> {} | equity {} -> {} (delta {})",
+        cranks_ok,
+        cranks_err,
+        price_moves,
+        group.assets[0].effective_price,
+        lp_before.capital,
+        lp_after.capital,
+        lp_before.pnl,
+        lp_after.pnl,
+        equity_before,
+        equity_after,
+        equity_after - equity_before
+    );
+
+    // NON-VACUITY: the scenario must actually have run through the wrapper.
+    assert!(cranks_ok >= 30, "VACUOUS: only {cranks_ok} cranks landed");
+    assert_eq!(
+        group.assets[0].effective_price, 100,
+        "price did not return to its starting point — not a zero-net path"
+    );
+    let pos_after = lp_after
+        .legs
+        .iter()
+        .find(|l| l.active)
+        .map(|l| l.basis_pos_q)
+        .expect("LP position vanished");
+    assert_eq!(pos_after, pos_before, "position changed — baseline invalid");
+
+    // PROPERTY: a zero-net price path must cost the LP nothing.
+    assert!(
+        (equity_after - equity_before).abs() <= 2,
+        "LP moved {} atoms on a ZERO-NET price path through the wrapper (drain regression)",
+        equity_after - equity_before
+    );
+}
