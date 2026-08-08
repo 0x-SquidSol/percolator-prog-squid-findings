@@ -4063,12 +4063,40 @@ pub mod ix {
         },
         DepositToLpVault {
             amount: u128,
+            /// Which pot of the vault's asset receives the backing. Must satisfy
+            /// `domain / 2 == registry.domain / 2`. Shares are priced off COMBINED
+            /// NAV, so the depositor is indifferent to the choice; routing exists
+            /// so new money can reach whichever pot the house is drawing on.
+            domain: u16,
+        },
+        /// Move IDLE (fresh, unliened) backing between the two domains of the
+        /// vault's asset. spec.md L410 requires refill be source-domain local;
+        /// the vault is welded to one domain at creation, so without this the
+        /// sibling domain can never be funded. Moves ledger principal in
+        /// lockstep so NAV stays in sync with the buckets.
+        RebalanceLpVaultBacking {
+            from_domain: u16,
+            to_domain: u16,
+            amount: u128,
         },
         RequestRedeemLpShares {
             shares: u128,
         },
-        ExecuteRedemption,
-        LpVaultCrankFees,
+        ExecuteRedemption {
+            /// Which pot of the vault's asset the payout is physically drawn
+            /// from. NAV and available-principal stay COMBINED across both pots,
+            /// so this does not change what the redeemer is owed — only where the
+            /// atoms come from. Needed because the money may legitimately sit in
+            /// the sibling: that is the entire point of routing deposits there.
+            domain: u16,
+        },
+        LpVaultCrankFees {
+            /// Which pot of the vault's asset receives the cranked fees. Must
+            /// satisfy `domain / 2 == registry.domain / 2`. Mints no shares, so
+            /// the choice cannot dilute; routing exists so fees can become
+            /// backing in the pot that actually needs it.
+            domain: u16,
+        },
         SetLpVaultPaused {
             paused: u8,
         },
@@ -4495,12 +4523,22 @@ pub mod ix {
                 },
                 75 => Self::DepositToLpVault {
                     amount: read_u128(&mut rest)?,
+                    domain: read_u16(&mut rest)?,
+                },
+                91 => Self::RebalanceLpVaultBacking {
+                    from_domain: read_u16(&mut rest)?,
+                    to_domain: read_u16(&mut rest)?,
+                    amount: read_u128(&mut rest)?,
                 },
                 76 => Self::RequestRedeemLpShares {
                     shares: read_u128(&mut rest)?,
                 },
-                77 => Self::ExecuteRedemption,
-                78 => Self::LpVaultCrankFees,
+                77 => Self::ExecuteRedemption {
+                    domain: read_u16(&mut rest)?,
+                },
+                78 => Self::LpVaultCrankFees {
+                    domain: read_u16(&mut rest)?,
+                },
                 79 => Self::SetLpVaultPaused {
                     paused: read_u8(&mut rest)?,
                 },
@@ -4705,6 +4743,16 @@ pub mod ix {
                 }
                 Self::CloseSlab => out.push(13),
                 Self::ResolveMarket => out.push(19),
+                Self::RebalanceLpVaultBacking {
+                    from_domain,
+                    to_domain,
+                    amount,
+                } => {
+                    out.push(91);
+                    push_u16(&mut out, from_domain);
+                    push_u16(&mut out, to_domain);
+                    push_u128(&mut out, amount);
+                }
                 Self::TopUpBackingBucket {
                     domain,
                     amount,
@@ -4981,16 +5029,23 @@ pub mod ix {
                     push_u16(&mut out, oi_reservation_threshold_bps);
                     push_u16(&mut out, domain);
                 }
-                Self::DepositToLpVault { amount } => {
+                Self::DepositToLpVault { amount, domain } => {
                     out.push(75);
                     push_u128(&mut out, amount);
+                    push_u16(&mut out, domain);
                 }
                 Self::RequestRedeemLpShares { shares } => {
                     out.push(76);
                     push_u128(&mut out, shares);
                 }
-                Self::ExecuteRedemption => out.push(77),
-                Self::LpVaultCrankFees => out.push(78),
+                Self::ExecuteRedemption { domain } => {
+                    out.push(77);
+                    push_u16(&mut out, domain);
+                }
+                Self::LpVaultCrankFees { domain } => {
+                    out.push(78);
+                    push_u16(&mut out, domain);
+                }
                 Self::SetLpVaultPaused { paused } => {
                     out.push(79);
                     out.push(paused);
@@ -7442,14 +7497,25 @@ pub mod processor {
                 oi_reservation_threshold_bps,
                 domain,
             ),
-            Instruction::DepositToLpVault { amount } => {
-                handle_deposit_to_lp_vault(program_id, accounts, amount)
+            Instruction::DepositToLpVault { amount, domain } => {
+                handle_deposit_to_lp_vault(program_id, accounts, amount, domain)
             }
+            Instruction::RebalanceLpVaultBacking {
+                from_domain,
+                to_domain,
+                amount,
+            } => handle_rebalance_lp_vault_backing(
+                program_id, accounts, from_domain, to_domain, amount,
+            ),
             Instruction::RequestRedeemLpShares { shares } => {
                 handle_request_redeem_lp_shares(program_id, accounts, shares)
             }
-            Instruction::ExecuteRedemption => handle_execute_redemption(program_id, accounts),
-            Instruction::LpVaultCrankFees => handle_lp_vault_crank_fees(program_id, accounts),
+            Instruction::ExecuteRedemption { domain } => {
+                handle_execute_redemption(program_id, accounts, domain)
+            }
+            Instruction::LpVaultCrankFees { domain } => {
+                handle_lp_vault_crank_fees(program_id, accounts, domain)
+            }
             Instruction::SetLpVaultPaused { paused } => {
                 handle_set_lp_vault_paused(program_id, accounts, paused)
             }
@@ -9898,6 +9964,133 @@ pub mod processor {
         }
         ledger.last_observed_insurance_atoms = insurance_atoms;
         Ok(())
+    }
+
+    /// The sibling domain of `domain` within the SAME asset: domain = asset*2 + side,
+    /// so flipping the low bit flips the side and keeps the asset. The LP vault is
+    /// authorised over both (the `backing_bucket_authority` it holds is per-ASSET).
+    fn sibling_domain(domain: u16) -> u16 {
+        domain ^ 1
+    }
+
+    /// One domain's contribution to LP-vault NAV, synced to its bucket first.
+    /// An uninitialised ledger account contributes 0 — `read_or_new_backing_domain_ledger`
+    /// returns a zeroed ledger whose watermarks match the bucket, so a domain the
+    /// vault has never funded adds nothing rather than failing.
+    fn lp_vault_domain_nav_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        fee_share_bps: u16,
+        ledger_data: &[u8],
+    ) -> Result<u128, ProgramError> {
+        let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
+        let (mut ledger, _) = read_or_new_backing_domain_ledger(
+            ledger_data,
+            market_group,
+            authority,
+            domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        percolator::lp_vault::lp_vault_nav_atoms(
+            ledger.total_principal_atoms,
+            ledger.total_earnings_atoms,
+            ledger.total_earnings_withdrawn_atoms,
+            ledger.cumulative_loss_atoms,
+            ledger.cumulative_recovery_atoms,
+            fee_share_bps,
+        )
+        .map_err(map_v16_error)
+    }
+
+    /// One domain's AVAILABLE principal (principal net of impairment). Mirrors
+    /// `lp_vault_nav_atoms`'s internals exactly, minus the earnings term.
+    fn lp_vault_domain_available_principal_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        ledger_data: &[u8],
+    ) -> Result<u128, ProgramError> {
+        let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
+        let (mut ledger, _) = read_or_new_backing_domain_ledger(
+            ledger_data,
+            market_group,
+            authority,
+            domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        let net_impairment = ledger
+            .cumulative_loss_atoms
+            .checked_sub(ledger.cumulative_recovery_atoms)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        ledger
+            .total_principal_atoms
+            .checked_sub(net_impairment)
+            .ok_or_else(|| PercolatorError::EngineCounterUnderflow.into())
+    }
+
+    /// AVAILABLE principal across BOTH domains. Must be summed alongside NAV: the
+    /// redemption split is `principal_out = shares * available_principal / total_shares`
+    /// and `earnings_out = atoms_out - principal_out`. Pairing a COMBINED nav with a
+    /// SINGLE-pot available_principal inflates `earnings_out` by the sibling pot's
+    /// principal, which then fails the earnings-availability gate and bricks the
+    /// redemption. Both terms have to span the same set of pots.
+    fn lp_vault_combined_available_principal_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        own_ledger_data: &[u8],
+        sibling_ledger_data: &[u8],
+    ) -> Result<u128, ProgramError> {
+        let own = lp_vault_domain_available_principal_atoms(
+            group, market_group, authority, domain, own_ledger_data,
+        )?;
+        let sib = lp_vault_domain_available_principal_atoms(
+            group,
+            market_group,
+            authority,
+            sibling_domain(domain),
+            sibling_ledger_data,
+        )?;
+        own.checked_add(sib)
+            .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+    }
+
+    /// LP-vault NAV across BOTH domains of its asset.
+    ///
+    /// The vault's backing can sit in either pot (see RebalanceLpVaultBacking,
+    /// tag 91), so pricing shares off `registry.domain` alone understates NAV by
+    /// whatever sits in the sibling and mints incoming depositors free shares at
+    /// existing holders' expense. Summing the two `lp_vault_nav_atoms` calls
+    /// separately loses at most 1 atom to the `lp_earnings` floor versus summing
+    /// the inputs first — that atom stays in the vault, which is the safe side.
+    fn lp_vault_combined_nav_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        fee_share_bps: u16,
+        own_ledger_data: &[u8],
+        sibling_ledger_data: &[u8],
+    ) -> Result<u128, ProgramError> {
+        let own = lp_vault_domain_nav_atoms(
+            group, market_group, authority, domain, fee_share_bps, own_ledger_data,
+        )?;
+        let sib = lp_vault_domain_nav_atoms(
+            group,
+            market_group,
+            authority,
+            sibling_domain(domain),
+            fee_share_bps,
+            sibling_ledger_data,
+        )?;
+        own.checked_add(sib)
+            .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
     }
 
     fn read_or_new_backing_domain_ledger(
@@ -14400,6 +14593,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         amount: u128,
+        target_domain: u16,
     ) -> ProgramResult {
         let depositor = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -14411,6 +14605,10 @@ pub mod processor {
         let ledger_ai = account(accounts, 7)?;
         let token_program = account(accounts, 8)?;
         let system_program_ai = account(accounts, 9)?;
+        // REQUIRED: the vault's OTHER domain ledger. NAV spans both pots, so
+        // omitting it would understate NAV and mint the depositor free shares.
+        // Pinned by address below; may be uninitialised (contributes 0).
+        let sibling_ledger_ai = account(accounts, 10)?;
 
         expect_signer(depositor)?;
         expect_writable(depositor)?;
@@ -14444,7 +14642,17 @@ pub mod processor {
         {
             return Err(PercolatorError::LpVaultNotFound.into());
         }
-        let domain = registry.domain as usize;
+        // Route to the requested pot. Both pots of the asset share one
+        // `backing_bucket_authority`, so the vault is already authorised over
+        // both; crossing to another asset is not permitted.
+        if target_domain as usize / 2 != registry.domain as usize / 2 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let domain = target_domain as usize;
+        // `ledger_ai` is always registry.domain's ledger and `sibling_ledger_ai`
+        // always the other; both are pinned by address below, so picking between
+        // them here cannot be steered by the caller.
+        let target_is_sibling = target_domain != registry.domain;
 
         // Market preflight: Live + registry PDA is backing-bucket authority.
         let (cfg, mode, configured_slots, _) =
@@ -14478,23 +14686,37 @@ pub mod processor {
         let (ledger_pda, ledger_bump) =
             state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
         expect_key(ledger_ai, &ledger_pda)?;
-        if ledger_ai.data_is_empty() {
+        let (sibling_ledger_pda, sibling_ledger_bump) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        // The routed pot's ledger is the one that gets written. Both candidates
+        // are address-pinned above, so this selection is not caller-steerable.
+        let (target_ledger_ai, target_ledger_bump) = if target_is_sibling {
+            (sibling_ledger_ai, sibling_ledger_bump)
+        } else {
+            (ledger_ai, ledger_bump)
+        };
+        expect_writable(target_ledger_ai)?;
+        if target_ledger_ai.data_is_empty() {
             let rent = Rent::get()?;
             let len = state::backing_domain_ledger_account_len();
             invoke_signed(
                 &system_instruction::create_account(
                     depositor.key,
-                    ledger_ai.key,
+                    target_ledger_ai.key,
                     rent.minimum_balance(len),
                     len as u64,
                     program_id,
                 ),
-                &[depositor.clone(), ledger_ai.clone(), system_program_ai.clone()],
+                &[depositor.clone(), target_ledger_ai.clone(), system_program_ai.clone()],
                 &[&[
                     crate::constants::LP_BACKING_LEDGER_SEED,
                     market_ai.key.as_ref(),
-                    &registry.domain.to_le_bytes(),
-                    &[ledger_bump],
+                    &target_domain.to_le_bytes(),
+                    &[target_ledger_bump],
                 ]],
             )?;
         }
@@ -14509,23 +14731,16 @@ pub mod processor {
             let (_, group) = state::market_view_mut(&mut market_data)?;
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let ledger_data = ledger_ai.try_borrow_data()?;
-            let (mut ledger, _) = read_or_new_backing_domain_ledger(
-                &ledger_data,
+            let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
+            let nav = lp_vault_combined_nav_atoms(
+                &group,
                 market_ai.key.to_bytes(),
                 registry_pda.to_bytes(),
                 registry.domain,
-                &bucket,
-            )?;
-            sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            let nav = percolator::lp_vault::lp_vault_nav_atoms(
-                ledger.total_principal_atoms,
-                ledger.total_earnings_atoms,
-                ledger.total_earnings_withdrawn_atoms,
-                ledger.cumulative_loss_atoms,
-                ledger.cumulative_recovery_atoms,
                 registry.fee_share_bps,
-            )
-            .map_err(map_v16_error)?;
+                &ledger_data,
+                &sibling_ledger_data,
+            )?;
             percolator::lp_vault::lp_shares_for_deposit(
                 amount,
                 registry.total_lp_shares_outstanding,
@@ -14570,13 +14785,13 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
-            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+            let mut ledger_data = target_ledger_ai.try_borrow_mut_data()?;
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
                 &ledger_data,
                 market_ai.key.to_bytes(),
                 registry_pda.to_bytes(),
-                registry.domain,
+                target_domain,
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
@@ -14779,9 +14994,256 @@ pub mod processor {
     /// The RESYNC 5ebd136 dual-withdraw gate is preserved: source watermark is
     /// checked post-decrement; EngineLockActive if credit_rate_num < CREDIT_RATE_SCALE.
     #[inline(never)]
+    /// LP Vault — RebalanceLpVaultBacking (tag 91).
+    ///
+    /// Moves IDLE (fresh, unliened) backing between the two domains of the
+    /// vault's asset, carrying ledger principal in lockstep so NAV stays in
+    /// sync with the buckets. No tokens move: `header.vault` is untouched and
+    /// the `source_fresh_backing_total_num` aggregate nets to zero (the source
+    /// decrement below cancels the increment inside
+    /// `add_fresh_counterparty_backing_view`).
+    ///
+    /// WHY THIS EXISTS: `CreateLpVault` welds the vault to ONE domain, but the
+    /// house takes whichever side traders leave it and draws its gains from the
+    /// OPPOSITE domain. spec.md L410 requires refill be "source-domain local",
+    /// so a vault that cannot reach both domains of its asset leaves one side
+    /// permanently unfundable. `backing_bucket_authority` is stored PER ASSET,
+    /// so the registry PDA is already authorised for both domains.
+    ///
+    /// Permissionless: moving idle backing between two pots owned by the same
+    /// vault cannot extract value, and the source-side gate below refuses any
+    /// move that would leave the source domain under-backed.
+    #[inline(never)]
+    fn handle_rebalance_lp_vault_backing<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        from_domain: u16,
+        to_domain: u16,
+        amount: u128,
+    ) -> ProgramResult {
+        let cranker = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let from_ledger_ai = account(accounts, 3)?;
+        let to_ledger_ai = account(accounts, 4)?;
+        let system_program_ai = account(accounts, 5)?;
+
+        expect_signer(cranker)?;
+        expect_writable(cranker)?;
+        expect_writable(market_ai)?;
+        expect_writable(from_ledger_ai)?;
+        expect_writable(to_ledger_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(from_ledger_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+        if from_domain == to_domain {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        if registry.paused != 0 {
+            return Err(PercolatorError::LpVaultPaused.into());
+        }
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        expect_key(market_ai, &market_key)?;
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+
+        // Both domains must belong to the SAME asset as the vault. The per-asset
+        // `backing_bucket_authority` only authorises this vault over its own
+        // asset; crossing assets would move another asset's backing.
+        let asset_index = registry.domain as usize / 2;
+        if from_domain as usize / 2 != asset_index || to_domain as usize / 2 != asset_index {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        // Pin BOTH ledger addresses. This program owns every (market, domain)
+        // ledger, so an owner check alone would admit any other domain's ledger.
+        let (from_ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, &market_key, from_domain);
+        expect_key(from_ledger_ai, &from_ledger_pda)?;
+        let (to_ledger_pda, to_ledger_bump) =
+            state::derive_lp_backing_ledger(program_id, &market_key, to_domain);
+        expect_key(to_ledger_ai, &to_ledger_pda)?;
+
+        let (cfg, mode, configured_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if from_domain as usize >= configured_slots.saturating_mul(2)
+            || to_domain as usize >= configured_slots.saturating_mul(2)
+            || asset_index >= configured_slots
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        {
+            let market_data = market_ai.try_borrow_data()?;
+            let profile = read_oracle_profile_for_asset(&market_data, &cfg, asset_index)?;
+            let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
+        }
+
+        // Destination ledger is lazily created on first arrival, exactly as
+        // handle_deposit_to_lp_vault does for its own domain.
+        if to_ledger_ai.data_is_empty() {
+            let rent = Rent::get()?;
+            let len = state::backing_domain_ledger_account_len();
+            invoke_signed(
+                &system_instruction::create_account(
+                    cranker.key,
+                    to_ledger_ai.key,
+                    rent.minimum_balance(len),
+                    len as u64,
+                    program_id,
+                ),
+                &[cranker.clone(), to_ledger_ai.clone(), system_program_ai.clone()],
+                &[&[
+                    crate::constants::LP_BACKING_LEDGER_SEED,
+                    market_ai.key.as_ref(),
+                    &to_domain.to_le_bytes(),
+                    &[to_ledger_bump],
+                ]],
+            )?;
+        }
+
+        let backing_num = amount
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+
+        // ── Source side: withdraw idle backing. Mirrors the withdrawability gate
+        //    in percolator::v16::prepare_counterparty_backing_withdraw_delta plus
+        //    the RESYNC 5ebd136 dual watermark gate from handle_execute_redemption,
+        //    so a rebalance can never leave the source domain under-backed.
+        {
+            let mut from_ledger_data = from_ledger_ai.try_borrow_mut_data()?;
+            let (from_source, from_bucket) =
+                backing_domain_parts_view(&group, from_domain as usize)?;
+            let (mut from_ledger, from_initialized) = read_or_new_backing_domain_ledger(
+                &from_ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                from_domain,
+                &from_bucket,
+            )?;
+            sync_backing_domain_ledger(&mut from_ledger, &from_bucket)?;
+            if from_bucket.status != BackingBucketStatusV16::Fresh
+                || from_bucket.fresh_unliened_backing_num < backing_num
+                || from_source.fresh_reserved_backing_num < backing_num
+            {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            // Only PRINCIPAL moves; earnings stay with the domain that earned them.
+            if amount > from_ledger.total_principal_atoms {
+                return Err(PercolatorError::EngineCounterUnderflow.into());
+            }
+
+            let mut bucket = from_bucket;
+            let mut source = from_source;
+            bucket.fresh_unliened_backing_num -= backing_num;
+            source.fresh_reserved_backing_num -= backing_num;
+            if bucket.fresh_unliened_backing_num == 0 && bucket.valid_liened_backing_num == 0 {
+                if bucket.impaired_liened_backing_num != 0 {
+                    bucket.status = BackingBucketStatusV16::Impaired;
+                } else if bucket.consumed_liened_backing_num != 0 {
+                    bucket.status = BackingBucketStatusV16::Expired;
+                } else {
+                    bucket.status = BackingBucketStatusV16::Empty;
+                    bucket.expiry_slot = 0;
+                }
+            }
+            source.credit_rate_num =
+                expected_source_credit_rate_num(source).map_err(map_v16_error)?;
+            if source.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            source.credit_epoch = source
+                .credit_epoch
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            {
+                let slot = &mut group.markets[asset_index].engine;
+                let (source_acc, bucket_acc) = if from_domain % 2 == 0 {
+                    (&mut slot.source_credit_long, &mut slot.backing_long)
+                } else {
+                    (&mut slot.source_credit_short, &mut slot.backing_short)
+                };
+                *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source);
+                *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
+            }
+            // Cancels the increment inside add_fresh_counterparty_backing_view below.
+            group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(
+                group
+                    .header
+                    .source_fresh_backing_total_num
+                    .get()
+                    .checked_sub(backing_num)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?,
+            );
+            from_ledger.total_principal_atoms -= amount;
+            write_or_init_backing_domain_ledger(
+                &mut from_ledger_data,
+                &from_ledger,
+                from_initialized,
+            )?;
+        }
+
+        // ── Destination side: deposit the same backing. ──
+        {
+            let mut to_ledger_data = to_ledger_ai.try_borrow_mut_data()?;
+            add_fresh_counterparty_backing_view(
+                &mut group,
+                to_domain as usize,
+                backing_num,
+                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            )?;
+            let (_, to_bucket) = backing_domain_parts_view(&group, to_domain as usize)?;
+            let (mut to_ledger, to_initialized) = read_or_new_backing_domain_ledger(
+                &to_ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                to_domain,
+                &to_bucket,
+            )?;
+            sync_backing_domain_ledger(&mut to_ledger, &to_bucket)?;
+            to_ledger.total_principal_atoms = to_ledger
+                .total_principal_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            write_or_init_backing_domain_ledger(&mut to_ledger_data, &to_ledger, to_initialized)?;
+        }
+
+        group.header.risk_epoch = percolator::V16PodU64::new(
+            group
+                .header
+                .risk_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
+        group.validate_shape().map_err(map_v16_error)?;
+        Ok(())
+    }
+
     fn handle_execute_redemption<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        source_domain: u16,
     ) -> ProgramResult {
         let cranker = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -14794,6 +15256,10 @@ pub mod processor {
         let ledger_ai = account(accounts, 8)?;
         let redeemer_dest = account(accounts, 9)?;
         let token_program = account(accounts, 10)?;
+        // REQUIRED: the vault's OTHER domain ledger. NAV and available-principal
+        // both span the two pots; omitting it would underpay the redeemer by
+        // whatever sits in the sibling. Pinned by address below.
+        let sibling_ledger_ai = account(accounts, 11)?;
 
         expect_signer(cranker)?;
         expect_writable(market_ai)?;
@@ -14802,12 +15268,10 @@ pub mod processor {
         expect_writable(lp_mint)?;
         expect_writable(escrow_ai)?;
         expect_writable(vault_token)?;
-        expect_writable(ledger_ai)?;
         expect_writable(redeemer_dest)?;
         expect_owner(market_ai, program_id)?;
         expect_owner(registry_ai, program_id)?;
         expect_owner(redemption_ai, program_id)?;
-        expect_owner(ledger_ai, program_id)?;
         verify_token_program(token_program)?;
 
         // ── REPLAY GUARD: rejects NotInitialized if magic was zeroed. ──
@@ -14845,6 +15309,30 @@ pub mod processor {
         let (ledger_pda, _) =
             state::derive_lp_backing_ledger(program_id, &market_key, registry.domain);
         expect_key(ledger_ai, &ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            &market_key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        // Pick the pot the payout is physically drawn from. NAV and
+        // available-principal remain COMBINED, so this cannot change the amount
+        // owed — only its source. With routed deposits the vault's own-domain
+        // ledger may not even exist, so the blanket owner check that used to sit
+        // above moved here, onto the pot actually being touched.
+        if source_domain as usize / 2 != registry.domain as usize / 2 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // Deliberately NOT shadowing `ledger_ai`: combined NAV must keep reading
+        // OWN + SIBLING. Shadowing would make it read the sibling twice and drop
+        // the own pot entirely, mispricing every redemption.
+        let source_ledger_ai = if source_domain == registry.domain {
+            ledger_ai
+        } else {
+            sibling_ledger_ai
+        };
+        expect_writable(source_ledger_ai)?;
+        expect_owner(source_ledger_ai, program_id)?;
 
         // ── Cooldown gate. ──
         let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
@@ -14856,7 +15344,7 @@ pub mod processor {
             return Err(PercolatorError::LpVaultCooldownActive.into());
         }
 
-        let domain = registry.domain as usize;
+        let domain = source_domain as usize;
         let asset_index = domain / 2;
 
         // Collateral mint + vault authority + redeemer dest checks.
@@ -14901,24 +15389,26 @@ pub mod processor {
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            // available_principal mirrors lp_vault_nav_atoms internals exactly.
-            let net_impairment = ledger
-                .cumulative_loss_atoms
-                .checked_sub(ledger.cumulative_recovery_atoms)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            let available_principal = ledger
-                .total_principal_atoms
-                .checked_sub(net_impairment)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            let nav = percolator::lp_vault::lp_vault_nav_atoms(
-                ledger.total_principal_atoms,
-                ledger.total_earnings_atoms,
-                ledger.total_earnings_withdrawn_atoms,
-                ledger.cumulative_loss_atoms,
-                ledger.cumulative_recovery_atoms,
+            // NAV and available_principal BOTH span the vault's two pots — see
+            // lp_vault_combined_available_principal_atoms for why they must agree.
+            let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
+            let available_principal = lp_vault_combined_available_principal_atoms(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                &ledger_data,
+                &sibling_ledger_data,
+            )?;
+            let nav = lp_vault_combined_nav_atoms(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
                 registry.fee_share_bps,
-            )
-            .map_err(map_v16_error)?;
+                &ledger_data,
+                &sibling_ledger_data,
+            )?;
             let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
                 redemption.shares,
                 registry.total_lp_shares_outstanding,
@@ -15032,12 +15522,12 @@ pub mod processor {
             };
             let mut source = source_acc.try_to_runtime().map_err(map_v16_error)?;
             let mut bucket = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
-            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+            let mut ledger_data = source_ledger_ai.try_borrow_mut_data()?;
             let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
                 &ledger_data,
                 market_ai.key.to_bytes(),
                 registry_pda.to_bytes(),
-                registry.domain,
+                source_domain,
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
@@ -15566,28 +16056,75 @@ pub mod processor {
     fn handle_lp_vault_crank_fees<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        target_domain: u16,
     ) -> ProgramResult {
         let cranker = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
         let registry_ai = account(accounts, 2)?;
-        let ledger_ai = account(accounts, 3)?;
+        let own_ledger_ai = account(accounts, 3)?;
+        // The vault's OTHER domain ledger, plus system_program so whichever pot
+        // is targeted can have its ledger created on first arrival. Once deposits
+        // can be routed (tag 75), a vault whose money all went to the sibling has
+        // NO own-domain ledger, and an unconditional `expect_owner` on it bricked
+        // the crank outright.
+        let sibling_ledger_ai = account(accounts, 4)?;
+        let system_program_ai = account(accounts, 5)?;
         expect_signer(cranker)?;
+        expect_writable(cranker)?;
         expect_writable(market_ai)?;
         expect_writable(registry_ai)?;
-        expect_writable(ledger_ai)?;
         expect_owner(market_ai, program_id)?;
         expect_owner(registry_ai, program_id)?;
-        expect_owner(ledger_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
 
         let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
         let market_key = Pubkey::new_from_array(registry.market_group);
         expect_key(market_ai, &market_key)?;
         let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
         expect_key(registry_ai, &registry_pda)?;
-        let (ledger_pda, _) =
+        if target_domain as usize / 2 != registry.domain as usize / 2 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (own_ledger_pda, own_ledger_bump) =
             state::derive_lp_backing_ledger(program_id, &market_key, registry.domain);
-        expect_key(ledger_ai, &ledger_pda)?;
-        let domain = registry.domain as usize;
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, sibling_ledger_bump) = state::derive_lp_backing_ledger(
+            program_id,
+            &market_key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        // Both candidates are address-pinned, so this selection is not caller-steerable.
+        let (ledger_ai, ledger_bump) = if target_domain == registry.domain {
+            (own_ledger_ai, own_ledger_bump)
+        } else {
+            (sibling_ledger_ai, sibling_ledger_bump)
+        };
+        expect_writable(ledger_ai)?;
+        if ledger_ai.data_is_empty() {
+            let rent = Rent::get()?;
+            let len = state::backing_domain_ledger_account_len();
+            invoke_signed(
+                &system_instruction::create_account(
+                    cranker.key,
+                    ledger_ai.key,
+                    rent.minimum_balance(len),
+                    len as u64,
+                    program_id,
+                ),
+                &[cranker.clone(), ledger_ai.clone(), system_program_ai.clone()],
+                &[&[
+                    crate::constants::LP_BACKING_LEDGER_SEED,
+                    market_ai.key.as_ref(),
+                    &target_domain.to_le_bytes(),
+                    &[ledger_bump],
+                ]],
+            )?;
+        }
+        expect_owner(ledger_ai, program_id)?;
+        let domain = target_domain as usize;
 
         // ORPHANED-ATOMS GUARD (Finding 3). The crank moves atoms out of
         // `header.insurance` and into `ledger.total_principal_atoms` +
@@ -15682,7 +16219,7 @@ pub mod processor {
                 &ledger_data,
                 market_ai.key.to_bytes(),
                 registry_pda.to_bytes(),
-                registry.domain,
+                target_domain,
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;

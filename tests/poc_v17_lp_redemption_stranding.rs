@@ -305,6 +305,10 @@ fn deposit_accounts(env: &Env, lp_ata: Pubkey, source: Pubkey, depositor: Pubkey
         AccountMeta::new(env.ledger, false),
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(
+            derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
+            false,
+        ),
     ]
 }
 
@@ -323,7 +327,7 @@ fn new_depositor(env: &mut Env, amount: u128) -> Depositor {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = deposit_accounts(env, lp_ata, source, kp.pubkey());
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount }, accts)], &[&kp]).expect("deposit");
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount, domain: DOMAIN }, accts)], &[&kp]).expect("deposit");
     let _ = market;
     Depositor { kp, source, lp_ata, dest, redemption }
 }
@@ -354,6 +358,11 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
         AccountMeta::new(env.ledger, false),
         AccountMeta::new(d.dest, false),
         AccountMeta::new_readonly(spl_token::ID, false),
+        // Sibling-domain ledger: NAV spans both pots of the vault's asset.
+        AccountMeta::new(
+            derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
+            false,
+        ),
     ]
 }
 
@@ -374,7 +383,7 @@ fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = execute_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption, accts)], &[])
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[])
 }
 
 // ── PoC-only additions ──────────────────────────────────────────────────────

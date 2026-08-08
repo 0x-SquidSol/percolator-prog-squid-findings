@@ -152,8 +152,9 @@ fn deposit(env: &mut Env, amount: u128) -> (Keypair, Pubkey, Pubkey) {
         AccountMeta::new(env.lp_mint, false), AccountMeta::new(lp_ata, false), AccountMeta::new(source, false),
         AccountMeta::new(env.vault_token, false), AccountMeta::new(env.ledger, false),
         AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0, false),
     ];
-    send(&mut env.svm, pid, &payer, ProgInstruction::DepositToLpVault { amount }, accts, &[&kp]).expect("deposit");
+    send(&mut env.svm, pid, &payer, ProgInstruction::DepositToLpVault { amount, domain: DOMAIN }, accts, &[&kp]).expect("deposit");
     (kp, lp_ata, source)
 }
 
@@ -165,8 +166,9 @@ fn try_deposit(env: &mut Env, kp: &Keypair, lp_ata: Pubkey, source: Pubkey, amou
         AccountMeta::new(env.lp_mint, false), AccountMeta::new(lp_ata, false), AccountMeta::new(source, false),
         AccountMeta::new(env.vault_token, false), AccountMeta::new(env.ledger, false),
         AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0, false),
     ];
-    send(&mut env.svm, pid, &payer, ProgInstruction::DepositToLpVault { amount }, accts, &[kp])
+    send(&mut env.svm, pid, &payer, ProgInstruction::DepositToLpVault { amount, domain: DOMAIN }, accts, &[kp])
 }
 
 fn set_paused(env: &mut Env, signer: &Keypair, paused: u8) -> Result<(), String> {
@@ -186,8 +188,10 @@ fn close_vault(env: &mut Env, signer: &Keypair) -> Result<(), String> {
 fn crank_fees(env: &mut Env) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    send(&mut env.svm, pid, &payer, ProgInstruction::LpVaultCrankFees,
-        vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(env.registry, false), AccountMeta::new(env.ledger, false)], &[])
+    send(&mut env.svm, pid, &payer, ProgInstruction::LpVaultCrankFees { domain: DOMAIN },
+        vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(env.registry, false), AccountMeta::new(env.ledger, false),
+             AccountMeta::new(derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0, false),
+             AccountMeta::new_readonly(solana_sdk::system_program::ID, false)], &[])
 }
 
 // ── F: CrankFees ────────────────────────────────────────────────────

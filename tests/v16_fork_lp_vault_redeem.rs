@@ -244,6 +244,11 @@ fn deposit_accounts(env: &Env, lp_ata: Pubkey, source: Pubkey, depositor: Pubkey
         AccountMeta::new(env.ledger, false),
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        // Sibling-domain ledger: NAV spans both pots of the vault's asset.
+        AccountMeta::new(
+            derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
+            false,
+        ),
     ]
 }
 
@@ -262,7 +267,7 @@ fn new_depositor(env: &mut Env, amount: u128) -> Depositor {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = deposit_accounts(env, lp_ata, source, kp.pubkey());
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount }, accts)], &[&kp]).expect("deposit");
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount, domain: DOMAIN }, accts)], &[&kp]).expect("deposit");
     let _ = market;
     Depositor { kp, source, lp_ata, dest, redemption }
 }
@@ -293,6 +298,11 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
         AccountMeta::new(env.ledger, false),
         AccountMeta::new(d.dest, false),
         AccountMeta::new_readonly(spl_token::ID, false),
+        // Sibling-domain ledger: NAV spans both pots of the vault's asset.
+        AccountMeta::new(
+            derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
+            false,
+        ),
     ]
 }
 
@@ -310,10 +320,15 @@ fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> 
 }
 
 fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
+    execute_from(env, d, DOMAIN)
+}
+
+/// Execute a redemption drawing the payout from a chosen pot of the vault's asset.
+fn execute_from(env: &mut Env, d: &Depositor, domain: u16) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = execute_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption, accts)], &[])
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain }, accts)], &[])
 }
 
 fn resolve_market(env: &mut Env) -> Result<(), String> {
@@ -450,7 +465,7 @@ fn execute_redemption_rejects_a_substituted_backing_ledger() {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let res = send(&mut env.svm, pid, &payer,
-        vec![(ProgInstruction::ExecuteRedemption, accts)], &[]);
+        vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[]);
 
     assert!(res.is_err(), "substituted backing ledger must be rejected, got: {res:?}");
     // `expect_key` returns ProgramError::InvalidArgument.
@@ -514,8 +529,8 @@ fn execute_twice_same_tx_second_rejects() {
     let a1 = execute_accounts(&env, &d);
     let a2 = execute_accounts(&env, &d);
     let res = send(&mut env.svm, pid, &payer, vec![
-        (ProgInstruction::ExecuteRedemption, a1),
-        (ProgInstruction::ExecuteRedemption, a2),
+        (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a1),
+        (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a2),
     ], &[]);
     assert!(res.is_err(), "two ExecuteRedemption in one tx MUST fail (2nd rejects on zeroed magic): {res:?}");
     // Atomic rollback: no payout, redemption PDA intact.
@@ -863,7 +878,7 @@ fn deposit_to_lp_vault_rejects_noncanonical_vault() {
     accts[6] = AccountMeta::new(bad_vault, false); // swap the canonical vault for a fragmenting one
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount: DEPOSIT }, accts)], &[&kp]);
+    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN }, accts)], &[&kp]);
     let msg = res.expect_err("DepositToLpVault to a non-canonical vault must reject");
     assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
 
@@ -885,7 +900,7 @@ fn execute_redemption_rejects_noncanonical_vault() {
     accts[6] = AccountMeta::new(noncanonical_vault(&mut env, DEPOSIT as u64), false); // fragmenting vault
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption, accts)], &[]);
+    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[]);
     let msg = res.expect_err("ExecuteRedemption from a non-canonical vault must reject");
     assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
 
@@ -1034,6 +1049,11 @@ fn seed_lp_fee_accrued(env: &mut Env, atoms: u128) {
 }
 
 fn crank_fees(env: &mut Env) -> Result<(), String> {
+    crank_fees_into(env, DOMAIN)
+}
+
+/// Crank accrued LP fees into a chosen pot of the vault's asset.
+fn crank_fees_into(env: &mut Env, domain: u16) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     send(
@@ -1041,12 +1061,17 @@ fn crank_fees(env: &mut Env) -> Result<(), String> {
         pid,
         &payer,
         vec![(
-            ProgInstruction::LpVaultCrankFees,
+            ProgInstruction::LpVaultCrankFees { domain },
             vec![
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(env.market, false),
                 AccountMeta::new(env.registry, false),
                 AccountMeta::new(env.ledger, false),
+                AccountMeta::new(
+                    derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
+                    false,
+                ),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
         )],
         &[],
@@ -2019,4 +2044,131 @@ fn crank_fees_after_full_lp_exit_rejects_and_leaves_atoms_in_insurance() {
 
     // And the vault can still be torn down cleanly, with no stranded principal.
     close_lp_vault(&mut env).expect("CloseLpVault still succeeds at the dead-share floor");
+}
+
+// ── v17 dual-domain: NAV must span BOTH pots on the way OUT as well as in ──
+
+/// A depositor whose collateral is routed to the SIBLING pot of the vault's asset.
+fn new_depositor_into_sibling(env: &mut Env, amount: u128) -> Depositor {
+    let kp = Keypair::new();
+    env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
+    let source = Pubkey::new_unique();
+    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    let lp_ata = Pubkey::new_unique();
+    set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
+    let dest = Pubkey::new_unique();
+    set_token(&mut env.svm, dest, env.collateral_mint, kp.pubkey(), 0);
+    let (redemption, _) = derive_lp_redemption(&env.program_id, &env.registry, &kp.pubkey());
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let accts = deposit_accounts(env, lp_ata, source, kp.pubkey());
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::DepositToLpVault { amount, domain: DOMAIN ^ 1 }, accts)],
+        &[&kp],
+    )
+    .expect("sibling deposit");
+    Depositor { kp, source, lp_ata, dest, redemption }
+}
+
+/// RED: a redemption must value shares against BOTH pots.
+///
+/// Two equal deposits, one into each pot, so NAV == 2 * DEPOSIT and the share
+/// supply is ~2 * DEPOSIT. Redeeming depositor 1's whole stake is therefore worth
+/// ~DEPOSIT, and their own pot holds exactly that much, so it can be paid in full.
+///
+/// If NAV is read from `registry.domain`'s ledger alone it reads DEPOSIT, and the
+/// redeemer is paid ~DEPOSIT/2 — half of what they own. The sibling pot's value is
+/// silently confiscated from anyone who exits.
+#[test]
+fn redemption_prices_shares_off_combined_nav() {
+    let mut env = setup_vault(0);
+    let d1 = new_depositor(&mut env, DEPOSIT);
+    let _d2 = new_depositor_into_sibling(&mut env, DEPOSIT);
+
+    let shares = tok(&env.svm, d1.lp_ata) as u128;
+    assert!(shares > 0, "depositor 1 holds shares");
+    request(&mut env, &d1, shares).expect("request redeem");
+    execute(&mut env, &d1).expect("execute redemption");
+
+    let paid = tok(&env.svm, d1.dest) as u128;
+    // Depositor 1 paid the one-off dead-share floor at genesis; allow exactly that.
+    let floor = LP_VAULT_MINIMUM_LIQUIDITY;
+    assert!(
+        paid + floor >= DEPOSIT,
+        "redeemer was paid {paid} for a stake worth ~{DEPOSIT} — NAV is ignoring the \
+         sibling pot, so exiting LPs forfeit whatever sits in it"
+    );
+    assert!(paid <= DEPOSIT, "must not overpay: got {paid}, stake worth ~{DEPOSIT}");
+}
+
+/// Piece 4: does the fee crank still behave when the vault's OWN pot is empty
+/// because all the backing was routed to the sibling?
+///
+/// The crank mints no shares, so it cannot dilute; the question is only whether
+/// it still credits value the LP can actually get back out. It credits
+/// `registry.domain`'s bucket, which is `Empty` here —
+/// `add_fresh_counterparty_backing_view` accepts Empty/Expired and reopens the
+/// bucket as Fresh — and combined NAV then picks the credit up from either pot.
+#[test]
+fn crank_fees_credits_nav_when_all_backing_sits_in_the_sibling_pot() {
+    const LP_FEES: u128 = 250_000;
+    let mut env = setup_vault(0);
+    let d = new_depositor_into_sibling(&mut env, DEPOSIT);
+    seed_lp_fee_accrued(&mut env, LP_FEES);
+
+    env.svm.expire_blockhash();
+    // Crank into the SIBLING, i.e. the pot that actually holds this vault's money.
+    // Before the fix this reverted IncorrectProgramId: the handler unconditionally
+    // required the OWN-domain ledger to already exist, and with routed deposits it
+    // never had been created.
+    crank_fees_into(&mut env, DOMAIN ^ 1).expect("crank into the pot holding the backing");
+
+    let shares = tok(&env.svm, d.lp_ata) as u128;
+    request(&mut env, &d, shares).expect("request redeem");
+    env.svm.expire_blockhash();
+    // Draw the payout from the pot the money is actually in.
+    execute_from(&mut env, &d, DOMAIN ^ 1).expect("execute redemption from the sibling pot");
+
+    let paid = tok(&env.svm, d.dest) as u128;
+    // The sole LP owns the whole vault: their DEPOSIT plus the cranked fee slice.
+    // fee_share_bps is 50% in this harness, so the LP's cut of LP_FEES is half.
+    assert!(
+        paid > DEPOSIT,
+        "cranked fees must reach the redeemer: paid {paid}, deposit {DEPOSIT}"
+    );
+    assert!(
+        paid <= DEPOSIT + LP_FEES,
+        "must not overpay: paid {paid} vs deposit {DEPOSIT} + fees {LP_FEES}"
+    );
+}
+
+/// Isolates the lazy-create path: crank fees into the pot that has NO ledger yet.
+/// All the money went to the sibling, so `registry.domain`'s ledger was never
+/// created. The handler used to `expect_owner` it unconditionally and reverted
+/// IncorrectProgramId; it must now create it on first use.
+#[test]
+fn crank_fees_creates_the_ledger_of_a_pot_that_has_none() {
+    const LP_FEES: u128 = 250_000;
+    let mut env = setup_vault(0);
+    let _d = new_depositor_into_sibling(&mut env, DEPOSIT);
+
+    let own_ledger = env.svm.get_account(&env.ledger);
+    assert!(
+        own_ledger.is_none() || own_ledger.unwrap().data.is_empty(),
+        "precondition: the vault's own-domain ledger must not exist yet"
+    );
+
+    seed_lp_fee_accrued(&mut env, LP_FEES);
+    env.svm.expire_blockhash();
+    crank_fees_into(&mut env, DOMAIN).expect("crank must create the missing ledger");
+
+    let created = env.svm.get_account(&env.ledger).expect("ledger now exists");
+    assert!(!created.data.is_empty(), "ledger was created and written");
+    assert!(
+        ledger(&env).total_principal_atoms > 0,
+        "cranked fees landed in the newly created ledger"
+    );
 }

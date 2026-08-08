@@ -949,8 +949,18 @@ impl CrosscutEnv {
                 AccountMeta::new(self.lp_ledger, false),
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                // Sibling-domain ledger: NAV spans both pots of the vault's asset.
+                AccountMeta::new(
+                    state::derive_lp_backing_ledger(
+                        &self.program_id,
+                        &self.market,
+                        CROSSCUT_DOMAIN ^ 1,
+                    )
+                    .0,
+                    false,
+                ),
             ],
-            data: ProgInstruction::DepositToLpVault { amount }.encode(),
+            data: ProgInstruction::DepositToLpVault { amount, domain: CROSSCUT_DOMAIN }.encode(),
         };
         send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp deposit");
         (lp_ata, source)
@@ -1017,8 +1027,18 @@ impl CrosscutEnv {
                 AccountMeta::new(self.lp_ledger, false),
                 AccountMeta::new(dest, false),
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
+                // Sibling-domain ledger: NAV spans both pots of the vault's asset.
+                AccountMeta::new(
+                    state::derive_lp_backing_ledger(
+                        &self.program_id,
+                        &self.market,
+                        CROSSCUT_DOMAIN ^ 1,
+                    )
+                    .0,
+                    false,
+                ),
             ],
-            data: ProgInstruction::ExecuteRedemption.encode(),
+            data: ProgInstruction::ExecuteRedemption { domain: CROSSCUT_DOMAIN }.encode(),
         };
         let res = send_ixs(&mut self.svm, &self.payer, vec![wix], &[]);
         (dest, res)

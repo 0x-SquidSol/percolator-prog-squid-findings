@@ -319,6 +319,11 @@ fn deposit_accounts(
         AccountMeta::new(ledger, false),
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        // Sibling-domain ledger: NAV spans both pots of the vault's asset.
+        AccountMeta::new(
+            derive_lp_backing_ledger(&percolator_prog::id(), &market, DOMAIN ^ 1).0,
+            false,
+        ),
     ]
 }
 
@@ -401,7 +406,7 @@ fn create_lp_vault_then_deposit_immediately_no_authority_step() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT },
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     )
@@ -425,7 +430,7 @@ fn deposit_happy_first_mints_amount_minus_dead_shares() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT },
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     )
@@ -489,7 +494,7 @@ fn deposit_genesis_at_or_below_minimum_liquidity_is_rejected() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY },
+        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     );
@@ -500,7 +505,7 @@ fn deposit_genesis_at_or_below_minimum_liquidity_is_rejected() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY - 1 },
+        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY - 1, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     );
@@ -517,7 +522,7 @@ fn deposit_genesis_at_or_below_minimum_liquidity_is_rejected() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY + 1 },
+        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY + 1, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     )
@@ -533,7 +538,7 @@ fn deposit_rejects_zero_amount() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: 0 },
+        ProgInstruction::DepositToLpVault { amount: 0, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     );
@@ -574,7 +579,7 @@ fn deposit_succeeds_with_no_separate_authority_handover() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT },
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
         deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
         &[&depositor],
     );
@@ -598,7 +603,7 @@ fn lp_deposit_twice_no_expiry_overflow() {
             &mut env.svm,
             env.program_id,
             &env.payer,
-            ProgInstruction::DepositToLpVault { amount: DEPOSIT },
+            ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
             deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
             &[&depositor],
         )
@@ -671,7 +676,7 @@ fn lp_deposit_backing_state_matches_top_up() {
         &mut env_b.svm,
         env_b.program_id,
         &env_b.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT },
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
         deposit_accounts(env_b.market, env_b.vault_token, registry_b, mint_b, lp_ata_b, source_b, ledger_b, depositor_b.pubkey()),
         &[&depositor_b],
     )
