@@ -12388,9 +12388,20 @@ pub mod processor {
         //
         // Assigning an UNHELD role (current_value == 0) still uses the admin path —
         // there is no holder to defend, and bootstrapping must stay possible.
+        // #437: the bypass must not reach the oracle leg either. `oracle_authority`
+        // gates ConfigureAuthMark / ConfigureEwmaMark / ConfigureHybridOracle and the
+        // two mark pushers, so taking it from a non-consenting holder hands over the
+        // asset's price surface on a live market. Same root cause as #414 and
+        // #416/#417, reached through the oracle leg.
+        //
+        // Note the `current_value == [0u8; 32]` escape is unreachable for ORACLE in
+        // practice: every activation path writes a non-zero oracle_authority, and the
+        // zero-burn above is rejected for every kind except ASSET_AUTH_ADMIN. It is
+        // kept for uniformity with the insurance legs, not because the oracle role can
+        // be vacant.
         let admin_bypass_permitted = !matches!(
             kind,
-            ASSET_AUTH_INSURANCE | ASSET_AUTH_INSURANCE_OPERATOR
+            ASSET_AUTH_INSURANCE | ASSET_AUTH_INSURANCE_OPERATOR | ASSET_AUTH_ORACLE
         ) || current_value == [0u8; 32];
         if !(admin_signed && admin_bypass_permitted) {
             expect_live_authority(&current_value, current.key)?;

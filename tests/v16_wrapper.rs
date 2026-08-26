@@ -20676,3 +20676,138 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
     );
     assert_err_and_market_unchanged(seized, &market, &held);
 }
+
+/// The `admin_signed` bypass must not reach `ASSET_AUTH_ORACLE`.
+///
+/// `oracle_authority` gates `ConfigureAuthMark`, `ConfigureEwmaMark`,
+/// `ConfigureHybridOracle` and both mark pushers, so an `asset_admin` able to take
+/// it from a non-consenting holder gets the asset's price surface on a live
+/// market. Same root cause as the backing-bucket (#414) and insurance (#416/#417)
+/// reports, reached through the oracle leg, and the same shape the repo already
+/// documents: "Non-burn transfers require both the current authority and the new
+/// key to sign" (README).
+///
+/// Written as a differential so a future carve-out that re-opens one leg is
+/// visible: identical instruction, identical accounts, only `kind` varies.
+#[test]
+fn v16_wrapper_asset_admin_cannot_seize_oracle_authority_from_holder() {
+    for (label, kind) in [
+        ("insurance", ASSET_AUTH_INSURANCE),
+        ("insurance_operator", ASSET_AUTH_INSURANCE_OPERATOR),
+        ("oracle", ASSET_AUTH_ORACLE),
+    ] {
+        let mut admin = signer().writable();
+        let mut market = market_account();
+        let mut holder = signer();
+        let mut attacker = signer();
+        let _mint = init_market(&mut admin, &mut market);
+
+        // Legitimately hand the role to `holder`, who co-signs.
+        run_ix(
+            Instruction::UpdateAssetAuthority {
+                asset_index: 0,
+                kind,
+                new_pubkey: holder.key.to_bytes(),
+            },
+            &mut [&mut admin, &mut holder, &mut market],
+        )
+        .unwrap_or_else(|e| panic!("{label}: holder-consented grant must succeed: {e:?}"));
+
+        let held = market.data.clone();
+
+        // `asset_admin` tries to take it back. `holder` does NOT sign.
+        let seized = run_ix(
+            Instruction::UpdateAssetAuthority {
+                asset_index: 0,
+                kind,
+                new_pubkey: attacker.key.to_bytes(),
+            },
+            &mut [&mut admin, &mut attacker, &mut market],
+        );
+        assert_err_and_market_unchanged(seized, &market, &held);
+
+        let profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+        let still_held = match kind {
+            ASSET_AUTH_INSURANCE => profile.insurance_authority,
+            ASSET_AUTH_INSURANCE_OPERATOR => profile.insurance_operator,
+            _ => profile.oracle_authority,
+        };
+        assert_eq!(
+            still_held,
+            holder.key.to_bytes(),
+            "{label}: the consenting holder must keep the role"
+        );
+    }
+}
+
+/// The price surface that the oracle leg protects: with the seizure refused, an
+/// `asset_admin` that never held `oracle_authority` cannot reach the mark through
+/// `ConfigureAuthMark` / `PushAuthMark`, and the asset's mark is unchanged.
+#[test]
+fn v16_wrapper_asset_admin_cannot_reach_the_mark_without_the_oracle_authority() {
+    let mut admin = signer().writable();
+    let mut market = market_account();
+    let mut holder = signer();
+    let mut attacker = signer().writable();
+    let _mint = init_market(&mut admin, &mut market);
+
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_ORACLE,
+            new_pubkey: holder.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut holder, &mut market],
+    )
+    .expect("consented grant to holder");
+
+    let mark_before = state::read_asset_oracle_profile(&market.data, 0)
+        .unwrap()
+        .mark_ewma_e6;
+    let held = market.data.clone();
+
+    // Seizure is refused, so `attacker` never becomes the oracle authority.
+    let seized = run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_ORACLE,
+            new_pubkey: attacker.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut attacker, &mut market],
+    );
+    assert_err_and_market_unchanged(seized, &market, &held);
+
+    // And the two instructions that write the mark stay closed to it.
+    assert!(
+        run_ix(
+            Instruction::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 5,
+                initial_mark_e6: 1_000_000,
+            },
+            &mut [&mut attacker, &mut market],
+        )
+        .is_err(),
+        "ConfigureAuthMark must reject a non-holder"
+    );
+    assert!(
+        run_ix(
+            Instruction::PushAuthMark {
+                asset_index: 0,
+                now_slot: 6,
+                mark_e6: 999_000_000,
+            },
+            &mut [&mut attacker, &mut market],
+        )
+        .is_err(),
+        "PushAuthMark must reject a non-holder"
+    );
+
+    let after = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+    assert_eq!(after.mark_ewma_e6, mark_before, "the asset's mark is untouched");
+    assert_eq!(
+        after.oracle_authority,
+        holder.key.to_bytes(),
+        "the consenting holder still owns the oracle leg"
+    );
+}
